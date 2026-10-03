@@ -123,8 +123,8 @@ REXCVAR_DEFINE_INT32(masseffect_io_cache_mb, 0, "Filesystem",
  * What was measured. Across two different builds the per-lap stutter pattern is identical: a period
  * of 62-68 s, three or four fixed places, always in the same order and with the same size. In those
  * frames the breakdown says GPU 27-29 ms (normal) and the `record` stage 0.2-0.4 ms: the time is
- * neither in the GPU nor in recording. What does go together with the big stutters are `[io] LENTO`
- * reads of a large streaming archive marked (RELEIDA), of 11 to 20 ms, and the worst one of the session
+ * neither in the GPU nor in recording. What does go together with the big stutters are `[io] SLOW`
+ * reads of a large streaming archive marked (REREAD), of 11 to 20 ms, and the worst one of the session
  * blocks for 132 to 140 ms. They are rereads of the zone pack: the game releases the pack on
  * leaving and asks for it again on entering, with the same offset and the same size.
  *

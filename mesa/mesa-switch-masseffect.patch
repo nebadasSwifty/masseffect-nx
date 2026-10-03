@@ -2479,7 +2479,7 @@ index 00523fb4987..477421ca8b5 100644
  };
  
 +#ifdef HAVE_SWITCH_PLATFORM
-+/* Port: PRECARGA (ver vk_pipeline.h). */
++/* Port: PRELOAD (see vk_pipeline.h). */
 +int32_t vk_switch_preload = 0;
 +
 +static inline void

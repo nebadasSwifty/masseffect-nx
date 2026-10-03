@@ -1789,7 +1789,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
   // Depth copy: the rectangle of the depth render target to a resolved texture
   // of the same host format, at the base GetResolveInfo computes
   // (4 bytes per texel, like k_24_8).
-  // borrara: this same game command clears the render target right after resolving it. Only then is it worth
+  // will_clear: this same game command clears the render target right after resolving it. Only then is it worth
   // swapping the images: if the game kept drawing on top, the content would have to be brought back and the
   // copy would be paid anyway (measured: one restore per frame on the shadow map).
   void CopyDepth(const RegistersCopy& reg, uint32_t pitch, bool will_clear) {
@@ -7504,7 +7504,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
                   edram4_capacity_rollovers_, slot_previous, used,
                   kConversionsEDRAMPerSlot, operation);
     // Deliberately fenced, including the one-slot configuration. BeginRecording
-    // alone is the only place resetting descriptor pools after Completar.
+    // alone is the only place resetting descriptor pools after Complete.
     if (!SendWork(true) || !Record()) {
       ++edram4_capacity_rollover_failures_;
       REXLOG_ERROR("[native] EDRAM mode4 conversion capacity rollover failed: slot {} operation {}",

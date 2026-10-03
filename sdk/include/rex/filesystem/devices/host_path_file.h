@@ -52,7 +52,7 @@ StatsWindow ReadStatsWindow();
  * bytes_disk  = bytes those same reads brought from the SD.
  * entries      = ranges alive right now.
  * bytes_live  = what those ranges take in the host heap.
- * expulsiones  = ranges dropped because of the cap. If this grows, the cap is too small.
+ * evictions    = ranges dropped because of the cap. If this grows, the cap is too small.
  * no_memory  = the cache turned itself off for lack of RAM.
  */
 struct StatsRanges {

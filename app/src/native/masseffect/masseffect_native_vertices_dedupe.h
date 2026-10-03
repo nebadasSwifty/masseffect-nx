@@ -77,7 +77,7 @@ namespace masseffect::native {
 class DedupeVertices {
  public:
   // Number of slots. Power of 2. With ~1,244 draws per frame, each with 1 or 2 vertex bindings,
-  // they fit easily in 4096 slots. The colisiones() counter tells whether it falls short: if it
+  // they fit easily in 4096 slots. The collisions() counter tells whether it falls short: if it
   // rises, double it here.
   /*
    * Raised to 16384 (640 KB). With 4096 there were 19,705-33,121 collisions per report; with

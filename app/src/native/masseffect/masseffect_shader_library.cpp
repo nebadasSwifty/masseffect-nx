@@ -13,7 +13,7 @@
 /*
  * xxHash reads with memcpy (XXH_FORCE_MEMORY_ACCESS 0). With the method it picks for GCC (1) it reads
  * through 64- and 32-bit pointers without may_alias, and GCC may hoist that read above the write of the
- * data being hashed (strict aliasing). That made the texture key read claves[4] before writing it, and
+ * data being hashed (strict aliasing). That made the texture key read keys[4] before writing it, and
  * the same texture was created several times. Same fingerprint values; on AArch64, the same LDR.
  */
 #if defined(XXH_IMPLEM_13a8737387)

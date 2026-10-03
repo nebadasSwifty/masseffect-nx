@@ -23,7 +23,7 @@ struct Shader {
   bool vertices = false;
 
   // --- Indexed load only ---------------------------------------------------------
-  // Precomputed by IndexShaders over the SPIR-V. In a full load indexado() is false and they are not
+  // Precomputed by IndexShaders over the SPIR-V. In a full load indexed() is false and they are not
   // filled (callers compute them from the SPIR-V, as before).
   FileShaders* file = nullptr;  // package the SPIR-V is read from
   uint64_t displacement = 0;        // file offset of the entry (its 16-byte header)

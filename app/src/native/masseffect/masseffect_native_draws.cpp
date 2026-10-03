@@ -103,7 +103,7 @@ REXCVAR_DEFINE_BOOL(masseffect_native_sort_updates_texture, true, "Mass Effect",
 /*
  * xxHash reads with memcpy (XXH_FORCE_MEMORY_ACCESS 0). The method it picks for GCC (1) reads through
  * 64- and 32-bit pointers without may_alias, and GCC may move that read ahead of the write of the data
- * being hashed (strict aliasing). The texture key read claves[4] before writing it, and the same texture
+ * being hashed (strict aliasing). The texture key read keys[4] before writing it, and the same texture
  * was created several times. Same hash values; on AArch64, the same LDR.
  */
 #if defined(XXH_IMPLEM_13a8737387)
@@ -2154,8 +2154,8 @@ static_assert(std::has_unique_object_representations_v<PipelineKey>,
  * One pipeline of the prewarm list (masseffect_native_pipelines_prewarm).
  *
  * What is needed to recreate it in another session exactly as the ring created it: its key as PipelineFor
- * looks it up; the fingerprint of its two shaders in the library (if the library has changed, clave.vs
- * and clave.ps are no longer the same shaders and the record is skipped); and its vertex input, which the
+ * looks it up; the fingerprint of its two shaders in the library (if the library has changed, key.vs
+ * and key.ps are no longer the same shaders and the record is skipped); and its vertex input, which the
  * key only carries as a fingerprint. It is stored on disk byte for byte, so it cannot have implicit
  * padding.
  */
@@ -2171,7 +2171,7 @@ struct RegisterPipeline {
   static constexpr uint32_t kMaxBindings = 16;
   PipelineKey key;
   uint64_t vs_fingerprint = 0;  // masseffect::native::Shader::fingerprint
-  uint64_t ps_fingerprint = 0;  // 0 without a fragment stage (clave.ps == 0)
+  uint64_t ps_fingerprint = 0;  // 0 without a fragment stage (key.ps == 0)
   uint32_t n_attributes = 0;
   uint32_t n_bindings = 0;
   AttributeRegister attributes[kMaxAttributes] = {};
@@ -3016,7 +3016,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         host_height = per_fetch.height;
         ++samplers_cache_fetch_;
       } else {
-        // Why the table misses ("C6 cache por fetch" report, every 10 s).
+        // Why the table misses ("C6 cache per fetch" report, every 10 s).
         if (!Equal(per_fetch.fetch.data(), fetch, sizeof(per_fetch.fetch))) {
           ++(per_fetch.frame == UINT64_MAX ? fetch_empty_failures_ : fetch_failures_clash_);
         } else if (per_fetch.generation != generation_textures_) {
@@ -3603,7 +3603,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (type == 8) key.rasterization &= ~0x3u;
     VkPipeline pipeline = VK_NULL_HANDLE;
     // Looked up with SearchKey (phase 0a: canonical form; phases 1 and 2: without the state set through
-    // vkCmdSet*). clave stays raw: the deferred sky (opaque_in_all), the counter and the dynamic state read
+    // vkCmdSet*). the key stays raw: the deferred sky (opaque_in_all), the counter and the dynamic state read
     // it.
     MASSEFFECT_SUB(11, pipeline = PipelineFor(SearchKey(key), *entry, p));
     if (pipeline == VK_NULL_HANDLE) {
@@ -5319,8 +5319,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
     // Safety net: if it still goes over the limit (because almost everything is hot), one batch every 60
     // frames. With the above working, this should almost never trigger.
-    if (bytes_textures_ > limit && frame_ >= attempt_expulsion_ + 60) {
-      attempt_expulsion_ = frame_;
+    if (bytes_textures_ > limit && frame_ >= attempt_eviction_ + 60) {
+      attempt_eviction_ = frame_;
       DropTextures(limit / 4 * 3, kFramesNoUsageForDrop, "above the limit");
     }
   }
@@ -5426,13 +5426,13 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   }
 
   // Evicts unused textures until below `goal`. Returns the bytes freed.
-  uint64_t DropTextures(uint64_t goal, uint64_t age_minima, const char* reason) {
+  uint64_t DropTextures(uint64_t goal, uint64_t age_min, const char* reason) {
     std::vector<std::pair<uint64_t, uint64_t>> candidate;  // (last frame it was prepared, key)
     for (const auto& [key, texture] : textures_) {
       // Nor those with a bind in flight (their image has no memory yet).
       if (texture.image.image != VK_NULL_HANDLE && !texture.needs_upload && !texture.in_flight &&
           texture.frame != UINT64_MAX &&
-          texture.frame + age_minima < frame_) {
+          texture.frame + age_min < frame_) {
         candidate.emplace_back(texture.frame, key);
       }
     }
@@ -5454,7 +5454,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     released_textures_ += images.size();
     REXLOG_INFO("[native] C3: texture cache {} ({} MB): {} dropped, unused for more than {} frames "
                 "({} MB); {} textures and {} MB remain ({} released in total)",
-                reason, before >> 20, images.size(), age_minima,
+                reason, before >> 20, images.size(), age_min,
                 (before - bytes_textures_) >> 20, textures_.size(), bytes_textures_ >> 20, released_textures_);
     return before - bytes_textures_;
   }
@@ -8187,7 +8187,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           const auto [it_words, new_entries] = words_per_shape_.try_emplace(shape);
           /*
            * Key guard. The same five words cannot produce a different key: if one does, the key was not computed
-           * from what its words say (as when XXH3 read claves[4] before it was written).
+           * from what its words say (as when XXH3 read keys[4] before it was written).
            */
           if (!new_entries && std::equal(std::begin(keys), std::end(keys), it_words->second.begin())) {
             const uint64_t times = ++incoherent_keys_;
@@ -10507,7 +10507,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   }
 
   /*
-   * The key used to look up a draw's pipeline. The raw one (clave) is still used for everything else: the
+   * The key used to look up a draw's pipeline. The raw one (key) is still used for everything else: the
    * deferred sky reads its blending (opaque_in_all) and the counter compares it. Phase 0a: canonical
    * form, remembering the previous draw's (the same raw key gives the same canonical one).
    */
@@ -12481,7 +12481,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   bool releasing_per_missing_of_memory_ = false;  // guard against reentry
   uint64_t released_little_to_little_ = 0;
   uint64_t warning_trickle_ = 0;
-  uint64_t attempt_expulsion_ = 0;
+  uint64_t attempt_eviction_ = 0;
   uint64_t released_textures_ = 0;
   // Diagnostic of why the cache grows: creations per address and last key per shape (address, format and
   // size). Only touched when a texture is created.

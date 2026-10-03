@@ -95,7 +95,7 @@ class ShadersNative {
   const ShaderEntry* IdentifyContainer(std::span<const uint8_t> container) const;
 
   // The entry with that number (its position in the library), or nullptr. Like IdentifyContainer, from any
-  // thread once loaded: entries do not change after Cargar. Pipeline prewarming (masseffect_native_draws.cpp) uses
+  // thread once loaded: entries do not change after Load. Pipeline prewarming (masseffect_native_draws.cpp) uses
   // it to recreate the pipelines of the previous session.
   const ShaderEntry* PerNumber(uint32_t number) const;
 
