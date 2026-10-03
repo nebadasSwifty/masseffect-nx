@@ -1902,7 +1902,7 @@ struct AttributeVertices {
 };
 
 struct BindingVertices {
-  uint32_t slot;   // fetch constant de vertices (0-95)
+  uint32_t slot;   // fetch constant of the vertices (0-95)
   uint32_t stride;  // bytes
 };
 

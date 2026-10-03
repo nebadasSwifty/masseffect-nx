@@ -8759,7 +8759,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
   uint64_t swaps_no_clear_ = 0;  // the ones that used to copy 1600x1600
   // Copies and clears removed, and what they cost.
   std::unordered_map<const Image*, TargetState> target_state_;
-  uint64_t cleared_skipped_ = 0;             // de color
+  uint64_t cleared_skipped_ = 0;             // colour
   uint64_t cleared_skipped_depth_ = 0;
   uint64_t cleared_skipped_pixels_ = 0;
   uint64_t cleared_useless_ = 0;             // clears wiped out by a swap with no draw in between
