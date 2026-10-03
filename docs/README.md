@@ -34,6 +34,7 @@ This is the path the game follows, from the Xbox 360 disc to the Switch screen:
 | Build the port yourself | [building.md](building.md) |
 | Port another Xbox 360 game | [porting-another-game.md](porting-another-game.md), then [native-renderer.md](native-renderer.md), [shaders.md](shaders.md) and [platform-notes.md](platform-notes.md) |
 | Make the port faster | [measuring.md](measuring.md) first, then [performance-history.md](performance-history.md), [optimization-paths.md](optimization-paths.md), [toolchain.md](toolchain.md) and [mesa.md](mesa.md) |
+| Shorten the start-up time | [startup.md](startup.md) (timeline, ranked options, the read trace and preload) |
 | Know what is broken or unproven | [known-issues.md](known-issues.md) |
 | Support another edition of the game | [editions.md](editions.md) |
 | Understand a word | [glossary.md](glossary.md) |

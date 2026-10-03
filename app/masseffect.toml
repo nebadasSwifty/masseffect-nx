@@ -141,3 +141,13 @@ masseffect_native_textures_pool = false
 # The game checks Coalesced.ini against a SHA-1 table. If you put a Coalesced.ini without the logo movies in
 # game_root (see tools/coalesced.py), give its SHA-1 here so the check accepts it.
 # masseffect_coalesced_sha1 = "0000000000000000000000000000000000000000"
+
+
+# ----------------------------------------------------------------------------
+#  Start-up read preload (optional, off by default; see docs/startup.md)
+# ----------------------------------------------------------------------------
+# The game reads the same files in the same order on every start. Run once with the trace on to record them, then run
+# with the preload on: a background thread reads the recorded ranges ahead of the game (about 0.5 s faster to the title).
+# Never time a run with the trace on.
+# masseffect_io_trace_record = true
+# masseffect_io_preload = true
