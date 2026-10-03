@@ -77,6 +77,12 @@ Evidence from many runs (t289-t313):
 - The guest picks the same pixel shaders as in the bad Switch run when run on the PC, so the decision is not in the game logic
   alone. Lead if reopened: why the guest skips those passes on the Switch only (frame-time-driven quality scaling, a
   minimum desired frame rate of 35 in the game configuration; compare the guest's decisions between the two platforms).
+- Later experiments (t314, t350), none of which changed it: on the PC a minimum Swap-to-Swap interval of 40 and 100 ms, a disk
+  slowed to the speed of the SD card (`masseffect_io_us_per_kb`) and the whole best settings set all keep the planet lit through
+  the pan, and the PC guest also drops the same passes in the pan, so a missing pass alone is not the cause; on the console,
+  `masseffect_native_mipmaps = false` and `masseffect_native_diag_mips = true` leave the planet black. Remaining untested
+  leads: the guest-visible memory and streaming budget, the thread and processor-count timing, the real pad against the
+  scripted input of the PC test, and the `TEXTUREGROUP_*` and streaming keys of `Coalesced.ini`.
 - The user decided to close the investigation: 960x544 stays and the planet is black only in this pan.
 
 ### 7. Eden Prime water is missing (open)
