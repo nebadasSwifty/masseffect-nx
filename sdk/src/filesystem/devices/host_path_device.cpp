@@ -10,6 +10,7 @@
  */
 
 #include <rex/filesystem/devices/host_path_entry.h>
+#include "startup_trace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -89,6 +90,7 @@ bool HostPathDevice::Initialize() {
       REXFS_INFO("[io] mounted '{}' at {}: {} entries in {:.1f} ms ({}, {})",
                  rex::path_to_utf8(host_path_), mount_path_, inputs, ms,
                  read_only_ ? "read-only" : "read-write", report_index);
+      startup_trace::OnMount(this);
       return true;
     }
     REXFS_INFO("[io] VFS index not used, full scan: {}", report_index);
@@ -118,6 +120,7 @@ bool HostPathDevice::Initialize() {
     }
   }
 
+  startup_trace::OnMount(this);
   return true;
 }
 

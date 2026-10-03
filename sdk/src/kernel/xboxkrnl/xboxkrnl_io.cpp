@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <thread>
 
 #include <rex/cvar.h>
 #include <rex/filesystem/device.h>
@@ -53,6 +54,9 @@
  */
 REXCVAR_DEFINE_INT32(masseffect_io_warning_ms, 8, "Filesystem",
                      "Logs a warning for every open or read that takes more than this many ms (0 = never).");
+REXCVAR_DEFINE_INT32(masseffect_io_us_per_kb, 0, "Filesystem",
+                     "Diagnostic (Mac): every NtReadFile sleeps this many microseconds per KiB read after the read, to "
+                     "emulate the Switch SD card (~100 = 13 ms per 128 KiB); 0 = off.");
 REXCVAR_DEFINE_INT32(masseffect_io_summary_s, 15, "Filesystem",
                      "How many seconds between [io] summaries (0 = never).");
 
@@ -585,6 +589,9 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       result = file->Read(buffer.guest_address(), buffer_length,
                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                           &bytes_read, apc_context.guest_address());
+      if (const int32_t us_kb = REXCVAR_GET(masseffect_io_us_per_kb); us_kb > 0 && bytes_read) {
+        std::this_thread::sleep_for(std::chrono::microseconds(uint64_t(us_kb) * bytes_read / 1024));
+      }
       const uint64_t io_us_end = NowUs();
       NoteRead(io_us_end - io_us_start, bytes_read, file->path(), displacement);
       MaybeSummaryIo(io_us_end);

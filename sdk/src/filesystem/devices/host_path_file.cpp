@@ -12,6 +12,7 @@
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
+#include "startup_trace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -621,6 +622,11 @@ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
       (REXCVAR_GET(masseffect_io_cache_mb) > 0 || REXCVAR_GET(masseffect_io_ranges_mb) > 0)) {
     cache_id_ = IdOfPath(entry->path());
   }
+  // Startup trace / preload (startup_trace.cpp): same read-only condition, so saves and profiles
+  // are never recorded or served from the preload store.
+  if (file_handle_ && entry && entry->is_read_only() && !wants_write) {
+    trace_tag_ = startup_trace::OnOpen(static_cast<HostPathDevice*>(entry->device()), entry->path());
+  }
   if (file_handle_ && kb > 0 && entry && entry->is_read_only() && !wants_write) {
     const int64_t max = REXCVAR_GET(masseffect_io_windows_max);
     if (g_live_windows.fetch_add(1, std::memory_order_relaxed) < max) {
@@ -783,6 +789,18 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
   }
 
   const size_t request = buffer.size();
+  // Records the read (record mode) or serves it from the preload store (preload mode).
+  if (trace_tag_ && startup_trace::OnRead(trace_tag_, byte_offset, buffer, out_bytes_read)) {
+    if (startup_trace::VerifyEnabled()) {
+      std::vector<uint8_t> check(request);
+      size_t n = 0;
+      const bool read = file_handle_->Read(byte_offset, check.data(), request, &n);
+      startup_trace::ReportVerify(trace_tag_, byte_offset, request,
+                                  read && n == *out_bytes_read &&
+                                      std::memcmp(check.data(), buffer.data(), n) == 0);
+    }
+    return X_STATUS_SUCCESS;
+  }
   if (active_window_ && request && request <= window_size_ / kSubmissionMaxFraction) {
     // The request falls entirely within what is already in RAM.
     if (window_bytes_ && byte_offset >= window_start_ &&

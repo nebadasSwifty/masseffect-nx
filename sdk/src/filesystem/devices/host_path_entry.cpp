@@ -11,6 +11,7 @@
 
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
+#include "startup_trace.h"
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
@@ -75,8 +76,16 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     return X_STATUS_SUCCESS;
   }
 
-  auto file_handle = rex::filesystem::FileHandle::OpenExisting(
-      host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
+  // A read handle the startup preload thread opened ahead of the guest (read-only access only).
+  std::unique_ptr<rex::filesystem::FileHandle> file_handle;
+  if (is_read_only() && !(desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
+                                            FileAccess::kFileAppendData | FileAccess::kGenericAll))) {
+    file_handle = startup_trace::TakePreopened(static_cast<HostPathDevice*>(device_), path());
+  }
+  if (!file_handle) {
+    file_handle = rex::filesystem::FileHandle::OpenExisting(
+        host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
+  }
   if (!file_handle) {
     // TODO(benvanik): pick correct response.
     return X_STATUS_NO_SUCH_FILE;
