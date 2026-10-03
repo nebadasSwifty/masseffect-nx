@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x=4,local_size_y=4) in;
+layout(set=0,binding=0) uniform sampler2DMS depth_image;
+layout(set=0,binding=1,std430) buffer Readback { float depth[32]; } output_data;
+void main() {
+  ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+  uint i=(uint(p.y)*4u+uint(p.x))*2u;
+  output_data.depth[i]=texelFetch(depth_image,p,0).r;
+  output_data.depth[i+1u]=texelFetch(depth_image,p,1).r;
+}

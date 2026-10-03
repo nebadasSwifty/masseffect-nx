@@ -1,0 +1,74 @@
+name: CI
+
+# Cheap checks that need no game files, no toolchain and no console.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-syntax:
+    name: Shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zsh (some tools are zsh scripts)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+      - name: Syntax-check every shell script (by its shebang)
+        run: |
+          status=0
+          while IFS= read -r -d '' f; do
+            shebang=$(head -n 1 "$f")
+            case "$shebang" in
+              *zsh*)  checker="zsh -n" ;;
+              *bash*) checker="bash -n" ;;
+              *)      checker="sh -n" ;;   # '#!/bin/sh' and files meant to be sourced
+            esac
+            if ! $checker "$f"; then echo "::error file=$f::syntax error ($checker)"; status=1; fi
+          done < <(find . -name '*.sh' -not -path './sdk/thirdparty/*' -not -path '*/node_modules/*' -print0)
+          exit $status
+
+  python-compile:
+    name: Python compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile every Python file (no bytecode written)
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          bad = 0
+          for d, dirs, files in os.walk('.'):
+              dirs[:] = [x for x in dirs if x not in ('.git', 'node_modules') and not d.startswith('./sdk/thirdparty')]
+              for f in files:
+                  if f.endswith('.py'):
+                      p = os.path.join(d, f)
+                      try:
+                          compile(open(p, 'rb').read(), p, 'exec')
+                      except SyntaxError as e:
+                          print(f'::error file={p}::{e}')
+                          bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+
+  installer-tests:
+    name: Installer JavaScript tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax-check the page's modules
+        run: for f in installer/config.js installer/js/*.js installer/js/workers/*.js; do node --check "$f"; done
+      - name: Unit tests (XDVDFS parser, ZIP64 writer, plan)
+        # The end-to-end and real-disc tests skip themselves unless MASSEFFECT_TEST_* variables point at game files.
+        run: node --test installer/test/

@@ -1,0 +1,64 @@
+# Code generation options for speed (Switch only). Root keys: they must stay outside any table.
+#
+# The options only change how the C++ is written so the aarch64 compiler can keep the guest registers in host
+# registers and drop dead stores; the guest-visible result is the same. Measured on the console: about -13 %
+# instructions and -3 % main thread time.
+
+# Guest registers as C++ locals instead of fields of the PPCContext in memory.
+cr_as_local = true
+non_volatile_as_local = true
+xer_as_local = true
+ctr_as_local = true
+# r0, r2, r11, r12, f0 and v32-v63 as locals too. Non-argument locals respect share_registers and are synced around
+# calls to share_registers callees.
+non_argument_as_local = true
+
+# Arguments in registers: direct calls between recompiled functions pass r3-r10, f1-f13, r0/r11/r12/f0 and lr as C++
+# arguments and return r3 as the C++ return value. Off until a console run confirms it; the key needs the SDK codegen
+# pass of the same name (tools/args_in_registers.py applies the same transformation to already generated code).
+args_in_registers = false
+# Functions a hook may replace keep the old ABI; tools/codegen.sh writes this list (tools/args_in_registers.py
+# --write-hooked) before every generation. Only read when args_in_registers = true.
+args_in_registers_exclude_file = "hooked_functions.txt"
+
+# No mfmsr/mtmsrd fences, ctx.msr stores or global lock around the guest atomic sequences, and the lwarx/stwcx
+# reservation in a C++ local.
+skip_msr = true
+reserved_as_local = true
+
+# No `ctx.lr = <ret>;` before calls, except where an app hook compares ctx.lr (src/native/me_resolution.cpp:
+# 0x826E5ABC, 0x826E5AEC, 0x8223D0D4; src/native/me_ring_wait.cpp kOcclusionPollReturn 0x826E7CE8) and PIC `bl` to a
+# local label.
+elide_lr_stores = true
+lr_keep_returns = [0x826E5ABC, 0x826E5AEC, 0x8223D0D4, 0x826E7CE8]
+# D-form loads/stores as base + zext(reg) + disp (differs only when reg+disp crosses 2^32).
+dform_disp_split = true
+# fctiwz as fcvtzs + NaN select.
+fctiwz_inline = true
+
+# share_registers is NOT needed for ordinary functions in this game. Check after every codegen with
+#   python3 tools/read_before_write.py generated/default --noreturn=82ACA550
+# (flow-sensitive; run it on code generated without share_registers marks). Expected residue, all harmless:
+#   sub_82ACA670  guest setjmp (mfcr reads cr1-cr7 only to store them in the jmp_buf)
+#   sub_826710B0, sub_827F6558  reads only on jump-table cases past the real table end (never taken)
+#   sub_82BE7694  4-byte orphan fragment, no callers
+# Do NOT mark ordinary functions share_registers: their __savegprlr/__restgprlr are elided (global gate) and a `bl`
+# caller copies their clobbered ctx.r14-r31 back into its locals. Marking 61 functions chosen by a linear
+# (loop-blind) scan zeroed r27 of a caller (the callee does `li r27,0` at entry), which then loaded guest address 0:
+# a crash at startup.
+#
+# 0x82ACA550 is the guest longjmp (restores r14-r31/cr/lr/r1 from the jmp_buf); it is treated as noreturn.
+# setjmp/longjmp (D3DX HLSL compiler error paths, guest setjmp 0x82ACA670) are unsupported: the recompiled longjmp
+# returns to its caller instead of to the setjmp site.
+
+[functions]
+# Callees that read r11/r12 as arguments and are not marked automatically (funclets and split-off fragments already
+# are). tools/read_before_write.py --volatile lists every function that reads one of these registers before writing it; this
+# is the complete residue besides the two jump-table artifacts (sub_826710B0, sub_827F6558):
+#   sub_82AC65E4  stack probe (_alloca_probe): size in r12, clobbers r0/r11, preserves r12 (80 callers)
+#   sub_8260D774/D7D4/D834/D894  tail fragments of sub_8260D740/D7A0/D800/D860 entered with `b`, read r11
+"0x82AC65E4" = { share_registers = true }
+"0x8260D774" = { share_registers = true }
+"0x8260D7D4" = { share_registers = true }
+"0x8260D834" = { share_registers = true }
+"0x8260D894" = { share_registers = true }

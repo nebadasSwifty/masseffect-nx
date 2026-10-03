@@ -1,0 +1,22 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2DMS depth2;
+layout(set=0,binding=2) uniform usampler2DMS stencil2;
+layout(set=0,binding=4) uniform sampler2D depth1;
+layout(set=0,binding=5) uniform usampler2D stencil1;
+layout(set=0,binding=1,std430) buffer Observer { uvec2 records[]; } observer;
+layout(push_constant) uniform Parameters { uvec4 dimensions; uvec4 tiles; uvec4 transfer; uvec4 reserved; } p;
+void main() {
+  uvec2 pixel=gl_GlobalInvocationID.xy;
+  if(any(greaterThanEqual(pixel,p.dimensions.xy)))return;
+  uint index=p.dimensions.z+(pixel.y*p.dimensions.x+pixel.x)*p.transfer.w;
+  if(p.transfer.w==2u) {
+    for(int sample_index=0;sample_index<2;++sample_index)
+      observer.records[index+uint(sample_index)]=uvec2(
+        floatBitsToUint(texelFetch(depth2,ivec2(pixel),sample_index).r),
+        texelFetch(stencil2,ivec2(pixel),sample_index).r);
+  } else if(p.transfer.w==1u) {
+    observer.records[index]=uvec2(floatBitsToUint(texelFetch(depth1,ivec2(pixel),0).r),
+                                 texelFetch(stencil1,ivec2(pixel),0).r);
+  }
+}

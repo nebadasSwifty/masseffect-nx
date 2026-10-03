@@ -1,0 +1,14 @@
+#version 450
+// Negative freshness fixture: only the SECOND extraction uses this module.
+// Stencil is read and written normally, but depth output is deliberately stale.
+layout(local_size_x=4,local_size_y=4) in;
+layout(set=0,binding=2) uniform usampler2DMS stencil_image;
+layout(set=0,binding=1,std430) buffer Readback {
+  float depth[32]; uint unused_counters[2]; uint stencil[32];
+} output_data;
+void main() {
+  ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+  uint i=(uint(p.y)*4u+uint(p.x))*2u;
+  for(int sample_index=0;sample_index<2;++sample_index)
+    output_data.stencil[i+uint(sample_index)]=texelFetch(stencil_image,p,sample_index).r;
+}

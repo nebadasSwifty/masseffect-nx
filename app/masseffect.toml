@@ -1,0 +1,143 @@
+# ============================================================================
+#  Mass Effect for Nintendo Switch: settings
+#
+#  Copy this file to the Switch next to the NRO:
+#      sdmc:/switch/masseffect-nx/masseffect.toml
+#  It is read at startup. Every key is optional: a missing key keeps the built-in default
+#  of the code. The values below are the configuration that was measured best on a
+#  stock-clock Switch (handheld, no overclock).
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+#  Resolution
+# ----------------------------------------------------------------------------
+# Video mode the game believes it is running in (what its own display scaler targets).
+video_mode_width = 960
+video_mode_height = 540
+
+# Internal render resolution. The game always renders its scene at 1280x720; the Switch GPU is the
+# bottleneck, so the whole frame (viewport, scene targets, back buffer, UI quad) is drawn smaller and the
+# finished frame is scaled to the screen. 0 = the game's own 1280x720 (slowest, sharpest).
+# The height is 544, not 540, so the render targets stay aligned to the Xbox 360's 32-pixel tiles.
+masseffect_scene_width = 960
+masseffect_scene_height = 544
+
+# Vertical sync (on by default). Turn off only to measure the uncapped frame rate.
+# vsync = true
+
+
+# ----------------------------------------------------------------------------
+#  Input and audio
+# ----------------------------------------------------------------------------
+# Face buttons by position, as on an Xbox pad (the bottom button, B on a Switch pad, acts as A).
+# false (default) = by letter: A accepts, B goes back.
+# input_xbox_layout = false
+
+# Pass the game's rumble to the controllers. Off by default.
+# input_rumble = false
+
+# Mute audio output.
+# audio_mute = false
+
+
+# ----------------------------------------------------------------------------
+#  Logging (sdmc:/switch/masseffect-nx/logs/)
+# ----------------------------------------------------------------------------
+# One of: trace, debug, info, warn, error, critical, off.
+# log_level = "info"
+
+# Write the log from a separate thread (the calling thread only queues the message). Removes the stutter of the
+# periodic flush; the downside is that the last messages are lost if the game hangs.
+log_async = true
+
+
+# ----------------------------------------------------------------------------
+#  Performance (the tested best configuration)
+# ----------------------------------------------------------------------------
+# --- Threads and waiting ---
+# Pin the game's main thread to core 2 (the value is 30 + core) and raise the render thread: it leaves
+# the other cores to the ring, render, audio and worker threads.
+masseffect_exclusive_core = 32
+# The game's Direct3D sleeps while it waits for the ring thread instead of spinning.
+masseffect_wait_blocking_ring = true
+# Occlusion-query polling waits up to this many microseconds for ring progress instead of Sleep(0).
+masseffect_wait_occlusion_us = 500
+# Ring progress notifications and the guest's atomic sequences without the global locks.
+masseffect_notify_no_lock = true
+masseffect_lockfree_atomics = true
+# Drop the PhysX warnings the scene emits every frame (~13 % of the main thread otherwise).
+masseffect_physx_no_warnings = true
+
+# --- Vulkan command recording ---
+# The ring thread queues every vkCmd* call and a worker thread records them (same commands, same image).
+masseffect_native_deferred_recording = true
+masseffect_native_deferred_recording_naps = 8
+masseffect_deferred_native_fast = true
+masseffect_deferred_native_batch = 16
+masseffect_deferred_native_update = true
+# Work slots of the renderer (1-4).
+masseffect_native_slots_work = 3
+# Output of each Swap is drawn rotating 3 slots so the ring never waits for the previous output.
+masseffect_native_output_no_wait = true
+
+# --- Per-draw CPU cost ---
+masseffect_native_flat_identity = true
+masseffect_native_fast_pair = true
+masseffect_native_raw_microcode = true
+masseffect_native_pm4_fast = true
+masseffect_native_compare_fast = true
+masseffect_native_fast_copy = true
+masseffect_native_fast_copy_verify = 256
+masseffect_native_fingerprint_mode = 1
+masseffect_native_dedupe_max_fingerprint = 16384
+masseffect_native_indices_cache = true
+# Self-check of the fast paths above: both versions run for the first N uses and are compared (0 = never).
+masseffect_native_verify_n = 2048
+
+# --- Hot guest functions replaced by exact native versions (each is checked against the recompiled original) ---
+masseffect_hot_guest = true
+masseffect_hot_guard_calls = 256
+masseffect_hot_guard_period = 4096
+
+# --- EDRAM emulation and image correctness ---
+# Mode 4: depth and color share one emulated EDRAM ownership map.
+masseffect_native_edram_alias_mode = 4
+masseffect_native_depth_samples_x = false
+masseffect_native_diag_msaa2_phase = 2
+masseffect_native_float24_ps_mode = 0
+masseffect_native_fix_tonemap_7e3 = false
+masseffect_native_reuse_alloc_resolved = true
+masseffect_native_logical_resolved_size = true
+# EDRAM conversions between 32-bit color views as fragment passes instead of compute dispatches.
+masseffect_native_conversion_frag = true
+
+# --- Memory and caches ---
+# Texture cache budget in MB (older textures are released above it).
+masseffect_native_textures_mb_max = 128
+# Recreate the Vulkan pipelines of earlier sessions in the background at startup (list in cache/).
+masseffect_native_pipelines_prewarm = true
+# Per-stage shader cache keys in NVK; needs the patched driver from mesa/.
+masseffect_nvk_cache_per_stage = true
+
+# --- Switch-only paths measured as not worth it: keep off ---
+masseffect_native_resolver_no_copy = false
+masseffect_native_postponed_sky = false
+masseffect_native_no_ps_no_color = false
+masseffect_native_ps_alpha_only = false
+masseffect_shadows_no_vegetation = false
+masseffect_native_pass_shadows_no_load = false
+masseffect_native_lazy_front = false
+masseffect_native_skip_invisibles = false
+masseffect_native_cache_textures_between_frames = false
+masseffect_native_invalidate_textures_each_copy = true
+masseffect_native_textures_binding_thread = false
+masseffect_native_textures_pool = false
+
+
+# ----------------------------------------------------------------------------
+#  Startup movies (optional)
+# ----------------------------------------------------------------------------
+# The game checks Coalesced.ini against a SHA-1 table. If you put a Coalesced.ini without the logo movies in
+# game_root (see tools/coalesced.py), give its SHA-1 here so the check accepts it.
+# masseffect_coalesced_sha1 = "0000000000000000000000000000000000000000"

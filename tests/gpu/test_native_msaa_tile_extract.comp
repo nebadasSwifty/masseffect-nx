@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2DMS source_depth;
+layout(set=0,binding=2) uniform usampler2DMS source_stencil;
+layout(set=0,binding=1,std430) buffer Observer { uvec2 records[]; } observer;
+layout(push_constant) uniform Parameters {
+  uvec4 dimensions; uvec4 tiles; uvec4 transfer; uvec4 reserved;
+} p;
+void main() {
+  uvec2 pixel=gl_GlobalInvocationID.xy;
+  if(any(greaterThanEqual(pixel,p.dimensions.xy)))return;
+  uint index=p.dimensions.z+(pixel.y*p.dimensions.x+pixel.x)*2u;
+  for(int sample_index=0;sample_index<2;++sample_index)
+    observer.records[index+uint(sample_index)]=uvec2(
+      floatBitsToUint(texelFetch(source_depth,ivec2(pixel),sample_index).r),
+      texelFetch(source_stencil,ivec2(pixel),sample_index).r);
+}

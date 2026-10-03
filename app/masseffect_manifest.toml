@@ -1,0 +1,21 @@
+# ReXGlue recompilation manifest for Mass Effect (Xbox 360, default.xex) -> Nintendo Switch.
+#
+# Run tools/codegen.sh (it calls `rexglue codegen masseffect_manifest.toml` and the post-codegen steps).
+# The project name sets the prefix of everything generated: generated/default/masseffect_{init,pch,funcs}.h,
+# masseffect_recomp.N.cpp, and the CMake target masseffect_recomp built by CMakeLists.txt.
+
+[project]
+name = "masseffect"
+sdk_version = "0.10.0"
+# Your own game files: the extracted disc tree (assets/game_root), with default.xex at its root. Nothing from the game is
+# distributed with this project.
+game_root = "../assets/game_root"
+
+[entrypoint]
+file_path = "../assets/game_root/default.xex"
+out_directory_path = "generated/default"
+
+# The includes are processed before this table, so whatever is set here overrides what is included.
+#   overrides.toml       written by hand: code the automatic function discovery misses, each with its evidence
+#   perf_overrides.toml  code generation options for speed (registers as C++ locals, no lr stores, ...)
+includes = ["overrides.toml", "perf_overrides.toml"]

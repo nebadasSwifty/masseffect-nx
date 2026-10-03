@@ -1,0 +1,52 @@
+# Game files supplied by the user (copyrighted).
+/game_root/
+/local_game/
+*.iso
+*.xex
+*.xiso
+
+# Code generated from the game's program by the ReXGlue code generator.
+/app/generated/default/
+/app/hooked_functions.txt
+/app/masseffect_manifest.exp.toml
+
+# Shader library and collected shader containers made from the user's disc.
+*.mesp
+*.mesp.idx
+/shaders/work/
+
+# Build trees, caches, logs, runtime data.
+/out/
+/build/
+/sdk/out/
+# Third-party sources are fetched by tools/fetch_thirdparty.py; only the files we changed are tracked.
+/sdk/thirdparty/*
+!/sdk/thirdparty/CMakeLists.txt
+!/sdk/thirdparty/FFmpeg
+/sdk/thirdparty/FFmpeg/*
+!/sdk/thirdparty/FFmpeg/config.h
+!/sdk/thirdparty/FFmpeg/config_switch_aarch64.h
+!/sdk/thirdparty/FFmpeg/config_masseffect_wmv3.h
+!/sdk/thirdparty/FFmpeg/libavcodec
+/sdk/thirdparty/FFmpeg/libavcodec/*
+!/sdk/thirdparty/FFmpeg/libavcodec/mdct_template.c
+!/sdk/thirdparty/FFmpeg/libavcodec/fft_template.c
+!/sdk/thirdparty/ffmpeg-overlay
+/sdk/thirdparty/ffmpeg-overlay/*
+!/sdk/thirdparty/ffmpeg-overlay/codec_list.c
+/mesa/work/
+*.log
+/cache/
+/logs/
+/run/
+
+# Local credentials of the console test automation.
+credentials.env
+
+# Host clutter.
+.DS_Store
+__pycache__/
+*.pyc
+.claude/
+/assets/
+/tools/console-test/ref/

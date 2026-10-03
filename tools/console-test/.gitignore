@@ -1,0 +1,3 @@
+# Your console's address and logins, and screenshots of your own console: never commit them.
+credentials.env
+ref/

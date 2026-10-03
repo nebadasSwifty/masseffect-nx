@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mass Effect for Switch - Installer</title>
+<meta name="description" content="Builds the SD card package of the Mass Effect Nintendo Switch port from your own game, entirely in your browser.">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="assets/icon.jpg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="hero">
+  <img class="banner" src="assets/banner.png" alt="Mass Effect - Nintendo Switch port" width="1200" height="273">
+</header>
+
+<main>
+  <p class="lead">
+    Make the SD card package of the Mass Effect port from <strong>your own copy</strong> of the Xbox 360 game.
+    Everything runs in this browser tab: <strong>your game files never leave your computer.</strong>
+  </p>
+  <div id="env-warning" class="notice warn" hidden></div>
+
+  <!-- Step 1 -->
+  <section class="card" id="step-source">
+    <h2><span class="num">1</span> Choose your game</h2>
+    <div class="seg" role="radiogroup" aria-label="Game format">
+      <label><input type="radio" name="format" value="iso" checked> <span>Disc image (.iso)</span></label>
+      <label><input type="radio" name="format" value="folder"> <span>XEX format (folder)</span></label>
+    </div>
+    <p class="hint" id="format-hint">The disc image of the Xbox 360 game (single or dual layer). It is read in place and never loaded as a whole.</p>
+    <div class="drop" id="drop" tabindex="0">
+      <button class="btn" id="pick" type="button">Choose .iso file</button>
+      <span class="or">or drop it here</span>
+    </div>
+    <input id="file-iso" type="file" accept=".iso,.xiso" hidden>
+    <input id="file-folder" type="file" webkitdirectory multiple hidden>
+    <p class="status" id="source-status" role="status"></p>
+  </section>
+
+  <!-- Step 2 -->
+  <section class="card" id="step-edition" hidden>
+    <h2><span class="num">2</span> Detected edition</h2>
+    <div id="edition-body"></div>
+  </section>
+
+  <!-- Step 3 -->
+  <section class="card" id="step-create" hidden>
+    <h2><span class="num">3</span> Create the package</h2>
+    <div id="create-info" class="info"></div>
+    <div class="actions" id="actions">
+      <button class="btn primary" id="create-full" type="button">Create masseffect-nx.zip</button>
+      <button class="btn" id="create-update" type="button">Create masseffect-nx-update.zip</button>
+    </div>
+    <p class="hint">
+      <strong>First install:</strong> the full zip with the game files. <strong>Update</strong> (a new release): only the program, the settings file
+      and the shaders, to extract over the existing folder. It needs the same disc selected, because the shaders are made from it.
+      The update overwrites <code>masseffect.toml</code>: keep a copy if you changed it.
+    </p>
+
+    <div id="progress" hidden>
+      <ol class="stages" id="stages"></ol>
+      <div class="row">
+        <span id="elapsed" class="muted"></span>
+        <button class="btn small" id="cancel" type="button">Cancel</button>
+      </div>
+      <details id="log-wrap">
+        <summary>Details <span id="log-count" class="muted"></span></summary>
+        <pre id="log" aria-live="off"></pre>
+      </details>
+    </div>
+
+    <div id="result" class="notice" hidden></div>
+  </section>
+
+  <section class="card plain" id="how">
+    <h2>After it finishes</h2>
+    <p>Extract the zip into <code>sdmc:/switch/</code> on the SD card. You get:</p>
+<pre class="tree">/switch/masseffect-nx/
+  masseffect-nx.nro
+  masseffect.toml               (settings)
+  masseffect_shaders.mesp       (the game's shaders, made from your disc)
+  masseffect_shaders.mesp.idx   (index of the shader file)
+  game_root/                    (the files of your disc)</pre>
+    <p>Then launch it as the README of the project explains.</p>
+  </section>
+
+  <section class="card plain" id="privacy">
+    <h2>Privacy</h2>
+    <p>
+      The page reads your disc with your browser's own file access, makes the shaders on your computer with WebAssembly and
+      writes the zip to your disk. The only network traffic is loading this page and downloading the build
+      (<code>masseffect-nx.nro</code>) and <code>masseffect.toml</code> from this site. No game data is uploaded, and there is no tracking.
+      Nothing from the game is distributed with the port.
+    </p>
+  </section>
+</main>
+
+<footer>
+  <a id="repo-link" href="#">Source code and releases</a> · by <span id="author"></span> ·
+  Not affiliated with BioWare, Electronic Arts or Nintendo.
+</footer>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=4,r32f) uniform readonly image2D resolved;
+layout(set=0,binding=1,std430) buffer Output {uvec2 records[];} o;
+layout(push_constant) uniform Parameters {uvec4 dimensions;uvec4 tiles;uvec4 transfer;uvec4 reserved;} p;
+void main(){
+  uvec2 xy=gl_GlobalInvocationID.xy;
+  if(any(greaterThanEqual(xy,p.dimensions.xy)))return;
+  uint i=p.dimensions.z+xy.y*p.dimensions.x+xy.x;
+  o.records[i]=uvec2(floatBitsToUint(imageLoad(resolved,ivec2(xy)).r),0xABCD1234u);
+}
+

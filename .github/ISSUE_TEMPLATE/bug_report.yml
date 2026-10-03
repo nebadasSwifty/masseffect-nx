@@ -1,0 +1,32 @@
+name: Bug report
+description: Something looks wrong or crashes
+labels: [bug]
+body:
+  - type: input
+    id: console
+    attributes:
+      label: Console and firmware
+      placeholder: "Switch OLED, firmware 19.0.1, Atmosphere 1.8.0"
+    validations: {required: true}
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options: [Handheld, Docked]
+    validations: {required: true}
+  - type: input
+    id: edition
+    attributes:
+      label: Game edition (region and language)
+      placeholder: "USA / Europe (En,Es,Pl)"
+    validations: {required: true}
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened and where in the game
+    validations: {required: true}
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The newest file of sdmc:/switch/masseffect-nx/logs/ (do not paste game files).

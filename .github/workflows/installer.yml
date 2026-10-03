@@ -1,0 +1,161 @@
+name: Installer page
+
+# Builds the WebAssembly shader tools with Emscripten and deploys the installer page (installer/) together with them
+# and with the latest release's NRO to GitHub Pages.
+#
+# One-time setup: Settings > Pages > Source: "GitHub Actions".
+#
+# STATUS: the scan/hlsl/pack tools are built the way shaders/wasm/build_wasm_tools.sh was run by hand. The DXC
+# WebAssembly build (job "dxc") follows the recipe in shaders/wasm/link_dxc_wasm.sh and has NOT been run yet: if it
+# fails, the site is still deployed and the page tells the user that dxc_web.mjs is missing.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'installer/**'
+      - 'shaders/wasm/**'
+      - 'shaders/tools/**'
+      - 'shaders/XenosRecomp/**'
+      - 'app/masseffect.toml'
+      - '.github/workflows/installer.yml'
+  release:
+    types: [published]     # a new release: redeploy so the page serves the new NRO
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  EMSDK_VERSION: '4.0.10'
+  XXHASH_REF: 'v0.8.2'
+  FMT_REF: '10.2.1'
+  DXC_COMMIT: '75a029d95e767f291885e081f71ed951acad0019'   # must match shaders/wasm/link_dxc_wasm.sh
+
+jobs:
+  tools:
+    name: Build scan / hlsl / pack (WebAssembly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSDK_VERSION }}
+          actions-cache-folder: emsdk-cache
+      - name: Fetch header-only dependencies
+        run: |
+          git clone --depth 1 --branch "$XXHASH_REF" https://github.com/Cyan4973/xxHash.git "$RUNNER_TEMP/xxHash"
+          git clone --depth 1 --branch "$FMT_REF" https://github.com/fmtlib/fmt.git "$RUNNER_TEMP/fmt"
+      - name: Build
+        run: |
+          export XXHASH_DIR="$RUNNER_TEMP/xxHash" FMT_DIR="$RUNNER_TEMP/fmt/include"
+          OUT="$PWD/wasm-out" shaders/wasm/build_wasm_tools.sh hlsl pack scan
+          ls -l wasm-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-tools
+          path: wasm-out/
+          if-no-files-found: error
+
+  dxc:
+    name: Build DXC (WebAssembly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    continue-on-error: true      # untested recipe: the site is deployed without it if this fails
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache the result
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: dxc-out
+          key: dxc-wasm-${{ env.DXC_COMMIT }}-${{ env.EMSDK_VERSION }}-${{ hashFiles('shaders/wasm/dxc_web.cpp', 'shaders/wasm/link_dxc_wasm.sh') }}
+      - uses: mymindstorm/setup-emsdk@v14
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          version: ${{ env.EMSDK_VERSION }}
+          actions-cache-folder: emsdk-cache
+      - name: Install build tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build cmake python3
+      - name: Fetch DXC at the pinned commit (with submodules)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/microsoft/DirectXShaderCompiler.git "$RUNNER_TEMP/dxc"
+          git -C "$RUNNER_TEMP/dxc" checkout "$DXC_COMMIT"
+          git -C "$RUNNER_TEMP/dxc" submodule update --init --recursive --depth 1
+      - name: Native build of the table generators
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -G Ninja -S "$RUNNER_TEMP/dxc" -B "$RUNNER_TEMP/dxc-host" -C "$RUNNER_TEMP/dxc/cmake/caches/PredefinedParams.cmake" \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_SPIRV_CODEGEN=ON -DLLVM_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_TESTS=OFF \
+            -DHLSL_INCLUDE_TESTS=OFF -DSPIRV_BUILD_TESTS=OFF
+          ninja -C "$RUNNER_TEMP/dxc-host" llvm-tblgen clang-tblgen
+      - name: WebAssembly build of DXC
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          emcmake cmake -G Ninja -S "$RUNNER_TEMP/dxc" -B "$RUNNER_TEMP/dxc-wasm" -C "$RUNNER_TEMP/dxc/cmake/caches/PredefinedParams.cmake" \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_SPIRV_CODEGEN=ON -DLLVM_TARGETS_TO_BUILD=None \
+            -DLLVM_ENABLE_THREADS=OFF -DLLVM_ENABLE_EH=ON -DLLVM_ENABLE_RTTI=ON -DLLVM_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF -DHLSL_INCLUDE_TESTS=OFF -DSPIRV_BUILD_TESTS=OFF \
+            -DLLVM_TABLEGEN="$RUNNER_TEMP/dxc-host/bin/llvm-tblgen" -DCLANG_TABLEGEN="$RUNNER_TEMP/dxc-host/bin/clang-tblgen" \
+            -DCMAKE_C_FLAGS=-Wno-error \
+            "-DCMAKE_CXX_FLAGS=-Wno-invalid-specialization -Wno-error -D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION -D_LIBCPP_ENABLE_CXX17_REMOVED_AUTO_PTR -D_LIBCPP_ENABLE_CXX20_REMOVED_TYPE_TRAITS"
+          ninja -C "$RUNNER_TEMP/dxc-wasm" dxcompiler
+      - name: Link dxc_web
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          DXC_SRC="$RUNNER_TEMP/dxc" DXC_BUILD="$RUNNER_TEMP/dxc-wasm" OUT="$PWD/dxc-out" shaders/wasm/link_dxc_wasm.sh
+          ls -l dxc-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-dxc
+          path: dxc-out/
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: [tools, dxc]
+    # run even when the (untested) DXC job failed
+    if: ${{ !cancelled() && needs.tools.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-tools
+          path: wasm-all
+      - uses: actions/download-artifact@v4
+        if: needs.dxc.result == 'success'
+        with:
+          name: wasm-dxc
+          path: wasm-all
+      - name: Latest release assets (the NRO builds)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-assets
+          if tag=$(gh release view --json tagName -q .tagName 2>/dev/null); then
+            gh release download "$tag" --pattern '*.nro' --dir release-assets
+            echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No release yet: the page will report that no build is published."
+          fi
+      - name: Stage the site
+        run: installer/tools/stage_site.sh _site --wasm wasm-all --releases release-assets
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
