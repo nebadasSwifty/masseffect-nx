@@ -71,4 +71,4 @@ jobs:
         run: for f in installer/config.js installer/js/*.js installer/js/workers/*.js; do node --check "$f"; done
       - name: Unit tests (XDVDFS parser, ZIP64 writer, plan)
         # The end-to-end and real-disc tests skip themselves unless MASSEFFECT_TEST_* variables point at game files.
-        run: node --test installer/test/
+        run: node --test installer/test/*.test.js

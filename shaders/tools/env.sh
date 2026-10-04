@@ -20,7 +20,7 @@ _first_dir_with() {  # _first_dir_with <file> <dir>...
   local f=$1; shift
   for d in "$@"; do [ -n "$d" ] && [ -e "$d/$f" ] && { echo "$d"; return; }; done
 }
-_brew=$(command -v brew >/dev/null 2>&1 && brew --prefix 2>/dev/null)
+_brew=$(command -v brew >/dev/null 2>&1 && brew --prefix 2>/dev/null || true)
 XXHASH_DIR=${XXHASH_DIR:-$(_first_dir_with xxhash.h "$ROOT/../rexglue-sdk/thirdparty/xxHash" "$ROOT/thirdparty/xxHash" "${_brew:+$_brew/include}" /usr/local/include /usr/include)}
 FMT_DIR=${FMT_DIR:-$(_first_dir_with fmt/format.h "$ROOT/../rexglue-sdk/thirdparty/fmt/include" "$ROOT/thirdparty/fmt/include" "${_brew:+$_brew/include}" /usr/local/include /usr/include)}
 

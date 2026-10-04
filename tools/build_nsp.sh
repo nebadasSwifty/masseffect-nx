@@ -20,11 +20,26 @@ git clone -q https://github.com/rlaphoenix/hacBrewPack.git "$WORK/packer"
 git -C "$WORK/packer" checkout -q 745b16ecfc9ce055743067d200572204cb2aac6c
 # Mount the key file read-only. It never enters the build tree or release artifacts.
 KEYS="$(cd "$(dirname "$KEYS")" && pwd)/$(basename "$KEYS")"
-docker run --rm -v "$WORK:/work" -v "$OUT:/output" -v "$KEYS:/run/keys/prod.keys:ro" \
+user=()
+[[ "$(uname -s)" == Linux ]] && user=(--user "$(id -u):$(id -g)" -e HOME=/tmp)
+docker run --rm "${user[@]+"${user[@]}"}" -v "$WORK:/work" -v "$OUT:/output" -v "$KEYS:/run/keys/prod.keys:ro" \
   -w /work "${DEVKITA64_IMAGE:-devkitpro/devkita64:latest}" bash -euo pipefail -c '
     python3 - <<"PY"
 import json, pathlib, struct
 root = pathlib.Path("/work")
+# Old packers do not understand modern unrelated key names. Use only two required keys.
+keys = {}
+for line in pathlib.Path("/run/keys/prod.keys").read_text().splitlines():
+    if "=" in line:
+        name, value = (part.strip() for part in line.split("=", 1))
+        if name in ("header_key", "key_area_key_application_00"):
+            if len(value) != (64 if name == "header_key" else 32) or any(c not in "0123456789abcdefABCDEF" for c in value):
+                raise SystemExit("Invalid required key: " + name)
+            keys[name] = value
+if len(keys) != 2:
+    raise SystemExit("Missing header_key or key_area_key_application_00")
+(root / "packing.keys").write_text("\n".join(name + " = " + value for name, value in keys.items()) + "\n")
+(root / "packing.keys").chmod(0o600)
 p = root / "loader/hbl.json"
 j = json.loads(p.read_text())
 j["name"] = "Mass Effect"
@@ -73,8 +88,8 @@ PY
     cp packer/config.mk.template packer/config.mk
     make -C packer -j2
     # Keep packer diagnostics out of CI logs (it reads console keys).
-    if ! packer/hacbrewpack --titleid 01a5eec700000000 -k /run/keys/prod.keys \
-        --nologo --keygeneration 1 --nspdir /output > /work/pack.log 2>&1; then
+    if ! packer/hacbrewpack --titleid 01a5eec700000000 -k /work/packing.keys \
+        --nologo --keygeneration 1 --nspdir /output > /work/pack.log 2> /work/pack.err; then
       echo "error: hacBrewPack failed; check that header_key and key_area_key_application_00 are present" >&2
       exit 1
     fi

@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: main
       - name: Download the NRO from the draft release
         run: |
           mkdir -p out/release
@@ -45,9 +45,10 @@ jobs:
       - name: SD card starter package and checksums
         run: |
           python3 tools/package_release.py out/release
+          git rev-parse HEAD > out/release/PACKAGING_COMMIT
       - name: Upload complete release artifacts
         run: |
-          gh release upload "$RELEASE_TAG" out/release/masseffect-nx-forwarder.nsp out/release/masseffect-nx-starter.zip out/release/masseffect.toml out/release/SHA256SUMS --clobber
+          gh release upload "$RELEASE_TAG" out/release/masseffect-nx-forwarder.nsp out/release/masseffect-nx-starter.zip out/release/masseffect.toml out/release/SHA256SUMS out/release/PACKAGING_COMMIT --clobber
       - name: Publish release only after all packages succeed
         env:
           PRERELEASE: ${{ inputs.prerelease }}
