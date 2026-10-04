@@ -73,3 +73,20 @@ The diagnostic contact sheet contains the turn without a clearly disappearing
 character at its 5 FPS sampling rate; this sparse sampling is insufficient for
 acceptance. Both TOML restoration and original Coalesced SHA-1 were read back,
 and the game was closed before releasing the lease.
+
+## Repeatable camera-motion reproduction
+
+With an exclusive console lease and production TOML unchanged, holding the right
+stick at +28000 for 25 seconds reproduced disappearing characters in the native
+Album recording. The user's refined route was then recorded: 16 alternating
++28000/-28000 right-stick intervals of 0.9 seconds (eight back-and-forth cycles)
+across the two side views of Shepard, after loading the same Eden Prime save.
+The arc clip has an original encoded frame at PTS 13.449989 seconds where the
+characters disappear while the world, targeting ring and HUD label remain.
+This was inspected in a native-frame contact sheet, without FPS resampling.
+
+Local evidence is under out/flicker-repro/: continuous-production.mp4,
+arc-production.mp4, arc-input.json and arc-evidence.json. These remain local,
+ignored diagnostic artifacts. No settings changed during either route. ME1 was
+closed and HOME verified before handing the lease back. This confirms a visual
+failure with the current configuration, not its cause or a fix.
