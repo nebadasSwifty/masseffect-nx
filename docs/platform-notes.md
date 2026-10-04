@@ -137,11 +137,10 @@ All of this is in `sdk/src/core/guest_memory_switch.cpp` and `memory_switch.cpp`
   dangerous if that core saturates, which is why it is a setting.
 - **Lost wake-ups.** Deciding to sleep on a condition variable and signalling without the lock held hung a worker. Every
   signal in the presenter is sent with the lock held.
-- **`log_async`.** The SDK keeps the asynchronous logger off by default and says that, on the earlier title it was
-  measured on, turning it on made stutter far worse (the queue blocked the thread that feeds the GPU, and the logger
-  thread rarely ran). The shipped `masseffect.toml` turns it on and says it removes the stutter of the periodic flush.
-  These two statements have not been reconciled for Mass Effect: if you see long frames in the log, try `log_async =
-  false`.
+- **`log_async`.** Keep it off in the shipped settings, matching the SDK default. On Horizon the async writer can be
+  starved, fill its blocking queue and stall the thread that feeds the GPU. A stationary Eden Prime comparison with
+  a four-frame texture recheck interval gave about 26 fps with either logger; this does not establish a performance
+  improvement, but there is no reason to opt into the known queue-starvation risk.
 - **Fibers.** devkitA64 has no `ucontext`, so fibers switch contexts in assembly (`fiber_switch.cpp`).
 - **Timers.** Never read `cntvct_el0` directly: it faults on Horizon (the game started to a black screen and ended in
   `std::terminate`). Use libnx's `armGetSystemTick`.

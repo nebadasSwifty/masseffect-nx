@@ -84,6 +84,14 @@ docker run --rm "${user[@]+"${user[@]}"}" "${mounts[@]}" -w "$ROOT" \
   -e APP_VERSION="${MASSEFFECT_VERSION:-1.0.0}" \
   -e FAST_MATH="${MASSEFFECT_FAST_MATH:-ON}" \
   "$DEVKITA64_IMAGE" bash -euo pipefail -c '
+    # An older SDK can link successfully while silently omitting the project NVK patches.
+    # Check the actual archive, rather than trusting its folder name or SOURCE.txt.
+    /opt/devkitpro/devkitA64/bin/aarch64-none-elf-nm --defined-only \
+      "$MESA_SDK/opt/devkitpro/portlibs/switch/lib/libvulkan.a" > /tmp/masseffect-nvk-symbols.txt
+    if ! grep -Eq " [BD] nvk_switch_draw$" /tmp/masseffect-nvk-symbols.txt; then
+      echo "error: Mesa SDK lacks the Mass Effect NVK patches. Rebuild with mesa/build_mesa_docker.sh" >&2
+      exit 1
+    fi
     cmake -S app -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ROOT/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro -DREXSDK_DIR="$SDK_DIR" \

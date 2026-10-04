@@ -95,9 +95,10 @@ and colour (FP16) as prepared textures plus the depth test against the scene dep
 
 ### 8. Texture popping and flicker (not verified)
 
-Suspected cause: the stable-texture recheck interval of up to 32 frames. A setting exists to lower it
-(`masseffect_native_texture_interval_max`, try 4); it was not tested on the console. 16-bit render target support
-made flicker worse (t285/t286) and was rejected.
+One suspected cause is the stable-texture recheck interval of up to 32 frames plus jitter. The shipped settings now
+use `masseffect_native_texture_interval_max = 4`. A stationary Eden Prime console test stayed around 26 fps, but
+that does not prove all temporal artifacts are fixed. 16-bit render target support made flicker worse (t285/t286)
+and was rejected.
 
 ### 9. Mako wheels float apart from the body (open, not a renderer bug)
 

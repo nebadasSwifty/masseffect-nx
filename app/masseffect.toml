@@ -47,9 +47,8 @@ masseffect_scene_height = 544
 # One of: trace, debug, info, warn, error, critical, off.
 # log_level = "info"
 
-# Write the log from a separate thread (the calling thread only queues the message). Removes the stutter of the
-# periodic flush; the downside is that the last messages are lost if the game hangs.
-log_async = true
+# Keep the synchronous logger: on Horizon a starved async writer can fill its queue and block the ring thread.
+log_async = false
 
 
 # ----------------------------------------------------------------------------
@@ -115,6 +114,8 @@ masseffect_native_conversion_frag = true
 # --- Memory and caches ---
 # Texture cache budget in MB (older textures are released above it).
 masseffect_native_textures_mb_max = 128
+# Recheck streamed textures within four frames when the game reuses their guest-memory address.
+masseffect_native_texture_interval_max = 4
 # Recreate the Vulkan pipelines of earlier sessions in the background at startup (list in cache/).
 masseffect_native_pipelines_prewarm = true
 # Per-stage shader cache keys in NVK; needs the patched driver from mesa/.

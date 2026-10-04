@@ -52,8 +52,8 @@ they are]. The prewarm thread spends its time in `_free_r` and `blake3_hash_many
 
 ### Logging [V]
 Not a bottleneck: 298 lines / 40 KB in the first 5 s, ~100 KB per 5 s later; SDK already flushes once per second
-(`flush_level` warn + `log_flush_interval` 1) and `log_async = true` is set in the toml (the SDK comment warns it
-hurt fps earlier; not touched here). One burst: 4536 lines / 536 KB of `[seqrec]` in 40-45 s (map load).
+(`flush_level` warn + `log_flush_interval` 1). These runs used `log_async = true`; the current default is false to
+avoid the SDK's documented async queue starvation on Horizon. One burst: 4536 lines / 536 KB of `[seqrec]` in 40-45 s (map load).
 `profile.log` is written every 10 s from the profiler, 1.7 MB per 170 s. The reference-port idea (RAM buffer, flush 0.5 s)
 is already mostly done; expected gain < 0.2 s.
 

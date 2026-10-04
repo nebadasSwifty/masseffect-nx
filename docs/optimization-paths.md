@@ -281,7 +281,7 @@ skipped. The proof reads the vertex shader on the CPU to see the rectangle.
 | Shipped list of pipeline keys so a thread compiles during the 8.6 s CPU-bound guest start-up (E32c) | open | needs a decision: does it count as a cold start? | none |
 | Texture memory cap and caches between frames | shipped | 1 Oct root cause 4 (thrashing at 128 MB) | `masseffect_native_textures_mb_max`, `masseffect_native_cache_textures_between_frames`, `masseffect_native_invalidate_textures_each_copy` |
 | Resolved images in a reuse pool; sampling at the logical size of the resolved texture | shipped | allocation churn 1445 down to 3 images in the diagnostic run; see [native-renderer.md](native-renderer.md) | `masseffect_native_reuse_alloc_resolved`, `masseffect_native_logical_resolved_size` |
-| Texture recheck interval up to 32 frames | open | probable cause of texture popping; test with 4 | `masseffect_native_texture_interval_max` |
+| Texture recheck interval | shipped at 4 frames | probable contributor to texture popping; stationary console test about 26 fps; temporal correctness still open | `masseffect_native_texture_interval_max` |
 
 ## 6. Driver (Mesa NVK for the Switch GPU)
 

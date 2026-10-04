@@ -54,6 +54,10 @@ Set repository variables:
 - `MASSEFFECT_XEX`: absolute path to your supported `default.xex` outside the runner checkout.
 - `MESA_SDK`: absolute path to the SDK built by `mesa/build_mesa_docker.sh`.
 
+The NRO build checks the actual Vulkan archive for the project's `nvk_switch_draw`
+contract. An older Mesa SDK is rejected even if it would link successfully: rebuild
+it with `mesa/build_mesa_docker.sh` rather than reusing another port's SDK.
+
 The workflow validates the edition hash, builds the host generator, runs codegen,
 builds the NRO, creates a tagged draft and dispatches the same NSP release workflow.
 A standard GitHub runner cannot build the game executable from this public checkout
