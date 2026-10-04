@@ -31,6 +31,7 @@ mkdir -p "$out/wasm" "$out/releases"
 cp "$inst/index.html" "$inst/style.css" "$inst/config.js" "$out/"
 cp -R "$inst/js" "$inst/assets" "$out/"
 touch "$out/.nojekyll"
+cp "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" "$out/"
 
 # masseffect.toml: the settings file of the build (the page downloads it and puts it into the zip).
 cp "$root/app/masseffect.toml" "$out/masseffect.toml"

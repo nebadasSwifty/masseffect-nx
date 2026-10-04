@@ -24,6 +24,10 @@ on:
         description: 'Release to serve (empty selects the most recent published release, including prereleases)'
         required: false
         type: string
+      rebuild_dxc:
+        description: 'Rebuild DXC from C++ instead of using the verified reference WASM compiler (slow)'
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -64,7 +68,7 @@ jobs:
           if-no-files-found: error
 
   dxc:
-    name: Build DXC (WebAssembly)
+    name: Prepare verified DXC (WebAssembly)
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -74,30 +78,33 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dxc-out
-          key: dxc-wasm-${{ env.DXC_COMMIT }}-${{ env.EMSDK_VERSION }}-${{ hashFiles('shaders/wasm/dxc_web.cpp', 'shaders/wasm/link_dxc_wasm.sh') }}
+          key: dxc-wasm-${{ inputs.rebuild_dxc || false }}-${{ env.DXC_COMMIT }}-${{ env.EMSDK_VERSION }}-${{ hashFiles('shaders/wasm/dxc_web.cpp', 'shaders/wasm/link_dxc_wasm.sh', 'installer/tools/fetch_dxc.sh') }}
+      - name: Fetch and verify the reference DXC compiler
+        if: inputs.rebuild_dxc != true && steps.cache.outputs.cache-hit != 'true'
+        run: installer/tools/fetch_dxc.sh dxc-out
       - uses: mymindstorm/setup-emsdk@v14
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: inputs.rebuild_dxc == true && steps.cache.outputs.cache-hit != 'true'
         with:
           version: ${{ env.EMSDK_VERSION }}
           actions-cache-folder: emsdk-cache
       - name: Install build tools
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: inputs.rebuild_dxc == true && steps.cache.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build cmake python3
       - name: Fetch DXC at the pinned commit (with submodules)
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: inputs.rebuild_dxc == true && steps.cache.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/microsoft/DirectXShaderCompiler.git "$RUNNER_TEMP/dxc"
           git -C "$RUNNER_TEMP/dxc" checkout "$DXC_COMMIT"
           git -C "$RUNNER_TEMP/dxc" submodule update --init --recursive --depth 1
       - name: Native build of the table generators
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: inputs.rebuild_dxc == true && steps.cache.outputs.cache-hit != 'true'
         run: |
           cmake -G Ninja -S "$RUNNER_TEMP/dxc" -B "$RUNNER_TEMP/dxc-host" -C "$RUNNER_TEMP/dxc/cmake/caches/PredefinedParams.cmake" \
             -DCMAKE_BUILD_TYPE=Release -DENABLE_SPIRV_CODEGEN=ON -DLLVM_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_TESTS=OFF \
             -DHLSL_INCLUDE_TESTS=OFF -DSPIRV_BUILD_TESTS=OFF
           ninja -C "$RUNNER_TEMP/dxc-host" llvm-tblgen clang-tblgen
       - name: WebAssembly build of DXC
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: inputs.rebuild_dxc == true && steps.cache.outputs.cache-hit != 'true'
         run: |
           emcmake cmake -G Ninja -S "$RUNNER_TEMP/dxc" -B "$RUNNER_TEMP/dxc-wasm" -C "$RUNNER_TEMP/dxc/cmake/caches/PredefinedParams.cmake" \
             -DCMAKE_BUILD_TYPE=Release -DENABLE_SPIRV_CODEGEN=ON -DLLVM_TARGETS_TO_BUILD=None \
@@ -108,7 +115,7 @@ jobs:
             "-DCMAKE_CXX_FLAGS=-Wno-invalid-specialization -Wno-error -D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION -D_LIBCPP_ENABLE_CXX17_REMOVED_AUTO_PTR -D_LIBCPP_ENABLE_CXX20_REMOVED_TYPE_TRAITS"
           ninja -C "$RUNNER_TEMP/dxc-wasm" dxcompiler
       - name: Link dxc_web
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: inputs.rebuild_dxc == true && steps.cache.outputs.cache-hit != 'true'
         run: |
           DXC_SRC="$RUNNER_TEMP/dxc" DXC_BUILD="$RUNNER_TEMP/dxc-wasm" OUT="$PWD/dxc-out" shaders/wasm/link_dxc_wasm.sh
           ls -l dxc-out

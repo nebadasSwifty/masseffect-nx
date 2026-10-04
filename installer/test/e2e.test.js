@@ -20,15 +20,20 @@ const here = dirname(fileURLToPath(import.meta.url));
 const wasmDir = process.env.MASSEFFECT_TEST_WASM;
 const disc = process.env.MASSEFFECT_TEST_DISC;
 const haveDxc = spawnSync(process.env.DXC || 'dxc', ['--version']).status === 0 || spawnSync(process.env.DXC || 'dxc', ['-?']).status === 0;
-const skip = !wasmDir || !disc || !haveDxc ? 'set MASSEFFECT_TEST_WASM and MASSEFFECT_TEST_DISC and have dxc' : false;
+const realDxcWasm = process.env.MASSEFFECT_TEST_DXC_WASM === '1';
+const skip = !wasmDir || !disc || (!realDxcWasm && !haveDxc) ? 'set MASSEFFECT_TEST_WASM and MASSEFFECT_TEST_DISC and have dxc' : false;
 
 function makeSite() {
   const site = mkdtempSync(join(tmpdir(), 'site-'));
   const w = join(site, 'wasm');
   spawnSync('mkdir', ['-p', w, join(site, 'releases')]);
   for (const f of ['scan.mjs', 'scan.wasm', 'hlsl.mjs', 'hlsl.wasm', 'pack.mjs', 'pack.wasm']) copyFileSync(join(wasmDir, f), join(w, f));
-  copyFileSync(join(here, 'fixtures/dxc_native_shim.mjs'), join(w, 'dxc_web.mjs'));
-  writeFileSync(join(w, 'dxc_web.wasm'), '');
+  if (realDxcWasm) {
+    for (const f of ['dxc_web.mjs', 'dxc_web.wasm']) copyFileSync(join(wasmDir, f), join(w, f));
+  } else {
+    copyFileSync(join(here, 'fixtures/dxc_native_shim.mjs'), join(w, 'dxc_web.mjs'));
+    writeFileSync(join(w, 'dxc_web.wasm'), '');
+  }
   copyFileSync(join(here, '../../shaders/XenosRecomp/shader_common.h'), join(w, 'shader_common.h'));
   const nro = Buffer.from('NRO0-fake-build-bytes'.repeat(100));
   const toml = Buffer.from('# fake toml\n');
@@ -86,7 +91,7 @@ const smallDisc = () => [
   '$SystemUpdate/system.manifest', 'nxeart',
 ].map(discFile).concat([{ path: 'FillerFiles/0042sb3o.jnk', size: 3, blob: new Blob([new Uint8Array(3)]) }]);
 
-test('full run: scan, translate (native DXC shim), pack, zip', { skip, timeout: 600000 }, async () => {
+test('full run: scan, translate, compile with DXC, pack, zip', { skip, timeout: 600000 }, async () => {
   const { site, nro, toml } = makeSite();
   try {
     const sink = new MemorySink();

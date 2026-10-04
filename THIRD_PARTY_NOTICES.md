@@ -73,3 +73,20 @@ from `shaders/` (the scanner includes its own LZO1X decoder) and, when it is bui
 
 Mass Effect is a trademark of Electronic Arts Inc. Nintendo Switch is a trademark of Nintendo. Xbox 360 is a trademark of
 Microsoft. This project is not affiliated with or endorsed by any of them.
+
+## Release NSP forwarder and browser DXC
+
+The NSP build downloads and compiles [Forwarder-Mod](https://github.com/Skywalker25/Forwarder-Mod)
+(commit `9853bd9167d5a7f0c5fdf935864245c1fbcf8282`), derived from switchbrew/nx-hbloader
+(ISC license), and [hacBrewPack](https://github.com/rlaphoenix/hacBrewPack)
+(commit `745b16ecfc9ce055743067d200572204cb2aac6c`, GPL-2.0, with bundled mbedTLS).
+The loader is adapted to modern libnx/npdmtool and configured for a 39-bit full application.
+The exact adaptations are in `tools/build_nsp.sh`; upstream licenses stay in the source trees.
+
+The browser installer reuses the DXC v2025.1 WASM compiler from
+[StevensND/nfsmw-nx-installer](https://github.com/StevensND/nfsmw-nx-installer/tree/e7ec1b651321d752ea34b05bc61cc210543f44d6)
+at a fixed commit with both artifact SHA-256 hashes checked in `installer/tools/fetch_dxc.sh`.
+It contains DirectXShaderCompiler and LLVM under the University of Illinois/NCSA
+Open Source License, SPIRV-Tools under Apache-2.0, and SPIRV-Headers under MIT.
+Source: [Microsoft DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler/tree/75a029d95e767f291885e081f71ed951acad0019).
+The source rebuild workflow and wrapper are provided in `shaders/wasm/`.

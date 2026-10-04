@@ -60,7 +60,8 @@ jobs on the private runner. Regular CI runs on GitHub-hosted runners.
 Enable **Settings → Pages → Source: GitHub Actions**. The site is hosted at
 https://nebadasswifty.github.io/masseffect-nx/.
 
-**Installer page** compiles scan/hlsl/pack and DXC with Emscripten, runs real WASM
+**Installer page** compiles scan/hlsl/pack with Emscripten, fetches the SHA-256 verified
+DXC v2025.1 WASM from the pinned reference installer commit, runs real WASM
 vertex/pixel shader smoke tests, and stages the release NRO, NSP and matching settings
 on the same origin. SHA-256 hashes and sizes are recorded in `releases/manifest.json`.
 The NSP can be downloaded directly from the installer. The game stays on the user's
@@ -69,5 +70,7 @@ computer; all extraction and shader compilation happen inside the browser.
 A missing WASM module or release asset fails deployment and keeps the last successful
 site available. Manual deployment accepts `release_tag`; otherwise the newest
 published release is selected, including prereleases. DXC is cached by compiler
-commit, Emscripten version and wrapper sources. Full disc processing still needs the
+commit, Emscripten version and wrapper sources. The manual `rebuild_dxc` option
+compiles DXC from its C++ sources instead. The reference compiler was also tested
+on real Mass Effect packages through the complete scan/translate/compile/pack/ZIP pipeline. Full disc processing still needs the
 memory described in `installer/README.md`.

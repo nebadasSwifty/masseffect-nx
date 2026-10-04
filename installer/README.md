@@ -117,8 +117,9 @@ The page needs a secure context (`https://` or `localhost`): it hashes `default.
 OUT=installer/wasm shaders/wasm/build_wasm_tools.sh hlsl pack scan      # a few seconds to build
 ```
 
-`dxc_web.mjs`/`dxc_web.wasm` are built by the mandatory `dxc` workflow job at the pinned
-DXC commit. Deployment loads every module and compiles vertex/pixel shaders to SPIR-V.
+`dxc_web.mjs`/`dxc_web.wasm` come from the pinned, SHA-256 verified DXC v2025.1 build
+of the reference nfsmw-nx installer. The mandatory `dxc` job can also rebuild them
+from the pinned C++ source by selecting `rebuild_dxc` in a manual run. Deployment loads every module and compiles vertex/pixel shaders to SPIR-V.
 A missing compiler blocks deployment rather than publishing an incomplete installer.
 See [../docs/releases.md](../docs/releases.md) for the release and Pages setup.
 
