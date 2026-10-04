@@ -39,7 +39,7 @@ concurrency:
 env:
   EMSDK_VERSION: '4.0.10'
   XXHASH_REF: 'v0.8.2'
-  FMT_REF: '10.2.1'
+  FMT_REF: '12.1.0'  # matches the SDK and the tested shader translator
   DXC_COMMIT: '75a029d95e767f291885e081f71ed951acad0019'   # must match shaders/wasm/link_dxc_wasm.sh
 
 jobs:
