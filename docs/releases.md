@@ -20,7 +20,9 @@ and hacBrewPack, and produces:
 - `masseffect-nx-starter.zip`, extracted into the SD card root.
 - `masseffect.toml` and `SHA256SUMS`.
 
-The workflow publishes the draft only after packaging succeeds, then explicitly
+The workflow publishes a normal release marked Latest by default (the manual
+`prerelease` option is available for preview builds). It publishes the draft only
+after packaging succeeds, then explicitly
 dispatches **Installer page**. An Actions-created release does not by itself trigger
 another workflow when using `GITHUB_TOKEN`.
 

@@ -13,8 +13,8 @@ git rev-parse "$TAG" >/dev/null 2>&1 || git tag "$TAG"
 [[ "$(git rev-parse "$TAG^{commit}")" = "$(git rev-parse HEAD)" ]] || { echo 'error: tag does not match the current sources' >&2; exit 1; }
 git push origin HEAD:main "$TAG"
 if ! gh release view "$TAG" >/dev/null 2>&1; then
-  gh release create "$TAG" --verify-tag --draft --prerelease --title "Mass Effect NX $TAG" --notes-file docs/release-notes.md
+  gh release create "$TAG" --verify-tag --draft --title "Mass Effect NX $TAG" --notes-file docs/release-notes.md
 fi
 gh release upload "$TAG" "$NRO#masseffect-nx.nro" --clobber
-gh workflow run release.yml --ref main -f tag="$TAG" -f prerelease=true
+gh workflow run release.yml --ref main -f tag="$TAG" -f prerelease=false
 echo "Actions will build the NSP and publish: https://github.com/nebadasSwifty/masseffect-nx/actions"

@@ -54,8 +54,8 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git tag "$RELEASE_TAG"
           git push origin "$RELEASE_TAG"
-          gh release create "$RELEASE_TAG" out/nx/masseffect-nx.nro --verify-tag --draft --prerelease --title "Mass Effect NX $RELEASE_TAG" --notes-file docs/release-notes.md
-          gh workflow run release.yml --ref main -f tag="$RELEASE_TAG" -f prerelease=true
+          gh release create "$RELEASE_TAG" out/nx/masseffect-nx.nro --verify-tag --draft --title "Mass Effect NX $RELEASE_TAG" --notes-file docs/release-notes.md
+          gh workflow run release.yml --ref main -f tag="$RELEASE_TAG" -f prerelease=false
       - name: Remove private input from the runner checkout
         if: always()
         run: rm -f assets/game_root/default.xex

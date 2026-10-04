@@ -10,7 +10,7 @@ on:
         type: string
       prerelease:
         description: Mark the release as a prerelease
-        default: true
+        default: false
         type: boolean
 permissions:
   contents: write
@@ -54,7 +54,11 @@ jobs:
       - name: Publish release only after all packages succeed
         env:
           PRERELEASE: ${{ (github.event_name == 'release' && github.event.release.prerelease) || (github.event_name == 'workflow_dispatch' && inputs.prerelease) }}
-        run: gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE"
+        run: |
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE"
+          if [ "$PRERELEASE" = false ]; then
+            gh release edit "$RELEASE_TAG" --latest
+          fi
       # Events created with GITHUB_TOKEN do not trigger another workflow automatically.
       - name: Refresh the installer with this release
         run: gh workflow run installer.yml --ref main -f release_tag="$RELEASE_TAG"
