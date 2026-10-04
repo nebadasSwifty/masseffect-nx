@@ -5,9 +5,6 @@ name: Installer page
 #
 # One-time setup: Settings > Pages > Source: "GitHub Actions".
 #
-# STATUS: the scan/hlsl/pack tools are built the way shaders/wasm/build_wasm_tools.sh was run by hand. The DXC
-# WebAssembly build (job "dxc") follows the recipe in shaders/wasm/link_dxc_wasm.sh and has NOT been run yet: if it
-# fails, the site is still deployed and the page tells the user that dxc_web.mjs is missing.
 on:
   push:
     branches: [main]
@@ -17,10 +14,16 @@ on:
       - 'shaders/tools/**'
       - 'shaders/XenosRecomp/**'
       - 'app/masseffect.toml'
+      - 'extras/icon.jpg'
       - '.github/workflows/installer.yml'
   release:
     types: [published]     # a new release: redeploy so the page serves the new NRO
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release to serve (empty selects the most recent published release, including prereleases)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -64,7 +67,6 @@ jobs:
     name: Build DXC (WebAssembly)
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    continue-on-error: true      # untested recipe: the site is deployed without it if this fails
     steps:
       - uses: actions/checkout@v4
       - name: Cache the result
@@ -119,8 +121,6 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     needs: [tools, dxc]
-    # run even when the (untested) DXC job failed
-    if: ${{ !cancelled() && needs.tools.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -136,23 +136,26 @@ jobs:
           name: wasm-tools
           path: wasm-all
       - uses: actions/download-artifact@v4
-        if: needs.dxc.result == 'success'
         with:
           name: wasm-dxc
           path: wasm-all
-      - name: Latest release assets (the NRO builds)
+      - name: Published release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
           mkdir -p release-assets
-          if tag=$(gh release view --json tagName -q .tagName 2>/dev/null); then
-            gh release download "$tag" --pattern '*.nro' --dir release-assets
-            echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
-          else
-            echo "::warning::No release yet: the page will report that no build is published."
+          tag="$REQUESTED_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq '[.[] | select(.draft == false)][0].tag_name // empty')
           fi
-      - name: Stage the site
-        run: installer/tools/stage_site.sh _site --wasm wasm-all --releases release-assets
+          test -n "$tag" || { echo '::error::Publish a complete NRO/NSP release before deploying'; exit 1; }
+          gh release download "$tag" --pattern '*.nro' --pattern '*.nsp' --pattern 'masseffect.toml' --dir release-assets
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+      - name: Verify DXC can compile a shader
+        run: node installer/tools/wasm_smoke.mjs wasm-all
+      - name: Stage a complete site
+        run: installer/tools/stage_site.sh _site --wasm wasm-all --releases release-assets --require-complete
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

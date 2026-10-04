@@ -1,0 +1,60 @@
+name: Release NRO and NSP
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing draft release tag containing masseffect-nx.nro (e.g. v0.1.0)'
+        required: true
+        type: string
+      prerelease:
+        description: Mark the release as a prerelease
+        default: true
+        type: boolean
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Download the NRO from the draft release
+        run: |
+          mkdir -p out/release
+          gh release download "$RELEASE_TAG" --pattern masseffect-nx.nro --dir out/release
+      - name: Load the private packing keys
+        env:
+          PACK_KEYS: ${{ secrets.SWITCH_PROD_KEYS }}
+        run: |
+          test -n "$PACK_KEYS" || { echo '::error::Configure the SWITCH_PROD_KEYS Actions secret'; exit 1; }
+          umask 077
+          printf '%s\n' "$PACK_KEYS" > "$RUNNER_TEMP/masseffect-prod.keys"
+      - name: Build the 39-bit NSP forwarder
+        env:
+          SWITCH_PROD_KEYS: ${{ runner.temp }}/masseffect-prod.keys
+        run: tools/build_nsp.sh out/release/masseffect-nx.nro out/release
+      - name: SD card starter package and checksums
+        run: |
+          python3 tools/package_release.py out/release
+      - name: Upload complete release artifacts
+        run: |
+          gh release upload "$RELEASE_TAG" out/release/masseffect-nx-forwarder.nsp out/release/masseffect-nx-starter.zip out/release/masseffect.toml out/release/SHA256SUMS --clobber
+      - name: Publish release only after all packages succeed
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE"
+      # Events created with GITHUB_TOKEN do not trigger another workflow automatically.
+      - name: Refresh the installer with this release
+        run: gh workflow run installer.yml --ref main -f release_tag="$RELEASE_TAG"
+      - name: Remove private keys
+        if: always()
+        run: rm -f "$RUNNER_TEMP/masseffect-prod.keys"

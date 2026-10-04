@@ -19,7 +19,14 @@ body {
   background: radial-gradient(1200px 600px at 80% -10%, #14235a 0%, transparent 60%), var(--bg);
   min-height: 100vh;
 }
-.hero { max-width: 880px; margin: 0 auto; padding: 24px 16px 0; }
+.hero { max-width: 880px; margin: 0 auto; padding: 40px 16px 16px; display: flex; align-items: center; gap: 32px; }
+.cover { width: 192px; height: 192px; border-radius: 12px; box-shadow: 0 12px 60px #0009; flex-shrink: 0; }
+h1 { font-size: clamp(2rem, 6vw, 3.4rem); letter-spacing: -.04em; margin: 0; line-height: 1.15; }
+.eyebrow { color: var(--amber); letter-spacing: .14em; font-size: .7rem; margin: 0 0 12px; }
+.hero-subtitle { color: var(--text); font-size: 1.2rem; margin: 12px 0 8px; }
+.hero-description { color: var(--muted); margin: 0 0 14px; }
+a.btn { display: inline-block; text-decoration: none; }
+@media (max-width: 560px) { .hero { gap: 20px; padding-top: 24px; } .cover { width: 112px; height: 112px; } .hero-description { font-size: .9rem; } .eyebrow { font-size: .6rem; } }
 .banner { width: 100%; height: auto; border-radius: var(--radius); display: block; }
 main { max-width: 880px; margin: 0 auto; padding: 8px 16px 32px; }
 .lead { font-size: 1.05rem; color: var(--muted); margin: 18px 0; }

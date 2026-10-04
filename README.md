@@ -26,18 +26,14 @@ renderer running on NVK (Mesa). It runs at the console's **stock clocks, with no
 
 ## How to install
 
-> [!IMPORTANT]
-> **Status of the installer page.** The page reads the disc in your browser and builds the package, but its shader
-> translation step needs DXC compiled to WebAssembly, and that build has not been completed yet (see
-> [installer/README.md](installer/README.md), "Building the WebAssembly tools"). Until it is, the page cannot produce
-> the shader package by itself: make it on a computer with the command line tools described in
-> [docs/building.md](docs/building.md) and [shaders/README.md](shaders/README.md), then use the layout below.
-
 1. Open the installer page: **https://nebadasswifty.github.io/masseffect-nx/**
 2. Choose your format (**Disc image (.iso)** or **XEX format**, the extracted disc folder with `default.xex`) and press
    **Create masseffect-nx.zip**. Everything runs in your browser and the game files never leave your computer: the
    page detects your edition, downloads its build and makes the shaders from your disc.
 3. Extract the downloaded `masseffect-nx.zip` into `sdmc:/switch/`.
+4. Download `masseffect-nx-forwarder.nsp` from the installer or [Releases](https://github.com/nebadasSwifty/masseffect-nx/releases),
+   install it with your CFW title installer, and launch the HOME menu tile. The forwarder uses 39-bit application mode.
+   The NSP requires the NRO, game files and shaders on the SD card.
 
 Your `masseffect-nx` folder should look like this:
 
@@ -296,3 +292,8 @@ violates Nintendo's terms of service and can get a console banned: your call.
 Copyright (c) 2026 NebadasSwifty. Source code is provided under the GPL-3.0 License (see [LICENSE](LICENSE)), which the
 port inherits from the project it started from. The SDK changes are under the SDK's BSD-3-Clause license, and the shader
 translator and Mesa changes under MIT, so other ports can reuse them (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+
+## Automated releases
+
+GitHub Actions packages the NRO, NSP launcher and SD starter ZIP, then deploys the browser installer to GitHub Pages.
+See [docs/releases.md](docs/releases.md) for local publishing and the optional private runner for NRO builds.

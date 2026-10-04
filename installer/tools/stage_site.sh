@@ -16,8 +16,10 @@ out=${1:?usage: stage_site.sh <out dir> [--wasm <dir>] [--releases <dir>]}
 shift
 wasm=$inst/wasm
 releases=
+strict=0
 while [ $# -gt 0 ]; do
   case $1 in
+    --require-complete) strict=1; shift;;
     --wasm) wasm=$2; shift 2;;
     --releases) releases=$2; shift 2;;
     *) echo "unknown argument $1" >&2; exit 1;;
@@ -44,8 +46,19 @@ done
 echo "staged $n wasm files from $wasm"
 [ "$n" -eq 8 ] || echo "WARNING: expected 8 wasm files (scan, hlsl, pack, dxc_web: .mjs + .wasm); the page will report the missing ones" >&2
 
-if [ -n "$releases" ] && ls "$releases"/*.nro >/dev/null 2>&1; then
-  cp "$releases"/*.nro "$out/releases/"
+if [ -n "$releases" ]; then
+  for asset in "$releases"/*.nro "$releases"/*.nsp; do
+    [ ! -f "$asset" ] || cp "$asset" "$out/releases/"
+  done
+  # Settings must belong to the same release as the executable.
+  [ ! -f "$releases/masseffect.toml" ] || cp "$releases/masseffect.toml" "$out/masseffect.toml"
+fi
+if [ "$strict" -eq 1 ]; then
+  [ "$n" -eq 8 ] || { echo 'error: incomplete WebAssembly toolchain' >&2; exit 1; }
+  for asset in masseffect-nx.nro masseffect-nx-forwarder.nsp; do
+    [ -s "$out/releases/$asset" ] || { echo "error: missing release asset $asset" >&2; exit 1; }
+  done
+  [ -s "$releases/masseffect.toml" ] || { echo 'error: missing release settings' >&2; exit 1; }
 fi
 cp "$out/masseffect.toml" "$out/releases/.toml-for-manifest"
 python3 - "$out" "${RELEASE_TAG:-}" <<'PY'
@@ -59,7 +72,7 @@ for name in sorted(os.listdir(rel)):
         data = open(path, "rb").read()
         assets["masseffect.toml"] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         os.remove(path)
-    elif name.endswith(".nro"):
+    elif name.endswith((".nro", ".nsp")):
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):

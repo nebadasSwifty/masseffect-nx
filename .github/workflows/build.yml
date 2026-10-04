@@ -1,0 +1,61 @@
+name: Build Switch NRO
+# The executable is generated from the owner's Xbox 360 disc. Keep that input
+# on a private runner instead of uploading it to this public repository.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New version tag for the checked-out main commit (vX.Y.Z)'
+        required: true
+        type: string
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: switch-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: [self-hosted, masseffect-build]
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      MASSEFFECT_XEX: ${{ vars.MASSEFFECT_XEX }}
+      MESA_SDK: ${{ vars.MESA_SDK }}
+      JOBS: '4'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Validate private inputs and version
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][a-zA-Z0-9.-]+)?$ ]] || exit 1
+          test -f "$MASSEFFECT_XEX" || { echo 'Set the MASSEFFECT_XEX repository variable to a private default.xex'; exit 1; }
+          test -f "$MESA_SDK/opt/devkitpro/portlibs/switch/lib/libvulkan.a" || { echo 'Set MESA_SDK to the private NVK SDK'; exit 1; }
+          python3 - <<'PY'
+          import hashlib, os
+          with open(os.environ['MASSEFFECT_XEX'], 'rb') as f:
+              digest = hashlib.file_digest(f, 'sha256').hexdigest()
+          assert digest == 'db14a72a5a24a57309b8c51bd0311c676b7018ca6524e3eb85fbc891c2dfc70b', 'Unsupported default.xex edition'
+          PY
+          mkdir -p assets/game_root
+          cp "$MASSEFFECT_XEX" assets/game_root/default.xex
+      - name: Build code generator and translate the game
+        run: |
+          tools/build_host.sh
+          tools/codegen.sh
+      - name: Build NRO with cover icon
+        run: MASSEFFECT_VERSION="${RELEASE_TAG#v}" tools/build_nro.sh
+      - name: Create draft and pass NRO to the release workflow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git tag "$RELEASE_TAG"
+          git push origin "$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" out/nx/masseffect-nx.nro --verify-tag --draft --prerelease --title "Mass Effect NX $RELEASE_TAG" --notes-file docs/release-notes.md
+          gh workflow run release.yml --ref main -f tag="$RELEASE_TAG" -f prerelease=true
+      - name: Remove private input from the runner checkout
+        if: always()
+        run: rm -f assets/game_root/default.xex

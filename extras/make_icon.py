@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draws the NRO icon (extras/icon.jpg, 256x256) and the README banner (extras/banner.png).
+"""Draws the README banner (extras/banner.png), preserving the selected NRO cover icon.
 Original artwork made with Pillow: a planet with an atmosphere, a ring of light and stars.
 Run: python3 extras/make_icon.py   (needs Pillow)"""
 import math, random, os
@@ -96,12 +96,13 @@ def spaced(draw, xy, text, f, fill, tracking):
         draw.text((x, y), ch, font=f, fill=fill)
         x += draw.textlength(ch, font=f) + tracking
 
-icon = scene(256, 256, 118, 138, 78, seed=3)
-icon.save(os.path.join(HERE, "icon.jpg"), quality=92)
+# Preserve the selected cover icon. This script only regenerates the original banner.
+# To replace the icon: use a 256x256 RGB JPEG without EXIF metadata in extras/icon.jpg,
+# then copy it to installer/assets/icon.jpg.
 
 banner = scene(1200, 273, 930, 150, 100, seed=11)
 d = ImageDraw.Draw(banner)
 spaced(d, (70, 82), "MASS EFFECT", font(84), (235, 240, 250), 10)
 spaced(d, (74, 186), "NINTENDO SWITCH PORT", font(26), (240, 170, 90), 8)
 banner.save(os.path.join(HERE, "banner.png"))
-print("wrote icon.jpg and banner.png")
+print("wrote banner.png; preserved icon.jpg")

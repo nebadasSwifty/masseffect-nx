@@ -136,6 +136,8 @@ function(rexglue_switch_add_nro target_name)
     find_program(REXGLUE_NACPTOOL nacptool HINTS "${DEVKITPRO}/tools/bin" NO_DEFAULT_PATH REQUIRED)
     find_program(REXGLUE_ELF2NRO elf2nro HINTS "${DEVKITPRO}/tools/bin" NO_DEFAULT_PATH REQUIRED)
 
+    # Changing the icon must re-run packaging even when executable sources are unchanged.
+    set_property(TARGET ${target_name} APPEND PROPERTY LINK_DEPENDS "${ARG_ICON}")
     set(_dir "$<TARGET_FILE_DIR:${target_name}>")
     add_custom_command(TARGET ${target_name} POST_BUILD
         COMMAND "${REXGLUE_NACPTOOL}" --create "${ARG_NAME}" "${ARG_AUTHOR}" "${ARG_VERSION}"

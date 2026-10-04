@@ -50,3 +50,8 @@ __pycache__/
 .claude/
 /assets/
 /tools/console-test/ref/
+
+# Console packing keys: never commit these.
+*.keys
+keys.dat
+keys.txt

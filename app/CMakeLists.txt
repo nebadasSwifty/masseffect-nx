@@ -184,9 +184,10 @@ if(REXGLUE_PLATFORM_SWITCH)
         set_property(TARGET masseffect APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/function_order.ld")
     endif()
     # On the SD card: sdmc:/switch/masseffect-nx/masseffect-nx.nro with masseffect.toml and game_root/ beside it.
+    set(MASSEFFECT_VERSION "1.0.0" CACHE STRING "NRO display version")
     rexglue_switch_add_nro(masseffect
         NAME "Mass Effect"
         AUTHOR "NebadasSwifty"
-        VERSION "1.0.0"
+        VERSION "${MASSEFFECT_VERSION}"
         ICON "${CMAKE_CURRENT_SOURCE_DIR}/../extras/icon.jpg")
 endif()

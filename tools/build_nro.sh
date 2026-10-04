@@ -81,12 +81,13 @@ echo "== configure and build ($NRO_OUT, -j$JOBS)"
 docker run --rm "${user[@]+"${user[@]}"}" "${mounts[@]}" -w "$ROOT" \
   -e JOBS="$JOBS" -e ROOT="$ROOT" -e SDK_DIR="$SDK_DIR" -e MESA_SDK="$MESA_SDK" -e NRO_OUT="$NRO_OUT" \
   -e LTO="${MASSEFFECT_LTO:-OFF}" -e PGO="${MASSEFFECT_PGO:-}" -e GEN_OPT="${MASSEFFECT_GEN_OPT:-}" \
+  -e APP_VERSION="${MASSEFFECT_VERSION:-1.0.0}" \
   -e FAST_MATH="${MASSEFFECT_FAST_MATH:-ON}" \
   "$DEVKITA64_IMAGE" bash -euo pipefail -c '
     cmake -S app -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ROOT/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro -DREXSDK_DIR="$SDK_DIR" \
-      -DMASSEFFECT_LTO="$LTO" -DMASSEFFECT_PGO="$PGO" -DMASSEFFECT_GEN_OPT="$GEN_OPT" -DMASSEFFECT_FAST_MATH="$FAST_MATH" \
+      -DMASSEFFECT_VERSION="$APP_VERSION" -DMASSEFFECT_LTO="$LTO" -DMASSEFFECT_PGO="$PGO" -DMASSEFFECT_GEN_OPT="$GEN_OPT" -DMASSEFFECT_FAST_MATH="$FAST_MATH" \
       -DREXGLUE_SWITCH_NVK_SDK="$MESA_SDK/opt/devkitpro/portlibs/switch"
     cmake --build "$NRO_OUT" -j "$JOBS"
     # crt0 must be first in .text or the NRO does not boot

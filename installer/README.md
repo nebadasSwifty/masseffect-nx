@@ -117,14 +117,10 @@ The page needs a secure context (`https://` or `localhost`): it hashes `default.
 OUT=installer/wasm shaders/wasm/build_wasm_tools.sh hlsl pack scan      # a few seconds to build
 ```
 
-`dxc_web.mjs`/`dxc_web.wasm` (DXC compiled to WebAssembly) is **not built yet**. `shaders/wasm/link_dxc_wasm.sh` and
-`dxc_web.cpp` are the recipe, and the `dxc` job of the workflow follows it step by step (native table generators,
-Emscripten configure, `ninja dxcompiler`, link) at the pinned DXC commit. That job has never run: it is marked
-`continue-on-error`, the site is deployed without it if it fails, and the page then says
-"The shader tools are not on this site: missing wasm/dxc_web.mjs". The page expects the interface of
-`dxc_web.cpp`: `createDxcModule()` resolving to a module with `FS` and `ccall('compile', 'number', ['string','string','number'],
-[hlslPath, spirvPath, isVertex])`, returning 0 on success. `spirv-val` is not run in the browser; DXC itself rejects the
-four known bad containers.
+`dxc_web.mjs`/`dxc_web.wasm` are built by the mandatory `dxc` workflow job at the pinned
+DXC commit. Deployment loads every module and compiles vertex/pixel shaders to SPIR-V.
+A missing compiler blocks deployment rather than publishing an incomplete installer.
+See [../docs/releases.md](../docs/releases.md) for the release and Pages setup.
 
 ## Changing things
 
