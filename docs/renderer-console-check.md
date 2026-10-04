@@ -50,3 +50,26 @@ not advance the title screen; HOME input did work. No isolated mission-turn
 result is claimed from that attempt. The downloaded Album clip shows motion
 smearing and a falling overlay FPS reading, but no specific disappearing
 surface has yet been identified conclusively.
+
+## Album evidence and follow-up
+
+The previously downloaded Album clip contains an encoded frame at approximately
+4.10 seconds in which both characters disappear while the world, targeting ring,
+and Kaidan Alenko HUD label remain. This is stronger evidence than the earlier
+contact sheet of only the start of the turn. Contact sheets resampled to 60 FPS
+repeat source frames; repeated cells are not independent captured game frames.
+
+In the next exclusive console interval, `detachController` followed by a new
+PLUS hold restored sys-botbase game input. Resume loaded Eden Prime successfully.
+A native Album recording was collected with the production TOML, followed by a
+one-variable diagnostic run with `masseffect_deferred_native_update = false`.
+No fix or performance improvement is accepted from these short runs. The overlay
+was frozen in this interval and cannot supply usable FPS comparisons. Production
+settings are restored before handing the console back to the other chat.
+
+The production capture does not provide a matched turn window comparable to the
+longer-delay diagnostic capture, so these videos cannot establish an A/B fix.
+The diagnostic contact sheet contains the turn without a clearly disappearing
+character at its 5 FPS sampling rate; this sparse sampling is insufficient for
+acceptance. Both TOML restoration and original Coalesced SHA-1 were read back,
+and the game was closed before releasing the lease.
