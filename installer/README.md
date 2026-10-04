@@ -150,7 +150,7 @@ node --test installer/test/          # Node 20+
 * `real-disc.test.js` (optional, read-only; `MASSEFFECT_TEST_ISO`, `MASSEFFECT_TEST_DISC`): the parser on a real image
   against the extracted disc, file by file (names, sizes, bytes of `default.xex` and of files beyond 4 GiB).
 * `e2e.test.js` (optional; `MASSEFFECT_TEST_WASM`, `MASSEFFECT_TEST_DISC`, native `dxc`): the whole pipeline over a few
-  real packages with the real scan/hlsl/pack WebAssembly, the installer's worker code and a native DXC behind the
+  real packages with the real scan/hlsl/pack WebAssembly, the installer's worker code and either the real DXC WASM (`MASSEFFECT_TEST_DXC_WASM=1`) or a native DXC behind the
   `dxc_web` interface (`test/fixtures/dxc_native_shim.mjs`).
 
 ## Limitations

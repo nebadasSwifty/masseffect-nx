@@ -27,7 +27,10 @@ another workflow when using `GITHUB_TOKEN`.
 Configure the encrypted Actions secret `SWITCH_PROD_KEYS` with your own `prod.keys`.
 The packer uses `header_key` and `key_area_key_application_00`. The secret is written
 to a restricted temporary file, mounted read-only, and removed even after failure.
-Keys never enter the release artifacts. Locally:
+Keys never enter the release artifacts. Only the two required key lines need to be
+stored in the secret. Packing also runs when a release is published manually in
+GitHub: attach `masseffect-nx.nro` to the draft before publishing it. Use the helper
+above to keep a release in draft until every artifact succeeds. Locally:
 
 ```sh
 SWITCH_PROD_KEYS=/path/to/prod.keys tools/build_nsp.sh

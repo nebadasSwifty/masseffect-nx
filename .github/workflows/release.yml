@@ -1,5 +1,7 @@
 name: Release NRO and NSP
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -14,7 +16,7 @@ permissions:
   contents: write
   actions: write
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ inputs.tag || github.event.release.tag_name }}
   cancel-in-progress: false
 jobs:
   package:
@@ -22,7 +24,7 @@ jobs:
     timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,7 +53,7 @@ jobs:
           gh release upload "$RELEASE_TAG" out/release/masseffect-nx-forwarder.nsp out/release/masseffect-nx-starter.zip out/release/masseffect.toml out/release/SHA256SUMS out/release/PACKAGING_COMMIT --clobber
       - name: Publish release only after all packages succeed
         env:
-          PRERELEASE: ${{ inputs.prerelease }}
+          PRERELEASE: ${{ (github.event_name == 'release' && github.event.release.prerelease) || (github.event_name == 'workflow_dispatch' && inputs.prerelease) }}
         run: gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE"
       # Events created with GITHUB_TOKEN do not trigger another workflow automatically.
       - name: Refresh the installer with this release

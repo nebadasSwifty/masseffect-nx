@@ -1,6 +1,6 @@
 // End-to-end run of the real pipeline in Node: the real scan/hlsl/pack WebAssembly (built from shaders/wasm), the
 // installer's worker handlers and orchestration, the zip writer, over a few packages of your own disc.
-// DXC runs natively through a shim (the DXC WebAssembly module is not built).
+// DXC can run natively through a shim, or use real WASM with MASSEFFECT_TEST_DXC_WASM=1.
 //   MASSEFFECT_TEST_WASM=<folder with scan/hlsl/pack .mjs+.wasm>  MASSEFFECT_TEST_DISC=<extracted disc>
 //   (needs `dxc` on PATH or DXC=...)  node --test test/e2e.test.js
 import test from 'node:test';
