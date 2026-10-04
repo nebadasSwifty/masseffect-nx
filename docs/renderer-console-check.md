@@ -35,3 +35,18 @@ No stationary FPS improvement is established. Consecutive screenshots and a shor
 camera pan do not establish temporal correctness at the game's frame rate. Texture
 flicker and movement-related drops remain open pending a repeatable route test and
 the player's observation; the changes do not claim to fix every renderer issue.
+
+## Coordination limitation
+
+After these runs, the user disclosed that a second chat could also operate the
+console. A shared exclusive lease was agreed at WORK/.switch-console.lock
+(atomic mkdir, owner.txt containing the thread ID and scenario). Earlier runs
+preceded that protocol and must not be treated as controlled A/B acceptance or
+proof that flicker or frame drops are fixed. v0.1.1 was returned to draft and
+Pages restored to v0.1.0 pending an isolated load-and-camera-turn verification.
+
+The first leased rerun reached Press START, but sys-botbase A/PLUS input did
+not advance the title screen; HOME input did work. No isolated mission-turn
+result is claimed from that attempt. The downloaded Album clip shows motion
+smearing and a falling overlay FPS reading, but no specific disappearing
+surface has yet been identified conclusively.
