@@ -74,7 +74,7 @@ PY
     make -C packer -j2
     # Keep packer diagnostics out of CI logs (it reads console keys).
     if ! packer/hacbrewpack --titleid 01a5eec700000000 -k /run/keys/prod.keys \
-        --nologo --keygeneration 0 --nspdir /output > /work/pack.log 2>&1; then
+        --nologo --keygeneration 1 --nspdir /output > /work/pack.log 2>&1; then
       echo "error: hacBrewPack failed; check that header_key and key_area_key_application_00 are present" >&2
       exit 1
     fi
