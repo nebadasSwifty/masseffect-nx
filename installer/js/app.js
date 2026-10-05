@@ -4,6 +4,7 @@ import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFro
 import { planGameFiles, formatBytes, formatDuration } from './plan.js';
 import { openSink, describeSinkSupport, cleanStaleTemporaryFiles } from './sink.js';
 import { run, Cancelled, UserError, stageIds } from './pipeline.js';
+import { initLanguage, getLanguage, setLanguage, t } from './i18n.js';
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => {
@@ -12,22 +13,48 @@ const el = (tag, props = {}, ...kids) => {
   return e;
 };
 
-const STAGE_NAMES = {
-  download: 'Download the build',
-  scan: 'Read the disc',
-  translate: 'Translate the shaders',
-  pack: 'Pack the shader library',
-  zip: 'Write the zip',
+const STAGE_KEYS = {
+  download: 'stage_download',
+  scan: 'stage_scan',
+  translate: 'stage_translate',
+  pack: 'stage_pack',
+  zip: 'stage_zip',
 };
 
 const state = { format: 'iso', disc: null, running: false, abort: null };
 
+// ---- i18n & language toggle ------------------------------------------------------------------------------------
+function applyLanguage() {
+  const lang = getLanguage();
+  document.documentElement.lang = lang;
+  const btnEn = $('lang-en');
+  const btnRu = $('lang-ru');
+  if (btnEn) btnEn.classList.toggle('active', lang === 'en');
+  if (btnRu) btnRu.classList.toggle('active', lang === 'ru');
+
+  for (const elem of document.querySelectorAll('[data-i18n]')) {
+    const key = elem.getAttribute('data-i18n');
+    const isHtml = elem.getAttribute('data-i18n-html') === 'true';
+    if (isHtml) elem.innerHTML = t(key);
+    else elem.textContent = t(key);
+  }
+
+  setFormat(state.format);
+  if (state.disc) {
+    showEdition();
+  }
+}
+
+initLanguage();
+
+const btnEn = $('lang-en');
+const btnRu = $('lang-ru');
+if (btnEn) btnEn.addEventListener('click', () => { setLanguage('en'); applyLanguage(); });
+if (btnRu) btnRu.addEventListener('click', () => { setLanguage('ru'); applyLanguage(); });
+
 // ---- header / footer -------------------------------------------------------------------------------------------
 $('repo-link').href = CONFIG.project.repoUrl;
 $('author').textContent = CONFIG.project.author;
-for (const [id, name] of [['create-full', CONFIG.zip.fullName], ['create-update', CONFIG.zip.updateName]]) {
-  $(id).textContent = `Create ${name}`;
-}
 
 // ---- environment checks ----------------------------------------------------------------------------------------
 function supportsModuleWorkers() {
@@ -62,7 +89,7 @@ function envProblems() {
   if (!problems.length && !warnings.length) return;
   box.hidden = false;
   box.className = `notice ${problems.length ? 'err' : 'warn'}`;
-  box.replaceChildren(...[...problems, ...warnings].map((t) => el('p', { textContent: t })));
+  box.replaceChildren(...[...problems, ...warnings].map((text) => el('p', { textContent: text })));
   if (problems.length) {
     for (const id of ['pick', 'file-iso', 'file-folder']) $(id).disabled = true;
   }
@@ -70,16 +97,12 @@ function envProblems() {
 cleanStaleTemporaryFiles();
 
 // ---- step 1 ---------------------------------------------------------------------------------------------------
-const hints = {
-  iso: 'The disc image of the Xbox 360 game (single or dual layer). It is read in place and never loaded as a whole.',
-  folder: `The extracted disc: the folder that contains ${CONFIG.disc.xex} next to the game's folders (Layer0, Layer1...). It is read in place.`,
-};
-
 function setFormat(f) {
   state.format = f;
-  $('format-hint').textContent = hints[f];
-  $('pick').textContent = f === 'iso' ? 'Choose .iso file' : 'Choose folder';
-  document.querySelector('.or').textContent = f === 'iso' ? 'or drop it here' : 'or drop the folder here';
+  $('format-hint').textContent = f === 'iso' ? t('format_hint_iso') : t('format_hint_folder');
+  $('pick').textContent = f === 'iso' ? t('pick_iso') : t('pick_folder');
+  const orSpan = document.querySelector('.or');
+  if (orSpan) orSpan.textContent = t('drop_or');
   resetDisc();
 }
 
@@ -104,7 +127,7 @@ $('pick').addEventListener('click', async () => {
   if (state.format === 'folder' && typeof showDirectoryPicker === 'function') {
     try {
       const handle = await showDirectoryPicker({ mode: 'read' });
-      await load(async () => sourceFromDirectoryHandle(handle, (n) => status(`Listing the folder: ${n} files...`)));
+      await load(async () => sourceFromDirectoryHandle(handle, (n) => status(t('status_folder_listing', { count: n }))));
     } catch (e) {
       if (e?.name !== 'AbortError') status(`Could not open the folder: ${e.message}`, true);
     }
@@ -112,11 +135,13 @@ $('pick').addEventListener('click', async () => {
   }
   (state.format === 'iso' ? $('file-iso') : $('file-folder')).click();
 });
+
 $('file-iso').addEventListener('change', (e) => {
-  const f = e.target.files[0];
+  const files = [...e.target.files];
   e.target.value = '';
-  if (f) load(() => sourceFromIso(f));
+  if (files.length) load(() => sourceFromIso(files));
 });
+
 $('file-folder').addEventListener('change', (e) => {
   const list = [...e.target.files];
   e.target.value = '';
@@ -130,8 +155,11 @@ drop.addEventListener('drop', async (e) => {
   e.preventDefault();
   if (state.running) return;
   try {
-    const dropped = await sourceFromDataTransfer(e.dataTransfer, (n) => status(`Listing the folder: ${n} files...`));
-    if (dropped.file) {
+    const dropped = await sourceFromDataTransfer(e.dataTransfer, (n) => status(t('status_folder_listing', { count: n })));
+    if (dropped.files?.length) {
+      setRadio('iso');
+      load(() => sourceFromIso(dropped.files));
+    } else if (dropped.file) {
       setRadio(dropped.file.name.toLowerCase().endsWith('.iso') || dropped.file.size > 100e6 ? 'iso' : state.format);
       load(() => sourceFromIso(dropped.file));
     } else {
@@ -140,18 +168,21 @@ drop.addEventListener('drop', async (e) => {
     }
   } catch (err) { status(`Could not read what was dropped: ${err.message}`, true); }
 });
+
 function setRadio(v) {
   document.querySelector(`input[name=format][value=${v}]`).checked = true;
-  if (state.format !== v) { state.format = v; $('format-hint').textContent = hints[v]; $('pick').textContent = v === 'iso' ? 'Choose .iso file' : 'Choose folder'; }
+  if (state.format !== v) {
+    setFormat(v);
+  }
 }
 
 async function load(makeSource) {
   if (state.running) return;
   resetDisc();
-  status('Reading the disc...');
+  status(t('status_reading'));
   try {
     const source = await makeSource();
-    status(`Checking ${CONFIG.disc.xex}...`);
+    status(t('status_checking'));
     const info = await inspectDisc(source, CONFIG);
     state.disc = { source, ...info };
     status(`${source.label}: ${info.files.length.toLocaleString('en-US')} files (${source.detail}).`);
@@ -169,23 +200,40 @@ function showEdition() {
   const plan = planGameFiles(d.files, CONFIG.disc);
   d.plan = plan;
   if (d.edition) {
-    body.replaceChildren(
+    const isUnverified = d.matchType === 'unverified_header';
+    const badge = isUnverified
+      ? el('span', { className: 'badge warn', textContent: t('badge_unverified') })
+      : el('span', { className: 'badge ok', textContent: t('badge_supported') });
+    const elements = [
       el('dl', { className: 'ed' },
-        el('dt', { textContent: 'Edition' }), el('dd', {}, el('strong', { textContent: d.edition.name }), ' ', el('span', { className: 'badge ok', textContent: 'supported' })),
+        el('dt', { textContent: t('edition_label') }), el('dd', {}, el('strong', { textContent: d.edition.name }), ' ', badge),
         el('dt', { textContent: 'default.xex' }), el('dd', {}, el('code', { textContent: d.sha256 })),
-        el('dt', { textContent: 'Game files' }), el('dd', { textContent: `${plan.copy.length.toLocaleString('en-US')} files, ${formatBytes(plan.copyBytes)} go into game_root` }),
-        el('dt', { textContent: 'Left out' }), el('dd', { textContent: `${plan.skipped.length.toLocaleString('en-US')} files, ${formatBytes(plan.skippedBytes)} that the game never reads (${CONFIG.disc.skip.map((s) => s.prefix.replace(/\/$/, '')).join(', ')})` }),
-      ));
+        el('dt', { textContent: t('game_files_label') }), el('dd', { textContent: t('files_summary', { count: plan.copy.length.toLocaleString('en-US'), bytes: formatBytes(plan.copyBytes) }) }),
+        el('dt', { textContent: t('left_out_label') }), el('dd', { textContent: t('left_out_summary', { count: plan.skipped.length.toLocaleString('en-US'), bytes: formatBytes(plan.skippedBytes), prefixes: CONFIG.disc.skip.map((s) => s.prefix.replace(/\/$/, '')).join(', ') }) }),
+      ),
+    ];
+    if (isUnverified) {
+      elements.push(
+        el('div', { className: 'notice warn' },
+          el('p', {}, el('strong', { textContent: t('unverified_notice_title', { name: d.edition.name }) })),
+          el('p', { textContent: t('unverified_notice_body', { hash: d.sha256 }) }),
+        ),
+      );
+    }
+    body.replaceChildren(...elements);
     showCreate();
   } else {
     $('step-create').hidden = true;
+    const msg = d.matchType === 'invalid'
+      ? t('invalid_xex_msg', { error: d.error || 'corrupted or truncated executable' })
+      : t('not_supported_msg');
     body.replaceChildren(
-      el('p', {}, el('span', { className: 'badge bad', textContent: 'not supported' }), ` This ${CONFIG.disc.xex} is not one of the editions the port is built for.`),
+      el('p', {}, el('span', { className: 'badge bad', textContent: t('badge_not_supported') }), ' ', msg),
       el('dl', { className: 'ed' }, el('dt', { textContent: 'SHA-256' }), el('dd', {}, el('code', { textContent: d.sha256 }))),
-      el('p', { textContent: 'The port is the recompiled program of one exact executable, so it cannot run with another. Supported editions:' }),
+      el('p', { textContent: t('supported_editions_intro') }),
       el('ul', {}, ...CONFIG.editions.map((e) => el('li', { textContent: e.name }))),
-      el('p', { textContent: 'Check that you picked an original, unmodified dump of the game (not a title-update patched, trimmed or re-authored one, and not another region). If you believe your edition should work, open an issue and include the SHA-256 above.' }),
-      el('p', {}, el('a', { href: CONFIG.project.issuesUrl, textContent: 'Open an issue', target: '_blank', rel: 'noopener' })),
+      el('p', { textContent: t('check_original_hint') }),
+      el('p', {}, el('a', { href: CONFIG.project.issuesUrl, textContent: t('open_issue'), target: '_blank', rel: 'noopener' })),
     );
   }
 }
@@ -196,12 +244,11 @@ function showCreate() {
   const updBytes = CONFIG.limits.expectedShaderBytes + CONFIG.limits.expectedNroBytes;
   const info = $('create-info');
   const lines = [
-    el('p', {}, 'The full zip will be about ', el('strong', { textContent: formatBytes(fullBytes) }), '; the update zip about ', el('strong', { textContent: formatBytes(updBytes) }),
-      '. Making the shaders is the long part (30,000 shaders are translated on your computer): expect a long wait, and keep this tab open and in the foreground.'),
+    el('p', { innerHTML: t('create_estimate', { full: formatBytes(fullBytes), upd: formatBytes(updBytes) }) }),
   ];
   const sink = describeSinkSupport();
   if (sink === 'memory' && fullBytes > CONFIG.limits.blobWarnBytes) {
-    lines.push(el('div', { className: 'notice err', textContent: `Warning: this browser can only build the zip in memory and ${formatBytes(fullBytes)} will very likely not fit. Use Chrome or Edge, or make only the update zip.` }));
+    lines.push(el('div', { className: 'notice err', textContent: t('memory_warning', { size: formatBytes(fullBytes) }) }));
   }
   info.replaceChildren(...lines);
   $('step-create').hidden = false;
@@ -222,8 +269,9 @@ function buildStages() {
   for (const id of stageIds) {
     const bar = el('i');
     const label = el('span', { className: 'label' });
+    const stageName = t(STAGE_KEYS[id] || id);
     const li = el('li', { className: 'stage pending' },
-      el('div', { className: 'top' }, el('span', { className: 'name', textContent: STAGE_NAMES[id] }), label),
+      el('div', { className: 'top' }, el('span', { className: 'name', textContent: stageName }), label),
       el('div', { className: 'bar' }, bar));
     rows[id] = { li, bar, label };
     list.append(li);
@@ -261,10 +309,9 @@ async function start(mode) {
   if (state.running || !state.disc?.edition) return;
   const name = mode === 'full' ? CONFIG.zip.fullName : CONFIG.zip.updateName;
   const d = state.disc;
-  // The file picker needs the click's user activation: ask for the target before anything else.
   const expected = (mode === 'full' ? d.plan.copyBytes : 0) + CONFIG.limits.expectedShaderBytes + CONFIG.limits.expectedNroBytes;
   const sink = await openSink(name, expected);
-  if (!sink) return; // picker cancelled
+  if (!sink) return;
 
   state.running = true;
   state.abort = new AbortController();
@@ -333,5 +380,8 @@ $('create-full').addEventListener('click', () => start('full'));
 $('create-update').addEventListener('click', () => start('update'));
 $('cancel').addEventListener('click', () => { $('cancel').disabled = true; state.abort?.abort(); });
 
+// Apply initial language
+applyLanguage();
+
 // For debugging in the console.
-window.__installer = { state, CONFIG };
+window.__installer = { state, CONFIG, applyLanguage, setLanguage };

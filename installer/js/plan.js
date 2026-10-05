@@ -55,7 +55,90 @@ export function scanCandidates(files, disc) {
 
 export function findEdition(editions, sha256Hex) {
   const h = sha256Hex.toLowerCase();
-  return editions.find((e) => e.xexSha256.toLowerCase() === h) ?? null;
+  return editions.find((e) => {
+    if (Array.isArray(e.xexSha256)) {
+      return e.xexSha256.some((x) => x.toLowerCase() === h);
+    }
+    return typeof e.xexSha256 === 'string' && e.xexSha256.toLowerCase() === h;
+  }) ?? null;
+}
+
+export function parseXexHeader(bytes) {
+  if (!bytes || bytes.length < 0x20) {
+    throw new Error('File is too small to be a valid XEX2 executable');
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const magic = view.getUint32(0, false);
+  if (magic !== 0x58455832) { // 'XEX2'
+    throw new Error('Not a valid Xbox 360 executable (missing XEX2 magic)');
+  }
+  const securityOffset = view.getUint32(0x10, false);
+  const optionalCount = view.getUint32(0x14, false);
+  if (bytes.length < 0x18 + optionalCount * 8) {
+    throw new Error('Truncated XEX2 optional headers table');
+  }
+  const optional = new Map();
+  for (let i = 0; i < optionalCount; i++) {
+    const key = view.getUint32(0x18 + i * 8, false);
+    const val = view.getUint32(0x18 + i * 8 + 4, false);
+    optional.set(key, val);
+  }
+
+  let titleId = null;
+  let mediaId = null;
+  let version = null;
+  if (optional.has(0x00040006)) {
+    const execInfoOff = optional.get(0x00040006);
+    if (bytes.length < execInfoOff + 16) {
+      throw new Error('Truncated XEX2 execution info');
+    }
+    mediaId = view.getUint32(execInfoOff, false);
+    version = view.getUint32(execInfoOff + 4, false);
+    titleId = view.getUint32(execInfoOff + 12, false);
+  }
+
+  let entryPoint = optional.get(0x00010100) ?? null;
+  let imageSize = null;
+  if (securityOffset + 8 <= bytes.length) {
+    imageSize = view.getUint32(securityOffset + 4, false);
+  }
+
+  return { titleId, mediaId, version, entryPoint, imageSize };
+}
+
+export function matchEditionHeader(editions, header) {
+  if (!header || header.titleId == null) return null;
+  return editions.find((e) => {
+    if (!e.header) return false;
+    return (
+      e.header.titleId === header.titleId &&
+      e.header.mediaId === header.mediaId &&
+      e.header.version === header.version &&
+      e.header.entryPoint === header.entryPoint &&
+      (!e.header.imageSize || e.header.imageSize === header.imageSize)
+    );
+  }) ?? null;
+}
+
+export function identifyEdition(editions, sha256Hex, bytes = null) {
+  const exact = findEdition(editions, sha256Hex);
+  if (exact) {
+    return { edition: exact, matchType: 'exact', header: null, error: null };
+  }
+  if (!bytes) {
+    return { edition: null, matchType: 'unsupported', header: null, error: null };
+  }
+  let header = null;
+  try {
+    header = parseXexHeader(bytes);
+  } catch (err) {
+    return { edition: null, matchType: 'invalid', header: null, error: err.message };
+  }
+  const fallback = matchEditionHeader(editions, header);
+  if (fallback) {
+    return { edition: fallback, matchType: 'unverified_header', header, error: null };
+  }
+  return { edition: null, matchType: 'foreign_header', header, error: null };
 }
 
 export async function sha256Hex(bytes) {

@@ -1,15 +1,42 @@
 // Turns what the user picked (a disc image, a folder from <input webkitdirectory>, a File System Access directory
 // handle or a drop) into one list of files: [{path, size, blob}], where `blob` is a lazy Blob/File (nothing is read).
 import { openXdvdfs } from './xdvdfs.js';
-import { findDiscRoot, normalise, sha256Hex, findEdition } from './plan.js';
+import { findDiscRoot, normalise, sha256Hex, findEdition, identifyEdition } from './plan.js';
 
-export async function sourceFromIso(file) {
-  const xiso = await openXdvdfs(file);
+export async function sourceFromIso(input) {
+  const filesList = Array.isArray(input) ? input : (input instanceof FileList ? Array.from(input) : [input]);
+  if (filesList.length === 1) {
+    const file = filesList[0];
+    const xiso = await openXdvdfs(file);
+    return {
+      kind: 'iso',
+      label: file.name,
+      files: xiso.files.map(({ path, size, blob }) => ({ path, size, blob })),
+      detail: xiso.partitionOffset ? `game partition at 0x${xiso.partitionOffset.toString(16).toUpperCase()}` : 'plain XDVDFS image',
+    };
+  }
+
+  // Multiple ISO files (e.g. Disc 1 + Disc 2): sort so Disc1 comes before Disc2
+  filesList.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+
+  const merged = new Map();
+  const discNames = [];
+
+  for (const file of filesList) {
+    const xiso = await openXdvdfs(file);
+    discNames.push(file.name);
+    for (const f of xiso.files) {
+      const key = normalise(f.path).toLowerCase();
+      // Second disc overrides earlier disc duplicates (e.g. full UNC map versions on Disc 2)
+      merged.set(key, { path: f.path, size: f.size, blob: f.blob });
+    }
+  }
+
   return {
     kind: 'iso',
-    label: file.name,
-    files: xiso.files.map(({ path, size, blob }) => ({ path, size, blob })),
-    detail: xiso.partitionOffset ? `game partition at 0x${xiso.partitionOffset.toString(16).toUpperCase()}` : 'plain XDVDFS image',
+    label: discNames.join(' + '),
+    files: Array.from(merged.values()),
+    detail: `${filesList.length} discs merged (${discNames.join(', ')})`,
   };
 }
 
@@ -40,11 +67,19 @@ export async function sourceFromDirectoryHandle(handle, onCount) {
   return { kind: 'folder', label: handle.name, files, detail: 'folder' };
 }
 
-/** Reads a drop. Returns {kind:'iso', file} for a single file, or a folder source. */
+/** Reads a drop. Returns {kind:'iso', file|files} for single/multi ISO, or a folder source. */
 export async function sourceFromDataTransfer(dt, onCount) {
   const items = [...(dt.items ?? [])].filter((i) => i.kind === 'file');
-  if (items.length === 0 && dt.files?.length) return { file: dt.files[0] };
+  if (items.length === 0 && dt.files?.length) {
+    const fl = [...dt.files];
+    if (fl.every((f) => /\.(iso|xiso)$/i.test(f.name))) return { files: fl };
+    return { file: fl[0] };
+  }
   const entries = items.map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  if (entries.length > 0 && entries.every((e) => e.isFile && /\.(iso|xiso)$/i.test(e.name))) {
+    const files = await Promise.all(entries.map((e) => new Promise((res, rej) => e.file(res, rej))));
+    return { files: files.length > 1 ? files : undefined, file: files.length === 1 ? files[0] : undefined };
+  }
   if (entries.length === 1 && entries[0].isFile) {
     return { file: await new Promise((res, rej) => entries[0].file(res, rej)) };
   }
@@ -69,7 +104,7 @@ export async function sourceFromDataTransfer(dt, onCount) {
 
 /**
  * Finds the disc root, reads default.xex and identifies the edition.
- * Returns {files, xex, sha256, edition|null}; throws a user-readable Error when there is no default.xex.
+ * Returns {files, xex, sha256, edition|null, matchType, header, error}; throws a user-readable Error when there is no default.xex.
  */
 export async function inspectDisc(source, config) {
   const root = findDiscRoot(source.files, config.disc.xex);
@@ -81,5 +116,15 @@ export async function inspectDisc(source, config) {
   const xex = root.files.find((f) => f.path.toLowerCase() === config.disc.xex.toLowerCase());
   const bytes = new Uint8Array(await xex.blob.arrayBuffer());
   const sha256 = await sha256Hex(bytes);
-  return { files: root.files, prefix: root.prefix, xex, sha256, edition: findEdition(config.editions, sha256) };
+  const identified = identifyEdition(config.editions, sha256, bytes);
+  return {
+    files: root.files,
+    prefix: root.prefix,
+    xex,
+    sha256,
+    edition: identified.edition,
+    matchType: identified.matchType,
+    header: identified.header,
+    error: identified.error,
+  };
 }

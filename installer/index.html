@@ -12,15 +12,23 @@
 <body>
 <header class="hero">
   <img class="cover" src="assets/icon.jpg" alt="Mass Effect cover" width="256" height="256">
-  <div class="hero-copy"><p class="eyebrow">NEBADASSWIFTY / NINTENDO SWITCH</p>
-    <h1>Mass Effect</h1><p class="hero-subtitle">Your disc. Your galaxy.</p>
-    <p class="hero-description">Prepare the port on your computer, directly in your browser.</p>
-    <a href="https://github.com/nebadasSwifty/masseffect-nx/releases">Releases ↗</a>
+  <div class="hero-copy">
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+      <p class="eyebrow" data-i18n="hero_eyebrow" style="margin: 0;">NEBADASSWIFTY / NINTENDO SWITCH</p>
+      <div class="lang-switch" role="group" aria-label="Language">
+        <button class="lang-btn" id="lang-en" type="button">EN</button>
+        <button class="lang-btn" id="lang-ru" type="button">RU</button>
+      </div>
+    </div>
+    <h1 data-i18n="hero_title">Mass Effect</h1>
+    <p class="hero-subtitle" data-i18n="hero_subtitle">Your disc. Your galaxy.</p>
+    <p class="hero-description" data-i18n="hero_description">Prepare the port on your computer, directly in your browser.</p>
+    <a href="https://github.com/nebadasSwifty/masseffect-nx/releases" data-i18n="releases_link">Releases ↗</a>
   </div>
 </header>
 
 <main>
-  <p class="lead">
+  <p class="lead" data-i18n="lead_text" data-i18n-html="true">
     Make the SD card package of the Mass Effect port from <strong>your own copy</strong> of the Xbox 360 game.
     Everything runs in this browser tab: <strong>your game files never leave your computer.</strong>
   </p>
@@ -28,36 +36,36 @@
 
   <!-- Step 1 -->
   <section class="card" id="step-source">
-    <h2><span class="num">1</span> Choose your game</h2>
+    <h2><span class="num">1</span> <span data-i18n="step_1_title">Choose your game</span></h2>
     <div class="seg" role="radiogroup" aria-label="Game format">
-      <label><input type="radio" name="format" value="iso" checked> <span>Disc image (.iso)</span></label>
-      <label><input type="radio" name="format" value="folder"> <span>XEX format (folder)</span></label>
+      <label><input type="radio" name="format" value="iso" checked> <span data-i18n="format_iso">Disc image (.iso)</span></label>
+      <label><input type="radio" name="format" value="folder"> <span data-i18n="format_folder">XEX format (folder)</span></label>
     </div>
-    <p class="hint" id="format-hint">The disc image of the Xbox 360 game (single or dual layer). It is read in place and never loaded as a whole.</p>
+    <p class="hint" id="format-hint" data-i18n="format_hint_iso">The disc image of the Xbox 360 game (single or two discs). It is read in place and never loaded as a whole.</p>
     <div class="drop" id="drop" tabindex="0">
-      <button class="btn" id="pick" type="button">Choose .iso file</button>
-      <span class="or">or drop it here</span>
+      <button class="btn" id="pick" type="button" data-i18n="pick_iso">Choose .iso file(s)</button>
+      <span class="or" data-i18n="drop_or">or drop it here</span>
     </div>
-    <input id="file-iso" type="file" accept=".iso,.xiso" hidden>
+    <input id="file-iso" type="file" accept=".iso,.xiso" multiple hidden>
     <input id="file-folder" type="file" webkitdirectory multiple hidden>
     <p class="status" id="source-status" role="status"></p>
   </section>
 
   <!-- Step 2 -->
   <section class="card" id="step-edition" hidden>
-    <h2><span class="num">2</span> Detected edition</h2>
+    <h2><span class="num">2</span> <span data-i18n="step_2_title">Detected edition</span></h2>
     <div id="edition-body"></div>
   </section>
 
   <!-- Step 3 -->
   <section class="card" id="step-create" hidden>
-    <h2><span class="num">3</span> Create the package</h2>
+    <h2><span class="num">3</span> <span data-i18n="step_3_title">Create the package</span></h2>
     <div id="create-info" class="info"></div>
     <div class="actions" id="actions">
-      <button class="btn primary" id="create-full" type="button">Create masseffect-nx.zip</button>
-      <button class="btn" id="create-update" type="button">Create masseffect-nx-update.zip</button>
+      <button class="btn primary" id="create-full" type="button" data-i18n="create_full_btn">Create masseffect-nx.zip</button>
+      <button class="btn" id="create-update" type="button" data-i18n="create_update_btn">Create masseffect-nx-update.zip</button>
     </div>
-    <p class="hint">
+    <p class="hint" data-i18n="create_hint" data-i18n-html="true">
       <strong>First install:</strong> the full zip with the game files. <strong>Update</strong> (a new release): only the program, the settings file
       and the shaders, to extract over the existing folder. It needs the same disc selected, because the shaders are made from it.
       The update overwrites <code>masseffect.toml</code>: keep a copy if you changed it.
@@ -67,10 +75,10 @@
       <ol class="stages" id="stages"></ol>
       <div class="row">
         <span id="elapsed" class="muted"></span>
-        <button class="btn small" id="cancel" type="button">Cancel</button>
+        <button class="btn small" id="cancel" type="button" data-i18n="cancel_btn">Cancel</button>
       </div>
       <details id="log-wrap">
-        <summary>Details <span id="log-count" class="muted"></span></summary>
+        <summary><span data-i18n="details_summary">Details</span> <span id="log-count" class="muted"></span></summary>
         <pre id="log" aria-live="off"></pre>
       </details>
     </div>
@@ -79,23 +87,23 @@
   </section>
 
   <section class="card plain" id="how">
-    <h2>After it finishes</h2>
-    <p>Extract the zip into <code>sdmc:/switch/</code> on the SD card. You get:</p>
+    <h2 data-i18n="how_title">After it finishes</h2>
+    <p data-i18n="how_desc" data-i18n-html="true">Extract the zip into <code>sdmc:/switch/</code> on the SD card. You get:</p>
 <pre class="tree">/switch/masseffect-nx/
   masseffect-nx.nro
   masseffect.toml               (settings)
   masseffect_shaders.mesp       (the game's shaders, made from your disc)
   masseffect_shaders.mesp.idx   (index of the shader file)
   game_root/                    (the files of your disc)</pre>
-    <p><a class="btn" href="releases/masseffect-nx-forwarder.nsp" download>Download the NSP launcher</a></p>
-    <p>Install the NSP with your CFW title installer to launch Mass Effect from the HOME menu.
+    <p><a class="btn" href="releases/masseffect-nx-forwarder.nsp" download data-i18n="download_nsp_btn">Download the NSP launcher</a></p>
+    <p data-i18n="nsp_instruction">Install the NSP with your CFW title installer to launch Mass Effect from the HOME menu.
       It uses 39-bit application mode and needs the files above on the SD card.
       You can also launch the NRO with a title override (hold R while starting an installed game).</p>
   </section>
 
   <section class="card plain" id="privacy">
-    <h2>Privacy</h2>
-    <p>
+    <h2 data-i18n="privacy_title">Privacy</h2>
+    <p data-i18n="privacy_desc" data-i18n-html="true">
       The page reads your disc with your browser's own file access, makes the shaders on your computer with WebAssembly and
       writes the zip to your disk. The only network traffic is loading this page and downloading the build
       (<code>masseffect-nx.nro</code>) and <code>masseffect.toml</code> from this site. No game data is uploaded, and there is no tracking.
@@ -104,21 +112,21 @@
   </section>
 
   <section class="card plain" id="credits">
-    <h2>Credits &amp; Acknowledgments</h2>
+    <h2 data-i18n="credits_title">Credits &amp; Acknowledgments</h2>
     <ul class="credits-list">
-      <li><strong>BioWare &amp; Electronic Arts</strong> — Original creators of Mass Effect. This is an unofficial, non-commercial fan project.</li>
-      <li><strong><a href="https://github.com/StevensND" target="_blank" rel="noopener">StevensND</a></strong> — Creator of <a href="https://github.com/StevensND/NFSMW-NX" target="_blank" rel="noopener">NFSMW-NX</a>, whose pioneering work on running statically recompiled Xbox 360 games on Nintendo Switch and client-side browser shader packaging served as the foundational inspiration for this installer. <em>(Note: StevensND is not affiliated with or responsible for this Mass Effect project.)</em></li>
-      <li><strong><a href="https://github.com/rexglue/rexglue-sdk" target="_blank" rel="noopener">Tom Clay &amp; ReXGlue SDK</a></strong> — The static binary translation framework for Xbox 360 executables.</li>
-      <li><strong><a href="https://github.com/hedge-dev/XenosRecomp" target="_blank" rel="noopener">hedge-dev</a></strong> — XenosRecomp, the Xbox 360 Xenos shader translator.</li>
-      <li><strong><a href="https://github.com/danfromtico/mesa-switch" target="_blank" rel="noopener">danfromtico &amp; NaGaa95</a></strong> — mesa-switch: Vulkan/NVK implementation on Horizon OS.</li>
-      <li><strong><a href="https://devkitpro.org" target="_blank" rel="noopener">devkitPro</a> &amp; <a href="https://github.com/switchbrew/libnx" target="_blank" rel="noopener">switchbrew</a></strong> — Nintendo Switch homebrew toolchain and runtime libraries.</li>
+      <li data-i18n="credits_bioware" data-i18n-html="true"><strong>BioWare &amp; Electronic Arts</strong> — Original creators of Mass Effect. This is an unofficial, non-commercial fan project.</li>
+      <li data-i18n="credits_stevens" data-i18n-html="true"><strong><a href="https://github.com/StevensND" target="_blank" rel="noopener">StevensND</a></strong> — Creator of <a href="https://github.com/StevensND/NFSMW-NX" target="_blank" rel="noopener">NFSMW-NX</a>, whose pioneering work on running statically recompiled Xbox 360 games on Nintendo Switch and client-side browser shader packaging served as the foundational inspiration for this installer. <em>(Note: StevensND is not affiliated with or responsible for this Mass Effect project.)</em></li>
+      <li data-i18n="credits_rexglue" data-i18n-html="true"><strong><a href="https://github.com/rexglue/rexglue-sdk" target="_blank" rel="noopener">Tom Clay &amp; ReXGlue SDK</a></strong> — The static binary translation framework for Xbox 360 executables.</li>
+      <li data-i18n="credits_xenos" data-i18n-html="true"><strong><a href="https://github.com/hedge-dev/XenosRecomp" target="_blank" rel="noopener">hedge-dev</a></strong> — XenosRecomp, the Xbox 360 Xenos shader translator.</li>
+      <li data-i18n="credits_mesa" data-i18n-html="true"><strong><a href="https://github.com/danfromtico/mesa-switch" target="_blank" rel="noopener">danfromtico &amp; NaGaa95</a></strong> — mesa-switch: Vulkan/NVK implementation on Horizon OS.</li>
+      <li data-i18n="credits_devkit" data-i18n-html="true"><strong><a href="https://devkitpro.org" target="_blank" rel="noopener">devkitPro</a> &amp; <a href="https://github.com/switchbrew/libnx" target="_blank" rel="noopener">switchbrew</a></strong> — Nintendo Switch homebrew toolchain and runtime libraries.</li>
     </ul>
   </section>
 </main>
 
 <footer>
-  <a id="repo-link" href="#">Source code and releases</a> · by <span id="author"></span> ·
-  <a href="#credits">Credits</a> · <a href="THIRD_PARTY_NOTICES.md">Third-party notices</a> · Not affiliated with BioWare, Electronic Arts or Nintendo.
+  <a id="repo-link" href="#" data-i18n="footer_source">Source code and releases</a> · <span data-i18n="footer_by">by</span> <span id="author"></span> ·
+  <a href="#credits" data-i18n="footer_credits">Credits</a> · <a href="THIRD_PARTY_NOTICES.md" data-i18n="footer_notices">Third-party notices</a> · <span data-i18n="footer_disclaimer">Not affiliated with BioWare, Electronic Arts or Nintendo.</span>
 </footer>
 
 <script type="module" src="js/app.js"></script>

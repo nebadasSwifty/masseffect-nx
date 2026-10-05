@@ -78,6 +78,7 @@ a { color: var(--blue); }
 .badge { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: .85rem; font-weight: 600; }
 .badge.ok { background: rgba(94, 214, 160, .15); color: var(--green); }
 .badge.bad { background: rgba(255, 123, 123, .15); color: var(--red); }
+.badge.warn { background: rgba(243, 169, 91, .15); color: #f3a95b; }
 
 .notice { border-radius: 10px; padding: 12px 14px; margin: 14px 0 0; border: 1px solid var(--card-border); background: #0b1230; }
 .notice.warn { border-color: #6b5320; background: rgba(243, 169, 91, .08); color: #f6d9b0; }
@@ -116,4 +117,31 @@ footer { max-width: 880px; margin: 0 auto; padding: 8px 16px 40px; color: var(--
   .btn { width: 100%; }
   .actions .btn { flex: 1 1 100%; }
   .drop .btn { width: auto; }
+}
+
+.lang-switch {
+  display: inline-flex;
+  gap: 2px;
+  background: var(--bg2);
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  padding: 2px;
+}
+.lang-btn {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 0.75rem;
+  padding: 3px 9px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.lang-btn:hover {
+  color: var(--text);
+}
+.lang-btn.active {
+  background: var(--blue-dim);
+  color: #fff;
 }

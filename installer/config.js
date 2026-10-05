@@ -46,7 +46,30 @@ export const CONFIG = {
       id: 'usa-eur-en-es-pl-rev1',
       name: 'Mass Effect (USA, Europe) (En,Es,Pl) (Rev 1)',
       xexSha256: 'db14a72a5a24a57309b8c51bd0311c676b7018ca6524e3eb85fbc891c2dfc70b',
+      header: {
+        titleId: 0x4D5307E8,
+        mediaId: 0x38575660,
+        version: 0x00000015,
+        imageSize: 16515072,
+        entryPoint: 0x828121D0,
+      },
       nro: 'masseffect-nx.nro',
+    },
+    {
+      id: 'rus-rev0',
+      name: 'Mass Effect (Russia) (Ru)',
+      xexSha256: [
+        '20c619de3c31f5c4448e7c54062577df839d59b2eb5ac5c633a2953dbbe525a3',
+        '4beb582540010b25032e3a51e4ce84a6fb1a9f381adddd8b2def0dc5d6bf715d',
+      ],
+      header: {
+        titleId: 0x4D5307E8,
+        mediaId: 0x572BA75D,
+        version: 0x00000005,
+        imageSize: 16515072,
+        entryPoint: 0x82812A00,
+      },
+      nro: 'masseffect-nx-rus.nro',
     },
   ],
 

@@ -7,19 +7,14 @@ recognised, and what it would take to add another one. Words you do not know are
 
 ## What is supported
 
-Only one edition has been built and tested:
+The supported editions are:
 
 | Edition | `default.xex` SHA-256 | NRO in the installer |
 |---|---|---|
 | Mass Effect (USA, Europe) (En,Es,Pl) (Rev 1) | `db14a72a5a24a57309b8c51bd0311c676b7018ca6524e3eb85fbc891c2dfc70b` | `masseffect-nx.nro` |
+| Mass Effect (Russia) (Ru) | `20c619de3c31f5c4448e7c54062577df839d59b2eb5ac5c633a2953dbbe525a3`<br>`4beb582540010b25032e3a51e4ce84a6fb1a9f381adddd8b2def0dc5d6bf715d` | `masseffect-nx-rus.nro` |
 
-Its title id is `4D5307E8`. Every address in the sources (the `0x82......` numbers in `app/`, `tools/` and the toml files)
-refers to this executable. Nothing is known about how the executables of other editions differ from it, because none
-has been compared: do not assume that another edition shares code or addresses with this one.
-
-The name of the edition lists the languages it contains (English, Spanish, Polish). Which language the game shows on the
-Switch has not been investigated. For reference, the SDK answers the game's language query with English and takes the
-user language from the `user_language` setting (default 1, which is English in the Xbox 360 numbering).
+Its title id is `4D5307E8` (both English and Russian share title id `4D5307E8`; Russian Media ID is `572BA75D`, version 0.0.0.5). Every address in the sources (the `0x82......` numbers in `app/`, `tools/` and the toml files) refers to the specific executable build. Detailed documentation of the Russian edition port and address remapping is in [russian-edition.md](russian-edition.md).
 
 ## How an edition is recognised
 
