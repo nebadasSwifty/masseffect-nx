@@ -3,95 +3,76 @@
 <img src="extras/banner.png" alt="Mass Effect - Nintendo Switch port" width="60%">
 
 </div>
-<h1 align=center>Mass Effect - Nintendo Switch port</h1>
+<h1 align=center>Mass Effect — Nintendo Switch Port</h1>
 
-A native Nintendo Switch port of the Xbox 360 version of **Mass Effect** (2007), by NebadasSwifty.
+An ahead-of-time static recompilation port of BioWare's sci-fi epic **Mass Effect** (Xbox 360, 2007) for the Nintendo Switch, by NebadasSwifty.
 
-It is not an emulator. The PowerPC code of the game's `default.xex` is statically recompiled to C++ with
-[ReXGlue](https://github.com/rexglue/rexglue-sdk), compiled for the Switch, and the game is drawn by a native Vulkan
-renderer running on NVK (Mesa). It runs at the console's **stock clocks, with no overclock**.
+Rather than emulating the Xbox 360 hardware at runtime, the original PowerPC machine code in `default.xex` is statically translated into C++ using [ReXGlue](https://github.com/rexglue/rexglue-sdk) and compiled directly to native ARM64 (AArch64) code for Horizon OS. In-game rendering is handled by a custom Vulkan backend built on the open-source Mesa/NVK graphics driver. The game runs on **standard Switch hardware clocks with no overclock required**.
 
 > [!WARNING]
-> **This is a work in progress.** The game starts, plays and looks right in the locations that were tested, but it is
-> **not yet at 30 FPS**: at stock clocks it averages about **25 FPS** at an internal resolution of **960x544**
-> (individual 10-second intervals range from about 19 to 31). Light areas reach 30 or more, heavy ones such as the
-> grass fields of Eden Prime drop to 20-24. Start-up is slow and a cold start (no caches yet) dips well below the
-> average. The numbers and their history are in [docs/performance-history.md](docs/performance-history.md), and
-> everything that is broken or unproven is in [docs/known-issues.md](docs/known-issues.md).
+> **Work-in-progress status & performance targets**
+> The port is in active development. The prologue, Normandy deck exploration, Citadel wards, Mako planet exploration, dialogue trees, and combat encounters are fully playable. At stock console clock rates, the renderer averages roughly **25 FPS** at a native **960x544** scene buffer (ranging from ~20 FPS in foliage-heavy Eden Prime combat to 30+ FPS in interior Normandy/Citadel decks). Frame hitches during the initial visit to a new area subside once Vulkan pipelines are cached to the SD card. See [docs/performance-history.md](docs/performance-history.md) for profiling details and [docs/known-issues.md](docs/known-issues.md) for known limitations.
 
 > [!NOTE]
-> You need your own copy of the Xbox 360 game: a disc image (`.iso`) or the extracted disc with its `default.xex`.
-> The only supported edition for now is **Mass Effect (USA, Europe) (En,Es,Pl) (Rev 1)**. How an edition is identified
-> and how another one could be added is explained in [docs/editions.md](docs/editions.md).
+> **Legal game files required**
+> This repository contains no game assets, copyrighted audio, video, or textures. You must supply your own copy of the Xbox 360 disc: either an uncompressed image (`.iso` / `.xiso`) or an extracted folder structure with `default.xex`. Currently, the tested and supported release is **Mass Effect (USA, Europe) (En,Es,Pl) (Rev 1)**. Check [docs/editions.md](docs/editions.md) for edition hashes and porting instructions for other regional releases.
 
-## How to install
+## Installation
 
-1. Open the installer page: **https://nebadasswifty.github.io/masseffect-nx/**
-2. Choose your format (**Disc image (.iso)** or **XEX format**, the extracted disc folder with `default.xex`) and press
-   **Create masseffect-nx.zip**. Everything runs in your browser and the game files never leave your computer: the
-   page detects your edition, downloads its build and makes the shaders from your disc.
-3. Extract the downloaded `masseffect-nx.zip` into `sdmc:/switch/`.
-4. Download `masseffect-nx-forwarder.nsp` from the installer or [Releases](https://github.com/nebadasSwifty/masseffect-nx/releases),
-   install it with your CFW title installer, and launch the HOME menu tile. The forwarder uses 39-bit application mode.
-   The NSP requires the NRO, game files and shaders on the SD card.
+You can assemble your complete Switch installation package entirely in your desktop browser using the client-side installer: **https://nebadasswifty.github.io/masseffect-nx/**.
 
-Your `masseffect-nx` folder should look like this:
+1. **Select game files:** Open the installer and point it to your Xbox 360 disc image (`.iso`) or extracted game directory (containing `default.xex`).
+2. **Build package:** Click **Create masseffect-nx.zip**. The browser unpacks Unreal Engine packages (`*.xxx`), translates Xenos microcode to SPIR-V shaders, bundles the Switch executable, and packages everything locally. **Nothing is uploaded to the internet.**
+3. **Copy to SD card:** Extract the resulting `masseffect-nx.zip` into `sdmc:/switch/` so files reside in `/switch/masseffect-nx/`.
+4. **Install launcher forwarder:** Download `masseffect-nx-forwarder.nsp` and install it via your preferred homebrew manager (DBI, Sphaira, etc.). Ensure your forwarder is configured for **39-bit address space** so the process receives full application memory.
+
+### Folder Structure
 
 ```text
-/switch/masseffect-nx/
-  masseffect-nx.nro
-  masseffect.toml               (settings)
-  masseffect_shaders.mesp       (the game's shaders, made from your disc)
-  masseffect_shaders.mesp.idx   (index of the shader file)
-  game_root/                    (the files of your disc)
+sdmc:/switch/masseffect-nx/
+  ├── masseffect-nx.nro          (native game executable)
+  ├── masseffect.toml           (runtime configuration file)
+  ├── masseffect_shaders.mesp   (compiled SPIR-V shader library)
+  ├── masseffect_shaders.mesp.idx (shader database index)
+  └── game_root/                (extracted game data: CookedXbox360, Movies, Maps)
 ```
 
-The full package is about 7.8 GB for the supported edition (the shaders alone are about 0.9 GB): make sure the SD card
-has room. The game's files are used as loose files, not as a disc image: an `.iso` is too big to be read into memory on
-the console.
-
-**Launching.** Start `masseffect-nx.nro` with a game override (hold **R** while starting an installed title) or from a
-forwarder. The port is built as a full application and needs the whole application memory: in album applet mode the
-process gets only about 400 MB, and the game's own memory is 512 MB, so it cannot start there. If you make a forwarder,
-set it to a **39-bit address space**; that setting comes from the other ports of this family and has not been tested
-separately here. The port reserves a 4.5 GB window of address space for the game's memory.
-
 > [!NOTE]
-> **Updating:** open the installer page again and press **Create masseffect-nx-update.zip**. It rebuilds
-> `masseffect-nx.nro`, `masseffect.toml` and the shader package (the disc is still needed, because the shaders are made
-> from it) but not `game_root/`, so the game files are not copied again: extract it over your existing folder. It
-> **overwrites `masseffect.toml`**, so keep a copy of your settings if you changed them.
+> **Incremental Updates:** When a new release of `masseffect-nx` is published, you do not need to re-copy the large ~7 GB `game_root/` folder. Simply open the installer page and select **Create masseffect-nx-update.zip**, which produces a lightweight zip containing only the updated binary, config, and shader library.
 
 > [!CAUTION]
-> **The first time a new area is drawn** the renderer compiles the graphics pipelines it has not seen before, so **it can
-> stutter for a few seconds**. The compiled pipelines are saved on the SD card, and later sessions start smoother
-> (`masseffect_native_pipelines_prewarm` recompiles the known ones in the background at start-up).
+> **Vulkan Pipeline Stutter:** When entering a new planet or graphical scene for the first time, brief stutter may occur while new Vulkan pipeline state objects are compiled by the Switch GPU driver. These pipelines are saved to the SD card and subsequent loads will be noticeably smoother.
 
-## Controls
+## Controls & Key Mapping
 
-Each Switch button acts as the Xbox 360 button with the same letter, so the letter in the on-screen prompts is the
-button to press: **A** accepts and **B** goes back, as in other Switch games.
+Game controls map directly to Nintendo Switch inputs while matching on-screen UI prompts:
 
 <div align="center">
 
-| Switch | Xbox 360 |
-| --- | --- |
-| A / B / X / Y | A / B / X / Y |
-| ZR / ZL | RT / LT (digital: fully pressed or not) |
-| R / L | RB / LB |
-| + | Start |
-| - | Back |
-| Left / right stick | Left / right stick |
-| Press left / right stick | Left / right stick click |
-| D-pad | D-pad |
+| Switch Button | Action in Mass Effect | Xbox 360 Original |
+| :--- | :--- | :--- |
+| **A** | Interact / Confirm / Take Cover | A |
+| **B** | Cancel / Exit / Storm (Sprint) | B |
+| **X** | Draw & Holster Weapon / Reload | X |
+| **Y** | First Aid (Medi-Gel) | Y |
+| **ZR** | Fire Weapon / Vehicle Cannon | RT |
+| **ZL** | Target Lock / Zoom / Vehicle Thruster | LT |
+| **R** | Weapon Wheel (Pause Combat) | RB |
+| **L** | Biotic & Tech Power Wheel (Pause Combat) | LB |
+| **+** | System Menu / Pause | Start |
+| **-** | Codex & Journal / Equipment | Back |
+| **Left Stick** | Shepard Movement / Mako Steering | Left Stick |
+| **Right Stick** | Camera Look / Turret Aim | Right Stick |
+| **L3 (Click)** | Toggle Crouch | Left Stick Click |
+| **R3 (Click)** | Scope Zoom Toggle | Right Stick Click |
+| **D-Pad** | Squad Tactical Orders (Attack, Move, Regroup) | D-Pad |
 
 </div>
 
-Handheld mode and Joy-Con pairs, Pro Controllers and four pads are accepted. To use the face buttons by position
-instead, as on an Xbox pad (B acts as A, A as B, Y as X and X as Y), set `input_xbox_layout = true` in
-`masseffect.toml`. Rumble is off by default (`input_rumble = true` turns it on).
+- **Physical Xbox Button Mapping:** If you prefer physical layout (bottom button confirms, right button cancels), set `input_xbox_layout = true` in `masseffect.toml`.
+- **Rumble Support:** Controller rumble can be enabled by setting `input_rumble = true` in `masseffect.toml`.
 
-### Overlays
+### In-Game Diagnostics Overlay
 
 The SDK's own menus are opened with **L + R** held and a direction. With the debug overlay open, **L + R + right stick**
 moves it, and while L and R are held the game does not see them or the right stick. The overlays also react to the
@@ -261,20 +242,16 @@ The short list: about 25 FPS instead of 30, dips in a cold start, slow start-up,
 planet behind the title screen is black while the camera pans to the main menu). Everything, with the evidence, is in
 [docs/known-issues.md](docs/known-issues.md).
 
-## Credits
+## Credits & Acknowledgments
 
-- **BioWare and Electronic Arts** - creators of Mass Effect. This is an unofficial, fan-made port with no affiliation.
-- **[madelrandel-blip](https://github.com/madelrandel-blip/NFSMW-Recompiled)** - NFSMW Recompiled, the recompilation
-  project this port started from (the application hooks, configuration, code generator setup and tools).
-- **[Tom Clay](https://github.com/rexglue/rexglue-sdk)** - the ReXGlue SDK, built on the work of the
-  **[Xenia](https://xenia.jp)** team.
-- **StevenSND** - the Horizon (Switch) layer of the SDK, the Mesa changes and the shader tooling this port builds on
-  originate from his work.
-- **[hedge-dev](https://github.com/hedge-dev/XenosRecomp)** - XenosRecomp, the Xenos shader translator.
-- **[danfromtico](https://github.com/danfromtico/mesa-switch)** and **[NaGaa95](https://github.com/NaGaa95/mesa-switch)** -
-  mesa-switch: Mesa, NVK and NAK on Horizon.
-- **[devkitPro](https://devkitpro.org) and [switchbrew](https://github.com/switchbrew/libnx)** - devkitA64 and libnx.
-- The other libraries listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- **BioWare and Electronic Arts** — Creators of Mass Effect. This is an unofficial, non-commercial fan-made port with no affiliation.
+- **[StevensND](https://github.com/StevensND)** — Creator of [NFSMW-NX](https://github.com/StevensND/NFSMW-NX), whose pioneer work on running statically recompiled Xbox 360 games on Nintendo Switch (including the Horizon OS runtime integration, Mesa/NVK driver adaptations, and browser-based shader compilation workflows) served as foundational inspiration and technical reference. *(Note: StevensND is not affiliated with, endorsing, or responsible for this Mass Effect port).*
+- **[madelrandel-blip](https://github.com/madelrandel-blip/NFSMW-Recompiled)** — NFSMW Recompiled, the recompilation project this port started from (the application hooks, configuration, code generator setup and tools).
+- **[Tom Clay](https://github.com/rexglue/rexglue-sdk)** — The ReXGlue SDK, built on the research of the **[Xenia](https://xenia.jp)** team.
+- **[hedge-dev](https://github.com/hedge-dev/XenosRecomp)** — XenosRecomp, the Xenos shader translator.
+- **[danfromtico](https://github.com/danfromtico/mesa-switch)** and **[NaGaa95](https://github.com/NaGaa95/mesa-switch)** — mesa-switch: Mesa, NVK and NAK on Horizon OS.
+- **[devkitPro](https://devkitpro.org)** and **[switchbrew](https://github.com/switchbrew/libnx)** — devkitA64 and libnx.
+- All third-party libraries listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Support
 

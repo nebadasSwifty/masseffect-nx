@@ -69,6 +69,6 @@ run the generator another way, run them in this order, then `verify_pch.sh`. All
 
 ## Licence
 
-The scripts adapted from the reference ReXGlue Switch port by StevenSND (`find_gaps.py`, `read_before_write.py`,
+The scripts adapted from the reference ReXGlue Switch port by [StevensND](https://github.com/StevensND) (`find_gaps.py`, `read_before_write.py`,
 `direct_calls.py`, `fetch_thirdparty.py`, the toolchain file) keep GPL-3.0. Everything is GPL-3.0 like the rest of the
 port, see `../LICENSE`.

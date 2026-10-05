@@ -118,7 +118,7 @@ OUT=installer/wasm shaders/wasm/build_wasm_tools.sh hlsl pack scan      # a few 
 ```
 
 `dxc_web.mjs`/`dxc_web.wasm` come from the pinned, SHA-256 verified DXC v2025.1 build
-of the reference nfsmw-nx installer. The mandatory `dxc` job can also rebuild them
+of [StevensND's](https://github.com/StevensND) [NFSMW-NX](https://github.com/StevensND/NFSMW-NX) installer. The mandatory `dxc` job can also rebuild them
 from the pinned C++ source by selecting `rebuild_dxc` in a manual run. Deployment loads every module and compiles vertex/pixel shaders to SPIR-V.
 A missing compiler blocks deployment rather than publishing an incomplete installer.
 See [../docs/releases.md](../docs/releases.md) for the release and Pages setup.

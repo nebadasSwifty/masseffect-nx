@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Finds code gaps with no function assigned in the codegen output.
 
-Adapted from the gap scanner of the reference ReXGlue Switch port by StevenSND (GPL-3.0).
+Adapted from the gap scanner of the reference ReXGlue Switch port by StevensND (GPL-3.0).
 
 The problem
 -----------

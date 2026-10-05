@@ -103,6 +103,10 @@ details { margin-top: 8px; }
 summary { cursor: pointer; color: var(--muted); }
 pre { background: #060a1c; border: 1px solid var(--card-border); border-radius: 8px; padding: 10px; overflow: auto; max-height: 260px; font-size: .82rem; line-height: 1.4; }
 pre.tree { max-height: none; }
+.credits-list { margin: 8px 0; padding-left: 20px; color: var(--muted); }
+.credits-list li { margin-bottom: 8px; }
+.credits-list strong { color: var(--text); }
+.credits-list em { font-size: .88em; color: var(--muted); }
 footer { max-width: 880px; margin: 0 auto; padding: 8px 16px 40px; color: var(--muted); font-size: .88rem; }
 
 @media (max-width: 560px) {

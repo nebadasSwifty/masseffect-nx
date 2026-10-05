@@ -16,7 +16,7 @@ links into the NRO.
 
 The patch is the sum of two things, applied on that commit:
 
-1. the Mesa patch of the reference Switch port of this recompilation framework (written by **StevenSND**), ported onto
+1. the Mesa patch of the reference Switch port of this recompilation framework (written by [StevensND](https://github.com/StevensND)), ported onto
    the Mesa 26.2.3 base. Its ZCULL work, the SM50 `FADD32I.SAT` fix, the uniform-buffer-through-cbuf policy, uncached
    CPU-write memory and other fixes were already merged upstream, so the ported patch only carries what upstream still
    lacks (see the table);
@@ -109,7 +109,7 @@ Windows builds needed.
 - **[danfromtico/mesa-switch](https://github.com/danfromtico/mesa-switch)**: the Mesa port to Horizon (platform backend,
   NVK on the Switch GPU, build scripts), the base of everything here.
 - **NaGaa95**: the Mesa 26.2.3 update, NVK/NAK fixes and the shared shader cache merged into mesa-switch main.
-- **StevenSND**: the original Mesa patch for the reference port (ZCULL, Horizon channel and memory changes, NAK
-  scheduling, the faster-draws and set-4-by-differences work), which is the starting point of this patch.
+- **[StevensND](https://github.com/StevensND)**: the original Mesa patch for the reference port (ZCULL, Horizon channel and memory changes, NAK
+  scheduling, the faster-draws and set-4-by-differences work), which is the starting point of this patch. (Note: StevensND is not affiliated with this Mass Effect project).
 - **The Mesa project** (NVK, NAK, NIL and the Vulkan runtime, MIT licensed). All file headers and licences in the
   patched files are unchanged.

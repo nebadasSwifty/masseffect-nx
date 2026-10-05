@@ -1,4 +1,4 @@
-# Based on the toolchain file of the reference ReXGlue Switch port by StevenSND (GPL-3.0): a generic devkitA64 + libnx
+# Based on the toolchain file of the reference ReXGlue Switch port by StevensND (GPL-3.0): a generic devkitA64 + libnx
 # toolchain for ReXGlue Switch builds, with no game-specific code.
 # Nintendo Switch / libnx cross toolchain for devkitPro devkitA64.
 #
