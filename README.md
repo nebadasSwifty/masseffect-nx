@@ -15,13 +15,13 @@ Rather than emulating the Xbox 360 hardware at runtime, the original PowerPC mac
 
 > [!NOTE]
 > **Legal game files required**
-> This repository contains no game assets, copyrighted audio, video, or textures. You must supply your own copy of the Xbox 360 disc: either an uncompressed image (`.iso` / `.xiso`) or an extracted folder structure with `default.xex`. Currently, the tested and supported release is **Mass Effect (USA, Europe) (En,Es,Pl) (Rev 1)**. Check [docs/editions.md](docs/editions.md) for edition hashes and porting instructions for other regional releases.
+> This repository contains no game assets, copyrighted audio, video, or textures. You must supply your own copy of the Xbox 360 disc: either an uncompressed image (`.iso` / `.xiso`), multi-disc images (Disc 1 + Disc 2), or an extracted folder structure with `default.xex`. Currently, supported releases include **Mass Effect (USA, Europe) (En,Es,Pl) (Rev 1)** and **Mass Effect (Russian Edition - 1C)** (supporting full Russian voiceover and text). Check [docs/editions.md](docs/editions.md) and [docs/russian-edition.md](docs/russian-edition.md) for edition hashes, setup details, and instructions for other regional releases.
 
 ## Installation
 
-You can assemble your complete Switch installation package entirely in your desktop browser using the client-side installer: **https://nebadasswifty.github.io/masseffect-nx/**.
+You can assemble your complete Switch installation package entirely in your desktop browser using the client-side installer: **https://nebadasswifty.github.io/masseffect-nx/** (available in English and Russian).
 
-1. **Select game files:** Open the installer and point it to your Xbox 360 disc image (`.iso`) or extracted game directory (containing `default.xex`).
+1. **Select game files:** Open the installer and point it to your Xbox 360 disc image (`.iso`), multi-disc ISOs, or extracted game directory (containing `default.xex`).
 2. **Build package:** Click **Create masseffect-nx.zip**. The browser unpacks Unreal Engine packages (`*.xxx`), translates Xenos microcode to SPIR-V shaders, bundles the Switch executable, and packages everything locally. **Nothing is uploaded to the internet.**
 3. **Copy to SD card:** Extract the resulting `masseffect-nx.zip` into `sdmc:/switch/` so files reside in `/switch/masseffect-nx/`.
 4. **Install launcher forwarder:** Download `masseffect-nx-forwarder.nsp` and install it via your preferred homebrew manager (DBI, Sphaira, etc.). Ensure your forwarder is configured for **39-bit address space** so the process receives full application memory.
@@ -195,6 +195,7 @@ you want to do. Every technical word is explained in the [glossary](docs/glossar
 | [docs/platform-notes.md](docs/platform-notes.md) | Things about the Switch system that cost a lot of time to find out |
 | [docs/audio-and-video.md](docs/audio-and-video.md) | The game's audio and movies on the Switch |
 | [docs/editions.md](docs/editions.md) | How the supported edition is identified, and how to add another |
+| [docs/russian-edition.md](docs/russian-edition.md) | How the Russian release (1C) is supported, audio mapping, and multi-disc setup |
 | [docs/measuring.md](docs/measuring.md) | How to measure performance on the console without being misled |
 | [docs/performance-history.md](docs/performance-history.md) | How the frame rate went from a few FPS to about 25, step by step |
 | [docs/optimization-paths.md](docs/optimization-paths.md) | Every optimization idea tried, with its result |
