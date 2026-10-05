@@ -47,6 +47,7 @@ Every path below is relative to the repository root. Built programs go to `out/t
 | `shaders/tools/ue3_shader_scan.cpp` | Finds the containers in the game's Unreal packages (includes its own LZO1X decoder). |
 | `shaders/tools/collect_shaders.sh` | Collects containers at run time instead (`MASSEFFECT_SHADER_DUMP`, needs the PC build of the game and a lot of play time). |
 | `shaders/tools/find_shader_microcode.cpp`, `shaders/tools/wrap_raw_shader.py`, `shaders/tools/repair_vertex_variant_declarations.cpp` | Developer tools for run-time shaders that have no container (Direct3D's own): find, wrap in a container, repair a vertex declaration. |
+| `shaders/runtime_containers/` | Synthetic 2008 Xenos containers for Direct3D immediate mode and Scaleform UI shaders generated dynamically at runtime (not present on the disc). Packaged by the web installer so UI, HUD, and menus render properly. |
 | `shaders/tools/hlsl_fma.py` | Optional experiment: rewrites `a*b+c` as `mad()` in vertex HLSL. Not part of the default pipeline. |
 | `shaders/tools/build_extra_tools.sh` | Builds `extract_shader_package`, `find_shader_microcode`, `repair_vertex_variant_declarations`, `ue3_shader_scan`. |
 | `shaders/tests/` | `test_shader_precise_codegen.sh`, `test_shader_alu_parallel_codegen.sh` (translator code generation, no game files), `test_shader_index.cpp` (index load == full load), `test_vertex_variant_declarations.cpp`. |

@@ -12,6 +12,7 @@ on:
       - 'installer/**'
       - 'shaders/wasm/**'
       - 'shaders/tools/**'
+      - 'shaders/runtime_containers/**'
       - 'shaders/XenosRecomp/**'
       - 'app/masseffect.toml'
       - 'extras/icon.jpg'

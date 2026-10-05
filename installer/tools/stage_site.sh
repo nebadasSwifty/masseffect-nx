@@ -37,6 +37,18 @@ cp "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" "$out/"
 cp "$root/app/masseffect.toml" "$out/masseffect.toml"
 # The translator's shared header, pasted into every generated HLSL by the translator.
 cp "$root/shaders/XenosRecomp/shader_common.h" "$out/wasm/shader_common.h"
+# Supplemental runtime containers for D3D immediate mode and Scaleform UI shaders.
+if [ -f "$inst/wasm/runtime_containers.json" ]; then
+  cp "$inst/wasm/runtime_containers.json" "$out/wasm/runtime_containers.json"
+elif [ -d "$root/shaders/runtime_containers" ]; then
+  python3 -c "
+import base64, json, os, sys
+src, dst = sys.argv[1], sys.argv[2]
+data = {f: base64.b64encode(open(os.path.join(src, f), 'rb').read()).decode('ascii')
+        for f in sorted(os.listdir(src)) if f.endswith('.bin')}
+json.dump(data, open(dst, 'w'), indent=0)
+" "$root/shaders/runtime_containers" "$out/wasm/runtime_containers.json"
+fi
 
 n=0
 for f in scan hlsl pack dxc_web; do
@@ -56,6 +68,7 @@ if [ -n "$releases" ]; then
 fi
 if [ "$strict" -eq 1 ]; then
   [ "$n" -eq 8 ] || { echo 'error: incomplete WebAssembly toolchain' >&2; exit 1; }
+  [ -s "$out/wasm/runtime_containers.json" ] || { echo 'error: missing runtime_containers.json' >&2; exit 1; }
   for asset in masseffect-nx.nro masseffect-nx-forwarder.nsp; do
     [ -s "$out/releases/$asset" ] || { echo "error: missing release asset $asset" >&2; exit 1; }
   done

@@ -32,6 +32,7 @@ export function wasmUrls(config, baseUrl) {
     dxc: abs(w.dir + w.dxc, baseUrl),
     pack: abs(w.dir + w.pack, baseUrl),
     shaderCommon: abs(w.dir + w.shaderCommon, baseUrl),
+    runtimeContainers: w.runtimeContainers ? abs(w.dir + w.runtimeContainers, baseUrl) : null,
   };
 }
 
@@ -39,6 +40,7 @@ export function wasmUrls(config, baseUrl) {
 export async function checkToolchain(config, baseUrl, fetchImpl = fetch) {
   const w = config.wasm;
   const names = [w.scan, w.hlsl, w.dxc, w.pack, w.shaderCommon, ...w.extraFiles];
+  if (w.runtimeContainers) names.push(w.runtimeContainers);
   const missing = [];
   await Promise.all(names.map(async (n) => {
     const url = abs(w.dir + n, baseUrl);
@@ -325,6 +327,34 @@ export async function run(options) {
 
     throwIfCancelled(signal);
     const containers = await scanStage({ workers, urls, files, config, signal, progress: stage('scan'), log });
+
+    // Inject supplemental runtime/UI containers (Direct3D immediate mode and Scaleform UI shaders).
+    if (urls.runtimeContainers) {
+      try {
+        const r = await fetchImpl(urls.runtimeContainers, { signal, cache: 'no-cache' });
+        if (r.ok) {
+          const data = typeof r.json === 'function' ? await r.json() : JSON.parse(new TextDecoder().decode(r));
+          let added = 0;
+          for (const [name, b64] of Object.entries(data)) {
+            if (!containers.has(name)) {
+              let bin;
+              if (typeof Buffer !== 'undefined') {
+                bin = new Uint8Array(Buffer.from(b64, 'base64'));
+              } else {
+                bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+              }
+              containers.set(name, bin);
+              added++;
+            }
+          }
+          if (added > 0) {
+            log(`Added ${added} supplemental runtime/UI shader containers. Total: ${containers.size.toLocaleString('en-US')} containers.`, 'info');
+          }
+        }
+      } catch (e) {
+        log(`Could not load runtime containers: ${e.message}`, 'warn');
+      }
+    }
 
     // The pack worker starts now so SPIR-V goes straight into it as the translators finish.
     const packRemote = workers.spawn('pack');

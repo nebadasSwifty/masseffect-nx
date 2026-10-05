@@ -35,6 +35,9 @@ function makeSite() {
     writeFileSync(join(w, 'dxc_web.wasm'), '');
   }
   copyFileSync(join(here, '../../shaders/XenosRecomp/shader_common.h'), join(w, 'shader_common.h'));
+  const rcPath = join(here, '../wasm/runtime_containers.json');
+  if (existsSync(rcPath)) copyFileSync(rcPath, join(w, 'runtime_containers.json'));
+  else writeFileSync(join(w, 'runtime_containers.json'), '{}');
   const nro = Buffer.from('NRO0-fake-build-bytes'.repeat(100));
   const toml = Buffer.from('# fake toml\n');
   writeFileSync(join(site, 'releases/masseffect-nx.nro'), nro);

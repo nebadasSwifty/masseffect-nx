@@ -72,6 +72,8 @@ export const CONFIG = {
     pack: 'pack.mjs',
     // shader_common.h of the translator (shaders/XenosRecomp/shader_common.h), copied next to the tools.
     shaderCommon: 'shader_common.h',
+    // Supplemental runtime containers for D3D immediate mode and Scaleform UI shaders.
+    runtimeContainers: 'runtime_containers.json',
     // Each .mjs loads its own .wasm from the same folder.
     extraFiles: ['scan.wasm', 'hlsl.wasm', 'dxc_web.wasm', 'pack.wasm'],
   },
