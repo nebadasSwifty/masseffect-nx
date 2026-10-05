@@ -1,11 +1,8 @@
 Native Nintendo Switch port of Mass Effect (Xbox 360), work in progress.
 
-This update rebuilds the NRO with the project's Mesa/NVK patches and rejects older
-Vulkan archives during future builds. Default settings use synchronous logging to
-avoid async queue starvation and recheck streamed textures every four frames.
-A stationary Eden Prime console comparison stayed around 26 fps; this is not a
-claim that all flicker or movement-related frame drops are fixed. See
-[the console verification notes](https://github.com/nebadasSwifty/masseffect-nx/blob/main/docs/renderer-console-check.md).
+### What's Changed in v0.1.2
+- **Runtime UI Shaders**: Bundled 288 supplemental runtime containers for Scaleform UI, menus, and HUD in the web installer package generator, fixing missing UI draw calls and black screen issues caused by dynamic containers not found in static package scans.
+- **Documentation & Attribution**: Completely rewrote project documentation and web installer to accurately represent Mass Effect NX, properly crediting StevensND and the NFSMW-NX project with non-affiliation disclaimers (#1).
 
 - `masseffect-nx.nro`: application for `/switch/masseffect-nx/`.
 - `masseffect-nx-forwarder.nsp`: installable HOME menu launcher, 39-bit full application mode. Requires the NRO, game files and shaders on SD.
