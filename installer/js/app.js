@@ -1,5 +1,5 @@
 // The page: picks the source, shows the detected edition, runs the pipeline with progress.
-import { CONFIG } from '../config.js';
+import { CONFIG } from '../config.js?v=0.1.4';
 import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc } from './source.js';
 import { planGameFiles, formatBytes, formatDuration } from './plan.js';
 import { openSink, describeSinkSupport, cleanStaleTemporaryFiles } from './sink.js';
@@ -24,6 +24,14 @@ const STAGE_KEYS = {
 const state = { format: 'iso', disc: null, running: false, abort: null };
 
 // ---- i18n & language toggle ------------------------------------------------------------------------------------
+function updateFormatTexts() {
+  const f = state.format;
+  $('format-hint').textContent = f === 'iso' ? t('format_hint_iso') : t('format_hint_folder');
+  $('pick').textContent = f === 'iso' ? t('pick_iso') : t('pick_folder');
+  const orSpan = document.querySelector('.or');
+  if (orSpan) orSpan.textContent = t('drop_or');
+}
+
 function applyLanguage() {
   const lang = getLanguage();
   document.documentElement.lang = lang;
@@ -39,13 +47,14 @@ function applyLanguage() {
     else elem.textContent = t(key);
   }
 
-  setFormat(state.format);
+  updateFormatTexts();
   if (state.disc) {
     showEdition();
   }
 }
 
 initLanguage();
+applyLanguage();
 
 const btnEn = $('lang-en');
 const btnRu = $('lang-ru');
@@ -99,10 +108,7 @@ cleanStaleTemporaryFiles();
 // ---- step 1 ---------------------------------------------------------------------------------------------------
 function setFormat(f) {
   state.format = f;
-  $('format-hint').textContent = f === 'iso' ? t('format_hint_iso') : t('format_hint_folder');
-  $('pick').textContent = f === 'iso' ? t('pick_iso') : t('pick_folder');
-  const orSpan = document.querySelector('.or');
-  if (orSpan) orSpan.textContent = t('drop_or');
+  updateFormatTexts();
   resetDisc();
 }
 
@@ -199,43 +205,61 @@ function showEdition() {
   $('step-edition').hidden = false;
   const plan = planGameFiles(d.files, CONFIG.disc);
   d.plan = plan;
-  if (d.edition) {
-    const isUnverified = d.matchType === 'unverified_header';
-    const badge = isUnverified
-      ? el('span', { className: 'badge warn', textContent: t('badge_unverified') })
-      : el('span', { className: 'badge ok', textContent: t('badge_supported') });
-    const elements = [
-      el('dl', { className: 'ed' },
-        el('dt', { textContent: t('edition_label') }), el('dd', {}, el('strong', { textContent: d.edition.name }), ' ', badge),
-        el('dt', { textContent: 'default.xex' }), el('dd', {}, el('code', { textContent: d.sha256 })),
-        el('dt', { textContent: t('game_files_label') }), el('dd', { textContent: t('files_summary', { count: plan.copy.length.toLocaleString('en-US'), bytes: formatBytes(plan.copyBytes) }) }),
-        el('dt', { textContent: t('left_out_label') }), el('dd', { textContent: t('left_out_summary', { count: plan.skipped.length.toLocaleString('en-US'), bytes: formatBytes(plan.skippedBytes), prefixes: CONFIG.disc.skip.map((s) => s.prefix.replace(/\/$/, '')).join(', ') }) }),
-      ),
-    ];
-    if (isUnverified) {
-      elements.push(
-        el('div', { className: 'notice warn' },
-          el('p', {}, el('strong', { textContent: t('unverified_notice_title', { name: d.edition.name }) })),
-          el('p', { textContent: t('unverified_notice_body', { hash: d.sha256 }) }),
-        ),
-      );
+  if (!d.edition) {
+    d.edition = CONFIG.editions[0];
+    d.matchType = 'unverified_manual';
+  }
+  const isUnverified = d.matchType !== 'exact';
+  const badge = isUnverified
+    ? el('span', { className: 'badge warn', textContent: t('badge_unverified') })
+    : el('span', { className: 'badge ok', textContent: t('badge_supported') });
+
+  const editionSelect = el('select', {
+    className: 'edition-picker',
+    style: 'display: block; margin-top: 6px; font: inherit; font-size: 0.9rem; background: var(--bg2); color: var(--text); border: 1px solid var(--card-border); border-radius: 6px; padding: 4px 8px; cursor: pointer;'
+  });
+  for (const ed of CONFIG.editions) {
+    const opt = el('option', { value: ed.id, textContent: ed.name });
+    if (ed.id === d.edition.id) opt.selected = true;
+    editionSelect.append(opt);
+  }
+  editionSelect.addEventListener('change', (e) => {
+    const found = CONFIG.editions.find((ed) => ed.id === e.target.value);
+    if (found) {
+      d.edition = found;
+      const exactMatch = Array.isArray(found.xexSha256)
+        ? found.xexSha256.some((x) => x.toLowerCase() === d.sha256.toLowerCase())
+        : (found.xexSha256 && found.xexSha256.toLowerCase() === d.sha256.toLowerCase());
+      d.matchType = exactMatch ? 'exact' : 'unverified_manual';
+      showEdition();
     }
-    body.replaceChildren(...elements);
-    showCreate();
-  } else {
-    $('step-create').hidden = true;
-    const msg = d.matchType === 'invalid'
-      ? t('invalid_xex_msg', { error: d.error || 'corrupted or truncated executable' })
-      : t('not_supported_msg');
-    body.replaceChildren(
-      el('p', {}, el('span', { className: 'badge bad', textContent: t('badge_not_supported') }), ' ', msg),
-      el('dl', { className: 'ed' }, el('dt', { textContent: 'SHA-256' }), el('dd', {}, el('code', { textContent: d.sha256 }))),
-      el('p', { textContent: t('supported_editions_intro') }),
-      el('ul', {}, ...CONFIG.editions.map((e) => el('li', { textContent: e.name }))),
-      el('p', { textContent: t('check_original_hint') }),
-      el('p', {}, el('a', { href: CONFIG.project.issuesUrl, textContent: t('open_issue'), target: '_blank', rel: 'noopener' })),
+  });
+
+  const elements = [
+    el('dl', { className: 'ed' },
+      el('dt', { textContent: t('edition_label') }),
+      el('dd', {},
+        el('strong', { textContent: d.edition.name }), ' ', badge,
+        el('div', { style: 'margin-top: 8px;' },
+          el('span', { style: 'font-size: 0.85em; color: var(--muted); display: block; margin-bottom: 2px;', textContent: t('override_edition_label') }),
+          editionSelect,
+        ),
+      ),
+      el('dt', { textContent: 'default.xex' }), el('dd', {}, el('code', { textContent: d.sha256 })),
+      el('dt', { textContent: t('game_files_label') }), el('dd', { textContent: t('files_summary', { count: plan.copy.length.toLocaleString('en-US'), bytes: formatBytes(plan.copyBytes) }) }),
+      el('dt', { textContent: t('left_out_label') }), el('dd', { textContent: t('left_out_summary', { count: plan.skipped.length.toLocaleString('en-US'), bytes: formatBytes(plan.skippedBytes), prefixes: CONFIG.disc.skip.map((s) => s.prefix.replace(/\/$/, '')).join(', ') }) }),
+    ),
+  ];
+  if (isUnverified) {
+    elements.push(
+      el('div', { className: 'notice warn' },
+        el('p', {}, el('strong', { textContent: t('unverified_notice_title', { name: d.edition.name }) })),
+        el('p', { textContent: t('unverified_notice_body', { hash: d.sha256 }) }),
+      ),
     );
   }
+  body.replaceChildren(...elements);
+  showCreate();
 }
 
 function showCreate() {

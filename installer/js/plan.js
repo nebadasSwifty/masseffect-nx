@@ -108,7 +108,7 @@ export function parseXexHeader(bytes) {
 
 export function matchEditionHeader(editions, header) {
   if (!header || header.titleId == null) return null;
-  return editions.find((e) => {
+  const exact = editions.find((e) => {
     if (!e.header) return false;
     return (
       e.header.titleId === header.titleId &&
@@ -117,7 +117,20 @@ export function matchEditionHeader(editions, header) {
       e.header.entryPoint === header.entryPoint &&
       (!e.header.imageSize || e.header.imageSize === header.imageSize)
     );
-  }) ?? null;
+  });
+  if (exact) return exact;
+
+  const byMedia = editions.find((e) => e.header?.mediaId === header.mediaId);
+  if (byMedia) return byMedia;
+
+  if (header.titleId === 0x4D5307E8) {
+    if (header.version <= 5 || (header.entryPoint && header.entryPoint >= 0x82812500)) {
+      return editions.find((e) => e.id === 'rus-rev0') ?? editions[0];
+    }
+    return editions.find((e) => e.id === 'usa-eur-en-es-pl-rev1') ?? editions[0];
+  }
+
+  return null;
 }
 
 export function identifyEdition(editions, sha256Hex, bytes = null) {
