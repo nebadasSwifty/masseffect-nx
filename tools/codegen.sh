@@ -23,6 +23,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Edition constants (guest addresses of one default.xex): a staged edition tree (tools/edition.sh) has an edition.env at its root;
+# without one the English values below apply.
+[[ -f "$ROOT/edition.env" ]] && . "$ROOT/edition.env"
+NORETURN="${NORETURN:-82ACA550}"
+RESIDUE_VOLATILE="${RESIDUE_VOLATILE:-sub_82ACA670 sub_826710B0 sub_827F6558 sub_82BE7694}"
+RESIDUE_ARGUMENT="${RESIDUE_ARGUMENT:-sub_826710B0 sub_827F6558}"
 APP="$ROOT/app"
 PY="${PYTHON:-python3}"
 REXGLUE="${REXGLUE:-$ROOT/sdk/out/host/rexglue}"
@@ -33,7 +39,7 @@ export REXSDK_DIR="${REXSDK_DIR:-$ROOT/sdk}"      # SDK sources the hook scan re
 
 [[ -x "$REXGLUE" ]] || { echo "error: $REXGLUE not found; run tools/build_host.sh (or set REXGLUE)" >&2; exit 1; }
 [[ -f "$APP/$MANIFEST_NAME" ]] || { echo "error: $APP/$MANIFEST_NAME not found" >&2; exit 1; }
-XEX="$ROOT/assets/game_root/default.xex"
+XEX="${XEX:-$ROOT/assets/game_root/default.xex}"
 [[ -f "$XEX" ]] || { echo "error: $XEX not found; extract your disc with tools/extract_iso.py first" >&2; exit 1; }
 
 # Arguments in registers: the key of perf_overrides.toml, or ARGS_IN_REGISTERS for one run.
@@ -95,7 +101,7 @@ check_residue() {  # description allowed-names... -- extra read_before_write.py 
   while [[ $# -gt 0 && "$1" != "--" ]]; do allowed+=("$1"); shift; done
   shift
   local out unexpected=""
-  out="$("$PY" "$ROOT/tools/read_before_write.py" "$GEN" --noreturn=82ACA550 "$@" 2>/dev/null)"
+  out="$("$PY" "$ROOT/tools/read_before_write.py" "$GEN" --noreturn=$NORETURN "$@" 2>/dev/null)"
   while read -r name _; do
     [[ "$name" == sub_* ]] || continue
     local ok=0 a
@@ -112,8 +118,8 @@ check_residue() {  # description allowed-names... -- extra read_before_write.py 
   fi
 }
 # Known residue (harmless): guest setjmp 0x82ACA670, two jump-table artifacts, one 4-byte orphan fragment.
-check_residue "non_volatile_as_local" sub_82ACA670 sub_826710B0 sub_827F6558 sub_82BE7694 --
+check_residue "non_volatile_as_local" $RESIDUE_VOLATILE --
 # non_argument_as_local / reserved_as_local: only the two jump-table artifacts.
-check_residue "non_argument_as_local" sub_826710B0 sub_827F6558 -- --volatile
+check_residue "non_argument_as_local" $RESIDUE_ARGUMENT -- --volatile
 
 echo "done: $GEN"

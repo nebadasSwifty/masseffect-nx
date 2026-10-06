@@ -73,7 +73,10 @@ fi
 # so paths in the generated files stay valid.
 mounts=(-v "$ROOT:$ROOT")
 case "$MESA_SDK/" in "$ROOT"/*) ;; *) mounts+=(-v "$MESA_SDK:$MESA_SDK:ro") ;; esac
-case "$SDK_DIR/" in "$ROOT"/*) ;; *) mounts+=(-v "$SDK_DIR:$SDK_DIR:ro") ;; esac
+# The SDK may be a link (a staged edition tree, tools/edition.sh): mount its real folder at its real path. The SDK build writes
+# into <sdk>/out, so a real folder outside the tree is mounted writable (it is shared, edition-independent build output).
+SDK_REAL="$(cd "$SDK_DIR" && pwd -P)"
+case "$SDK_REAL/" in "$ROOT"/*) ;; *) mounts+=(-v "$SDK_REAL:$SDK_REAL") ;; esac
 user=()
 [[ "$(uname -s)" == Linux ]] && user=(--user "$(id -u):$(id -g)" -e HOME=/tmp)
 
