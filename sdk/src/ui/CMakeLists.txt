@@ -139,6 +139,13 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
 
+# The CAS and FSR1 (EASU/RCAS) output shaders are precompiled SPIR-V in src/ui/shaders/vulkan_spirv and need no AMD source tree: enable
+# those effects without the FidelityFX SDK (the temporal FSR2/FSR3 effects stay off: they need the runtime below).
+option(REXGLUE_UPSCALE_SHADERS "Enable the cas/fsr output effects (precompiled shaders only, no FidelityFX SDK)" OFF)
+if(REXGLUE_UPSCALE_SHADERS)
+    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+endif()
+
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
 if(TARGET amd_fidelityfx_vk)
     target_link_libraries(rexui PRIVATE amd_fidelityfx_vk)
