@@ -22,6 +22,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.tag }}
       MASSEFFECT_XEX: ${{ vars.MASSEFFECT_XEX }}
+      MASSEFFECT_XEX_RU: ${{ vars.MASSEFFECT_XEX_RU }}
       MESA_SDK: ${{ vars.MESA_SDK }}
       JOBS: '4'
     steps:
@@ -33,6 +34,8 @@ jobs:
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][a-zA-Z0-9.-]+)?$ ]] || exit 1
           test -f "$MASSEFFECT_XEX" || { echo 'Set the MASSEFFECT_XEX repository variable to a private default.xex'; exit 1; }
+          # Every edition the installer offers (installer/config.js) needs its NRO in the release.
+          test -f "$MASSEFFECT_XEX_RU" || { echo 'Set the MASSEFFECT_XEX_RU repository variable to a private Russian default.xex'; exit 1; }
           test -f "$MESA_SDK/opt/devkitpro/portlibs/switch/lib/libvulkan.a" || { echo 'Set MESA_SDK to the private NVK SDK'; exit 1; }
           python3 - <<'PY'
           import hashlib, os
@@ -48,14 +51,17 @@ jobs:
           tools/codegen.sh
       - name: Build NRO with cover icon
         run: MASSEFFECT_VERSION="${RELEASE_TAG#v}" tools/build_nro.sh
+      - name: Build the Russian edition NRO
+        # tools/edition.sh checks the SHA-256 against editions/ru/edition.env and writes out/nx-ru/masseffect-nx-rus.nro.
+        run: EDITION_XEX="$MASSEFFECT_XEX_RU" MASSEFFECT_VERSION="${RELEASE_TAG#v}" tools/edition.sh ru all
       - name: Create draft and pass NRO to the release workflow
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git tag "$RELEASE_TAG"
           git push origin "$RELEASE_TAG"
-          gh release create "$RELEASE_TAG" out/nx/masseffect-nx.nro --verify-tag --draft --title "Mass Effect NX $RELEASE_TAG" --notes-file docs/release-notes.md
+          gh release create "$RELEASE_TAG" out/nx/masseffect-nx.nro out/nx-ru/masseffect-nx-rus.nro --verify-tag --draft --title "Mass Effect NX $RELEASE_TAG" --notes-file docs/release-notes.md
           gh workflow run release.yml --ref main -f tag="$RELEASE_TAG" -f prerelease=false
       - name: Remove private input from the runner checkout
         if: always()
-        run: rm -f assets/game_root/default.xex
+        run: rm -f assets/game_root/default.xex out/edition-ru/assets/game_root/default.xex

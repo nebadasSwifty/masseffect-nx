@@ -69,7 +69,10 @@ fi
 if [ "$strict" -eq 1 ]; then
   [ "$n" -eq 8 ] || { echo 'error: incomplete WebAssembly toolchain' >&2; exit 1; }
   [ -s "$out/wasm/runtime_containers.json" ] || { echo 'error: missing runtime_containers.json' >&2; exit 1; }
-  for asset in masseffect-nx.nro masseffect-nx-forwarder.nsp; do
+  # Every edition's NRO named in installer/config.js (nro: '...'), plus the forwarder.
+  edition_nros=$(sed -nE "s/^[[:space:]]*nro: '([^']+\.nro)',.*/\1/p" "$(dirname "$0")/../config.js" | sort -u)
+  [ -n "$edition_nros" ] || { echo 'error: no edition NRO names found in installer/config.js' >&2; exit 1; }
+  for asset in $edition_nros masseffect-nx-forwarder.nsp; do
     [ -s "$out/releases/$asset" ] || { echo "error: missing release asset $asset" >&2; exit 1; }
   done
   [ -s "$releases/masseffect.toml" ] || { echo 'error: missing release settings' >&2; exit 1; }

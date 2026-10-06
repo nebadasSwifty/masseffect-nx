@@ -52,6 +52,7 @@ CMake, Ninja, Clang and the dependencies listed in `docs/building.md`.
 Set repository variables:
 
 - `MASSEFFECT_XEX`: absolute path to your supported `default.xex` outside the runner checkout.
+- `MASSEFFECT_XEX_RU`: absolute path to your Russian `default.xex` (one of the SHA-256 values in `editions/ru/edition.env`) outside the runner checkout. The build also produces `masseffect-nx-rus.nro`; the installer deployment refuses to publish a site without the NRO of every edition in `installer/config.js`.
 - `MESA_SDK`: absolute path to the SDK built by `mesa/build_mesa_docker.sh`.
 
 The NRO build checks the actual Vulkan archive for the project's `nvk_switch_draw`
