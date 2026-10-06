@@ -2221,9 +2221,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
     uint32_t w = std::min(width ? width : resolved.image.width, resolved.image.width);
     uint32_t h = std::min(height ? height : resolved.image.height, resolved.image.height);
     // Internal resolution with a full-size front buffer (me_resolution.cpp): present only the scaled corner.
-    if (uint32_t crop_w = 0, crop_h = 0; MeResolutionOutputSize(&crop_w, &crop_h)) {
+    bool cropped = false;
+    if (uint32_t crop_w = 0, crop_h = 0; MeResolutionOutputSize(&crop_w, &crop_h) && (crop_w < w || crop_h < h)) {
       w = std::min(w, crop_w);
       h = std::min(h, crop_h);
+      cropped = true;
     }
     bool painted = false;
     // How much of RefreshGuestOutput belongs to the SDK (before and after the callback) and how much to
@@ -2233,7 +2235,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
           auto& context =
               static_cast<VulkanPresenter::VulkanGuestOutputRefreshContext&>(base_context);
           painted = PaintOutput(context, source_front ? *source_front : resolved.image, w, h,
-                                 source_front != nullptr);  // masseffect_native_lazy_front
+                                 source_front != nullptr, cropped);  // masseffect_native_lazy_front
           return painted;
         });
     if (painted) {
@@ -8494,7 +8496,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
   // from_target = the source is a render target's image (or a retained one) with the front buffer in its
   // corner and larger than the output (masseffect_native_lazy_front). Only requested with the exact variant.
   bool PaintOutput(VulkanPresenter::VulkanGuestOutputRefreshContext& context, Image& source,
-                    uint32_t width, uint32_t height, bool from_target = false) {
+                    uint32_t width, uint32_t height, bool from_target = false, bool cropped = false) {
     // With masseffect_native_output_no_wait, the next of 3 slots, and it only waits if that one is still pending.
     // Without it, always slot 0: it waits for the previous output.
     const uint32_t s = output_no_wait_ ? (output_current_ + 1) % kSlotsOutput : 0;
@@ -8590,7 +8592,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
       // From a render target, the output has the front buffer's size, not the image's
       // (FrontOnPresent only requests it that way): texelFetch of the pixel, the same texel the texture
       // would hold.
-      const bool exact = from_target || (width == source.width && height == source.height);
+      // Cropped (internal resolution with a full-size front buffer): the WxH corner, texel for texel.
+      const bool exact = from_target || cropped || (width == source.width && height == source.height);
       pipeline = PipelineRamp(exact ? 1 : 0);
       if (pipeline == VK_NULL_HANDLE) {
         pipeline = pipelines_ramp_[exact ? 1 : 0];  // requested variant missing: the usual one
@@ -8609,8 +8612,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
                             sizeof(rectangle), rectangle);
     struct {
       int32_t displacement[2];
-      float inverse[2];
-    } bilinear = {{0, 0}, {1.0f / float(width), 1.0f / float(height)}};
+      std::array<float, 2> inverse;
+    } bilinear = {{0, 0}, cropped ? std::array<float, 2>{1.0f / float(source.width), 1.0f / float(source.height)}
+                                  : std::array<float, 2>{1.0f / float(width), 1.0f / float(height)}};
     dfn_.vkCmdPushConstants(commands_output_[s], layout_pipeline_, VK_SHADER_STAGE_FRAGMENT_BIT, 16,
                             sizeof(bilinear), &bilinear);
     dfn_.vkCmdDraw(commands_output_[s], 4, 1, 0, 0);

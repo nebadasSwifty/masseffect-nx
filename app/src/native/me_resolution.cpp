@@ -26,6 +26,7 @@
 #include <rex/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 
@@ -188,6 +189,10 @@ REX_HOOK_RAW(sub_823D0118) {
 // the back buffer is resolved into at Present. src/me_d3d_trace.cpp already hooks these three functions, so
 // its wrappers call this before the original.
 void MeResolutionBefore(uint32_t address, PPCContext& ctx, uint8_t* base) {
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+    REXLOG_INFO("[native] internal resolution: D3D call {:08X} r3 {:08X} r4 {:08X} lr {:08X}", address, ctx.r3.u32,
+                ctx.r4.u32, uint32_t(ctx.lr));
   if (address == 0x82234D98 && Part(4) && ctx.r4.u32) {
     REXLOG_INFO("[native] internal resolution: device {}x{} -> {}x{}", Load32(base, ctx.r4.u32),
                 Load32(base, ctx.r4.u32 + 4), Configured().w, Configured().h);

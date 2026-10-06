@@ -40,10 +40,21 @@ fi
 stage() {
   [[ "$ID" == en ]] && return 0
   echo "== staging $W"
+  # Overlay files replace English ones: show any change of the English file the overlay copy does not have.
+  python3 "$ROOT/tools/edition_drift.py" "$ID" | sed 's/^/   drift: /'
   mkdir -p "$W/assets/game_root" "$W/out"
   rsync -a --delete --exclude generated --exclude '.manifest.extra.toml' "$ROOT/app/" "$W/app/"
   rsync -a --delete "$ROOT/tools/" "$W/tools/"
-  if [[ -d "$ED/overlay" ]]; then rsync -a "$ED/overlay/" "$W/"; fi
+  if [[ -d "$ED/overlay" ]]; then
+    # --checksum: an overlay file often has the same size as the English one (only same-length addresses differ) and,
+    # when both were edited in the same second, the same mtime: rsync's quick check then keeps the English file.
+    # No -t: a copied file gets the current time, so ninja recompiles it even when its object is newer than the
+    # overlay's own (older) mtime. -a here kept a stale object of the English file in the build.
+    rsync -rlpD --checksum "$ED/overlay/" "$W/"
+    (cd "$ED/overlay" && find . -type f | while read -r f; do
+      cmp -s "$f" "$W/$f" || { echo "error: overlay file $f was not applied to $W" >&2; exit 1; }
+    done) || exit 1
+  fi
   cp "$ED/edition.env" "$W/edition.env"
   # Docker only mounts the tree itself: small inputs the build reads are copied, not linked (sdk is mounted by build_nro.sh).
   rsync -a "$ROOT/extras/" "$W/extras/"

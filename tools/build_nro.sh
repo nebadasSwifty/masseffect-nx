@@ -15,6 +15,8 @@
 #   SDK_DIR               SDK source tree to build against (default sdk/)
 #   NRO_OUT               build folder, relative to the repository (default out/nx)
 #   JOBS                  parallel compile jobs inside the container (default 6; every job needs about 1-2 GB)
+#   UPSCALE_SHADERS       ON = build the cas/fsr output effects (present_effect = "cas" / "fsr" in masseffect.toml).
+#                         Default OFF. CMake keeps the value in its cache, so pass it on every build.
 #   DEVKITA64_IMAGE       Docker image with devkitA64, cmake, ninja and glslangValidator. By default the script builds
 #                         the small image "masseffect-nx-build" (devkitpro/devkita64 plus glslang-tools) once.
 #   MASSEFFECT_LTO        ON/OFF   LTO on the game and app code (default OFF: measured no gain, needs ~16 GB of Docker memory)
@@ -84,7 +86,7 @@ echo "== configure and build ($NRO_OUT, -j$JOBS)"
 docker run --rm "${user[@]+"${user[@]}"}" "${mounts[@]}" -w "$ROOT" \
   -e JOBS="$JOBS" -e ROOT="$ROOT" -e SDK_DIR="$SDK_DIR" -e MESA_SDK="$MESA_SDK" -e NRO_OUT="$NRO_OUT" \
   -e LTO="${MASSEFFECT_LTO:-OFF}" -e PGO="${MASSEFFECT_PGO:-}" -e GEN_OPT="${MASSEFFECT_GEN_OPT:-}" \
-  -e APP_VERSION="${MASSEFFECT_VERSION:-1.0.0}" \
+  -e APP_VERSION="${MASSEFFECT_VERSION:-1.0.0}" -e UPSCALE_SHADERS="${UPSCALE_SHADERS:-OFF}" \
   -e FAST_MATH="${MASSEFFECT_FAST_MATH:-ON}" \
   "$DEVKITA64_IMAGE" bash -euo pipefail -c '
     # An older SDK can link successfully while silently omitting the project NVK patches.
@@ -99,7 +101,8 @@ docker run --rm "${user[@]+"${user[@]}"}" "${mounts[@]}" -w "$ROOT" \
       -DCMAKE_TOOLCHAIN_FILE="$ROOT/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro -DREXSDK_DIR="$SDK_DIR" \
       -DMASSEFFECT_VERSION="$APP_VERSION" -DMASSEFFECT_LTO="$LTO" -DMASSEFFECT_PGO="$PGO" -DMASSEFFECT_GEN_OPT="$GEN_OPT" -DMASSEFFECT_FAST_MATH="$FAST_MATH" \
-      -DREXGLUE_SWITCH_NVK_SDK="$MESA_SDK/opt/devkitpro/portlibs/switch"
+      -DREXGLUE_SWITCH_NVK_SDK="$MESA_SDK/opt/devkitpro/portlibs/switch" \
+      -DREXGLUE_UPSCALE_SHADERS="${UPSCALE_SHADERS:-OFF}"
     cmake --build "$NRO_OUT" -j "$JOBS"
     # crt0 must be first in .text or the NRO does not boot
     /opt/devkitpro/devkitA64/bin/aarch64-none-elf-nm "$NRO_OUT/masseffect" | grep "^0000000000000000 T _start$" >/dev/null
