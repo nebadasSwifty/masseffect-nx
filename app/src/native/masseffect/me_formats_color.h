@@ -30,6 +30,8 @@ inline VkFormat HostFormatTargetColor(uint32_t format) {
     case F::k_2_10_10_10_FLOAT_AS_16_16_16_16:
     case F::k_16_16_16_16_FLOAT:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case F::k_16_16:
+      return VK_FORMAT_R16G16_UNORM;
     case F::k_16_16_FLOAT:
       return VK_FORMAT_R16G16_SFLOAT;
     case F::k_32_FLOAT:
@@ -52,6 +54,8 @@ inline VkFormat HostFormatResolved(uint32_t format) {
     case F::k_2_10_10_10:
     case F::k_2_10_10_10_AS_16_16_16_16:
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case F::k_16_16:
+      return VK_FORMAT_R16G16_UNORM;
     case F::k_16_16_16_16_FLOAT:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
     case F::k_16_16_FLOAT:
@@ -83,6 +87,12 @@ inline VkClearColorValue ClearValueColor(uint32_t format, uint64_t value) {
         color.float32[j] = rex::graphics::xenos::Float7e3To32(uint32_t(value >> (j * 10)) & 0x3FF);
       }
       color.float32[3] = float((value >> 30) & 0x3) * (1.0f / 0x3);
+      break;
+    case F::k_16_16:
+      color.float32[0] = float(value & 0xFFFF) * (1.0f / 65535.0f);
+      color.float32[1] = float((value >> 16) & 0xFFFF) * (1.0f / 65535.0f);
+      color.float32[2] = 1.0f;
+      color.float32[3] = 1.0f;
       break;
     case F::k_16_16_FLOAT:
     case F::k_16_16_16_16_FLOAT:

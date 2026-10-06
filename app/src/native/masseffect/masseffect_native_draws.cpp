@@ -1767,6 +1767,8 @@ constexpr uint16_t kSwizzleRRRR = 0;
 constexpr uint16_t kSwizzleRGGG = (1 << 3) | (1 << 6) | (1 << 9);
 constexpr uint16_t kSwizzleRGBA = (1 << 3) | (2 << 6) | (3 << 9);
 constexpr uint16_t kSwizzleBGRA = 2 | (1 << 3) | (0 << 6) | (3 << 9);
+// Host swizzle with constant 1.0 (5 in Xenos swizzle notation) in B and A for 2-channel textures (k_16_16, etc.)
+constexpr uint16_t kSwizzleRG11 = (1 << 3) | (5 << 6) | (5 << 9);
 
 struct TextureFormat {
   VkFormat format = VK_FORMAT_UNDEFINED;
@@ -1784,7 +1786,7 @@ bool TextureFormatFor(uint32_t format, TextureFormat& f) {
       f = {VK_FORMAT_R8_UNORM, 1, 1, 0, kSwizzleRRRR};
       return true;
     case 10:  // k_8_8
-      f = {VK_FORMAT_R8G8_UNORM, 1, 2, 2, kSwizzleRGGG};
+      f = {VK_FORMAT_R8G8_UNORM, 1, 2, 2, kSwizzleRG11};
       return true;
     case 6:   // k_8_8_8_8
     case 50:  // k_8_8_8_8_AS_16_16_16_16
@@ -1816,16 +1818,25 @@ bool TextureFormatFor(uint32_t format, TextureFormat& f) {
       f = {VK_FORMAT_R16_UNORM, 1, 2, 2, kSwizzleRRRR};
       return true;
     case 25:  // k_16_16
-      f = {VK_FORMAT_R16G16_UNORM, 1, 4, 2, kSwizzleRGGG};
+      f = {VK_FORMAT_R16G16_UNORM, 1, 4, 2, kSwizzleRG11};
       return true;
     case 26:  // k_16_16_16_16
+      f = {VK_FORMAT_R16G16B16A16_UNORM, 1, 8, 2, kSwizzleRGBA};
+      return true;
+    case 27:  // k_16_EXPAND
+      f = {VK_FORMAT_R16_UNORM, 1, 2, 2, kSwizzleRRRR};
+      return true;
+    case 28:  // k_16_16_EXPAND
+      f = {VK_FORMAT_R16G16_UNORM, 1, 4, 2, kSwizzleRG11};
+      return true;
+    case 29:  // k_16_16_16_16_EXPAND
       f = {VK_FORMAT_R16G16B16A16_UNORM, 1, 8, 2, kSwizzleRGBA};
       return true;
     case 30:  // k_16_FLOAT
       f = {VK_FORMAT_R16_SFLOAT, 1, 2, 2, kSwizzleRRRR};
       return true;
     case 31:  // k_16_16_FLOAT
-      f = {VK_FORMAT_R16G16_SFLOAT, 1, 4, 2, kSwizzleRGGG};
+      f = {VK_FORMAT_R16G16_SFLOAT, 1, 4, 2, kSwizzleRG11};
       return true;
     case 32:  // k_16_16_16_16_FLOAT
       f = {VK_FORMAT_R16G16B16A16_SFLOAT, 1, 8, 2, kSwizzleRGBA};
@@ -1834,7 +1845,7 @@ bool TextureFormatFor(uint32_t format, TextureFormat& f) {
       f = {VK_FORMAT_R32_SFLOAT, 1, 4, 4, kSwizzleRRRR};
       return true;
     case 37:  // k_32_32_FLOAT
-      f = {VK_FORMAT_R32G32_SFLOAT, 1, 8, 4, kSwizzleRGGG};
+      f = {VK_FORMAT_R32G32_SFLOAT, 1, 8, 4, kSwizzleRG11};
       return true;
     case 38:  // k_32_32_32_32_FLOAT
       f = {VK_FORMAT_R32G32B32A32_SFLOAT, 1, 16, 4, kSwizzleRGBA};
@@ -1856,7 +1867,13 @@ VkComponentMapping MappingComponents(uint32_t swizzle_guest, uint16_t swizzle_ho
     const uint32_t value = (swizzle_guest >> (i * 3)) & 0x7;
     if (value <= 3) {
       const uint32_t host = (swizzle_host >> (value * 3)) & 0x7;
-      *output[i] = VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + host);
+      if (host <= 3) {
+        *output[i] = VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + host);
+      } else if (host == 4) {
+        *output[i] = VK_COMPONENT_SWIZZLE_ZERO;
+      } else {
+        *output[i] = VK_COMPONENT_SWIZZLE_ONE;
+      }
     } else if (value == 4) {
       *output[i] = VK_COMPONENT_SWIZZLE_ZERO;
     } else {
@@ -7958,6 +7975,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     for (uint32_t i = 0; i < 4; ++i) {
       signed_value |= ((signs >> (i * 2)) & 0x3) == uint32_t(xenos::TextureSign::kSigned);
     }
+    const uint32_t format_sign = f[1] & 0x3F;
+    if (signed_value && ((format_sign >= 27 && format_sign <= 32) || (format_sign >= 36 && format_sign <= 38))) {
+      signed_value = false;
+    }
     if (signed_value) {
       Warn(31, "signed textures not supported yet: read as unsigned");
       // Mass Effect diagnostic: which formats and sign sets are read unsigned (normal maps?).
@@ -8012,11 +8033,15 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           valid_until = frame_;
           return;
         }
-        // The emulation writes the copy to memory with copy_dest_swap and loads it as a texture: the fetch
-        // constant's swizzle (ZYXW for 8888) undoes that swap. Here the copy is image to image and does not
-        // swap channels, so the swap goes into the host channels (without this, Mia came out blue).
-        slot = SlotView(resolved->image, resolved->format, swizzle,
-                             resolved->swap_rb ? kSwizzleBGRA : kSwizzleRGBA);
+        TextureFormat resolved_tf;
+        uint16_t host_swizzle = resolved->swap_rb ? kSwizzleBGRA : kSwizzleRGBA;
+        if (resolved->resolved_guest_format && TextureFormatFor(resolved->resolved_guest_format, resolved_tf)) {
+          host_swizzle = resolved_tf.swizzle_host;
+          if (resolved->swap_rb && host_swizzle == kSwizzleRGBA) {
+            host_swizzle = kSwizzleBGRA;
+          }
+        }
+        slot = SlotView(resolved->image, resolved->format, swizzle, host_swizzle);
         valid_until = frame_;  // see the long comment on the depth copy
         return;
       }

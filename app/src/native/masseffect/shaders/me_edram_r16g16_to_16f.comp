@@ -1,0 +1,56 @@
+#version 450
+
+// Typeless EDRAM reinterpretation: host R16G16_UNORM image (Xenos k_16_16,
+// EDRAM class 4) -> host RGBA16F image (Xenos k_2_10_10_10_FLOAT / 7e3, EDRAM class 3, or UNORM10, class 2).
+// Reads raw 32-bit word from R16G16_UNORM (via r32ui view) and unpacks into RGBA16F.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D source;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D target;
+layout(push_constant) uniform Constants {
+  uvec2 source_size;
+  uvec2 target_size;
+  uint pitch_tiles_source;
+  uint pitch_tiles_target;
+  uint tile_source_start;
+  uint tile_target_start;
+  uint tiles_count;
+  uint source_format;
+  uint target_format;
+  uint source_64bpp;
+  uint target_64bpp;
+  uint source_msaa_x, source_msaa_y;
+  uint target_msaa_x, target_msaa_y;
+} c;
+
+vec4 Unpack32(uint word) {
+  return vec4(float(word & 0xFFFFu) / 65535.0,
+              float((word >> 16u) & 0xFFFFu) / 65535.0,
+              1.0, 1.0);
+}
+
+void main() {
+  uvec2 q = gl_GlobalInvocationID.xy;
+  if ((q.x & ((1u << (c.target_64bpp + c.target_msaa_x)) - 1u)) != 0u ||
+      (q.y & ((1u << c.target_msaa_y) - 1u)) != 0u) return;
+  bool range = c.tiles_count != 0u;
+  if (range && (q.y >= 16u || q.x >= c.tiles_count * 80u)) return;
+  uint relative    = q.x / 80u;
+  uint word_local  = q.x % 80u;
+  uint tile_target = range ? c.tile_target_start + relative
+                           : (q.y / 16u) * c.pitch_tiles_target + relative;
+  uint tile_source = range ? c.tile_source_start + relative : tile_target;
+
+  uvec2 ps = uvec2((tile_source % c.pitch_tiles_source) * 80u + word_local,
+                   (tile_source / c.pitch_tiles_source) * 16u + q.y % 16u)
+             >> uvec2(c.source_msaa_x, c.source_msaa_y);
+  if (any(greaterThanEqual(ps, c.source_size))) return;
+
+  uint word = imageLoad(source, ivec2(ps)).r;
+
+  uvec2 pt = uvec2((tile_target % c.pitch_tiles_target) * (80u >> c.target_64bpp) + (word_local >> c.target_64bpp),
+                   (tile_target / c.pitch_tiles_target) * 16u + q.y % 16u)
+             >> uvec2(c.target_msaa_x, c.target_msaa_y);
+  if (any(greaterThanEqual(pt, c.target_size))) return;
+
+  imageStore(target, ivec2(pt), Unpack32(word));
+}

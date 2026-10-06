@@ -364,6 +364,19 @@ const uint32_t me_edram_16f_to_raw64_cs[] = {
 const uint32_t me_edram_raw64_to_raw64_cs[] = {
 #include "me_edram_raw64_to_raw64.inc"
 };
+const uint32_t me_edram_r16g16_to_rgba8_cs[] = {
+#include "me_edram_r16g16_to_rgba8.inc"
+};
+const uint32_t me_edram_rgba8_to_r16g16_cs[] = {
+#include "me_edram_rgba8_to_r16g16.inc"
+};
+const uint32_t me_edram_r16g16_to_16f_cs[] = {
+#include "me_edram_r16g16_to_16f.inc"
+};
+const uint32_t me_edram_16f_to_r16g16_cs[] = {
+#include "me_edram_16f_to_r16g16.inc"
+};
+
 const uint32_t me_edram_depth_to_raw64_cs[] = {
 #include "me_edram_depth_to_raw64.inc"
 };
@@ -680,6 +693,8 @@ class TargetsVulkan final : public TargetsNative, public ContextTargets {
     if (fs_raw64_to_depth_edram_) dfn_.vkDestroyShaderModule(device_, fs_raw64_to_depth_edram_, nullptr);
     for (const auto& [image, view] : views_raw64_edram_) dfn_.vkDestroyImageView(device_, view, nullptr);
     views_raw64_edram_.clear();
+    for (const auto& [image, view] : views_raw32_edram_) dfn_.vkDestroyImageView(device_, view, nullptr);
+    views_raw32_edram_.clear();
     if (layout_pipeline_import_depth_edram_)
       dfn_.vkDestroyPipelineLayout(device_, layout_pipeline_import_depth_edram_, nullptr);
     if (layout_import_depth_edram_)
@@ -893,7 +908,7 @@ class TargetsVulkan final : public TargetsNative, public ContextTargets {
                                     &layout_pipeline_conversion_edram_) != VK_SUCCESS) {
       return false;
     }
-const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
+const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
         {shaders::masseffect_edram_7e3_to_rgba8_cs, sizeof(shaders::masseffect_edram_7e3_to_rgba8_cs)},
         {shaders::masseffect_edram_rgba8_to_7e3_cs, sizeof(shaders::masseffect_edram_rgba8_to_7e3_cs)},
         {shaders::masseffect_edram_16f_to_16f_cs, sizeof(shaders::masseffect_edram_16f_to_16f_cs)},
@@ -903,6 +918,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
         {shaders::me_edram_raw64_to_16f_cs, sizeof(shaders::me_edram_raw64_to_16f_cs)},
         {shaders::me_edram_16f_to_raw64_cs, sizeof(shaders::me_edram_16f_to_raw64_cs)},
         {shaders::me_edram_raw64_to_raw64_cs, sizeof(shaders::me_edram_raw64_to_raw64_cs)},
+        {shaders::me_edram_r16g16_to_rgba8_cs, sizeof(shaders::me_edram_r16g16_to_rgba8_cs)},  // 9: k_16_16 -> k_8_8_8_8
+        {shaders::me_edram_rgba8_to_r16g16_cs, sizeof(shaders::me_edram_rgba8_to_r16g16_cs)},  // 10: k_8_8_8_8 -> k_16_16
+        {shaders::me_edram_r16g16_to_16f_cs, sizeof(shaders::me_edram_r16g16_to_16f_cs)},      // 11: k_16_16 -> k_2_10_10_10_FLOAT (7e3/UNORM10)
+        {shaders::me_edram_16f_to_r16g16_cs, sizeof(shaders::me_edram_16f_to_r16g16_cs)},      // 12: k_2_10_10_10_FLOAT (7e3/UNORM10) -> k_16_16
     }};
     for (uint32_t i = 0; i < codes_conversion.size(); ++i) {
       VkShaderModuleCreateInfo info_module_conversion{};
@@ -4288,6 +4307,20 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
         c.float32[3] = float(word >> 30) / 3.0f;
         return c;
       }
+      if (w.format == VK_FORMAT_R16G16_UNORM && w.edram_format == 4) {
+        const uint32_t word = [&] {
+          VkClearColorValue a = *color_rgba8;
+          uint32_t v = 0;
+          for (uint32_t i = 0; i < 4; ++i) v |= uint32_t(std::lround(a.float32[i] * 255.0f)) << (8 * i);
+          return v;
+        }();
+        VkClearColorValue c{};
+        c.float32[0] = float(word & 0xFFFFu) * (1.0f / 65535.0f);
+        c.float32[1] = float((word >> 16) & 0xFFFFu) * (1.0f / 65535.0f);
+        c.float32[2] = 1.0f;
+        c.float32[3] = 1.0f;
+        return c;
+      }
       return std::nullopt;
     };
     // Partial edge tiles are cleared in their owner too when the bounds are exact (the draw touches no pixel
@@ -5225,6 +5258,32 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
       view.pNext = &usage;
       if (dfn_.vkCreateImageView(device_, &view, nullptr, &it->second) != VK_SUCCESS) {
         views_raw64_edram_.erase(it);
+        return VK_NULL_HANDLE;
+      }
+    }
+    return it->second;
+  }
+
+  // Creates (or reuses) a VK_FORMAT_R32_UINT storage-image view for a 32bpp
+  // EDRAM render target (RGBA8 or R16G16). Requires the image was allocated
+  // with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, which GetTarget() now sets for
+  // both of these formats. Used by the r16g16<->rgba8 EDRAM alias shaders.
+  VkImageView GetViewRaw32EDRAM4(Image& image) {
+    if (image.format != VK_FORMAT_R8G8B8A8_UNORM &&
+        image.format != VK_FORMAT_R16G16_UNORM)
+      return VK_NULL_HANDLE;
+    auto [it, fresh] = views_raw32_edram_.try_emplace(image.image, VK_NULL_HANDLE);
+    if (fresh) {
+      VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      view.image = image.image;
+      view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      view.format = VK_FORMAT_R32_UINT;
+      view.subresourceRange = kRangeColor;
+      VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+      usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+      view.pNext = &usage;
+      if (dfn_.vkCreateImageView(device_, &view, nullptr, &it->second) != VK_SUCCESS) {
+        views_raw32_edram_.erase(it);
         return VK_NULL_HANDLE;
       }
     }
@@ -6461,6 +6520,18 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
     } else if (source.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
                target.format == VK_FORMAT_R16G16B16A16_SFLOAT) {
       pipeline = 2;
+    } else if (source.format == VK_FORMAT_R16G16_UNORM &&
+               target.format == VK_FORMAT_R8G8B8A8_UNORM) {
+      pipeline = 9;  // k_16_16 -> k_8_8_8_8: raw 32-bit word reinterpretation
+    } else if (source.format == VK_FORMAT_R8G8B8A8_UNORM &&
+               target.format == VK_FORMAT_R16G16_UNORM) {
+      pipeline = 10;  // k_8_8_8_8 -> k_16_16: raw 32-bit word reinterpretation
+    } else if (source.format == VK_FORMAT_R16G16_UNORM &&
+               target.format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+      pipeline = 11;  // k_16_16 -> 7e3/UNORM10 (host RGBA16F)
+    } else if (source.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+               target.format == VK_FORMAT_R16G16_UNORM) {
+      pipeline = 12;  // 7e3/UNORM10 (host RGBA16F) -> k_16_16
     } else {
       return false;
     }
@@ -6475,6 +6546,22 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
       pipeline = source.edram_64bpp
           ? (target.edram_64bpp ? 8u : target.format == VK_FORMAT_R8G8B8A8_UNORM ? 4u : 6u)
           : source.format == VK_FORMAT_R8G8B8A8_UNORM ? 5u : 7u;
+    } else if (pipeline == 9u || pipeline == 10u) {
+      // For R16G16<->RGBA8 raw word copy, both images must be accessed via R32_UINT views.
+      raw_source = GetViewRaw32EDRAM4(source);
+      raw_destination = GetViewRaw32EDRAM4(target);
+      if (!raw_source || !raw_destination)
+        return FailureEDRAM4("raw 32-bit color alias UINT views unavailable", target, &source);
+    } else if (pipeline == 11u) {
+      // R16G16 (source) is accessed via R32_UINT view; RGBA16F (target) via normal view.
+      raw_source = GetViewRaw32EDRAM4(source);
+      if (!raw_source)
+        return FailureEDRAM4("raw 32-bit color alias UINT view unavailable for source R16G16", target, &source);
+    } else if (pipeline == 12u) {
+      // RGBA16F (source) via normal view; R16G16 (target) is accessed via R32_UINT view.
+      raw_destination = GetViewRaw32EDRAM4(target);
+      if (!raw_destination)
+        return FailureEDRAM4("raw 32-bit color alias UINT view unavailable for target R16G16", target, &source);
     }
     // masseffect_native_conversion_frag: the 32-bit pipelines (0-2) and raw64 -> raw64 (8) as a fragment pass.
     if ((pipeline <= 2 || pipeline == 8) && tiles_count && REXCVAR_GET(masseffect_native_edram_alias_mode) == 4 &&
@@ -6704,8 +6791,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
     image.guest_width = guest_width;
     image.guest_height = guest_height;
     image.accepts_target_of_copy = with_transfer_dst;
-    REXLOG_INFO("[native] targets: depth target base {:03X}, format {}, {}x{}", base,
-                format, pitch, height);
+    // With a ZCULL plane (no TRANSFER_DST) the driver culls with a fixed LESS direction and a tile size that
+    // depends on the image area: a suspect for lost equal-depth light passes (black characters).
+    REXLOG_INFO("[native] targets: depth target base {:03X}, format {}, {}x{}, host image {}x{}, "
+                "ZCULL plane eligible: {}", base, format, pitch, height, image_width, image_height,
+                with_transfer_dst ? "no (TRANSFER_DST)" : "yes");
     if (grid_x_log2)
       REXLOG_INFO("[native] depth raster X samples retained: base {:03X}/{} guest {}x{} -> host {}x{}; "
                   "Y still collapsed, not native MSAA", base, format, pitch, height, image_width, image_height);
@@ -7322,7 +7412,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
       return Reject(9, "real multisample allocation is not enabled in this backend");
     VkImageCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.flags = format == VK_FORMAT_R16G16B16A16_SFLOAT ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    info.flags = (format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                  format == VK_FORMAT_R8G8B8A8_UNORM ||
+                  format == VK_FORMAT_R16G16_UNORM)
+                 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     info.imageType = VK_IMAGE_TYPE_2D;
     info.format = format;
     info.extent = {width, height, 1};
@@ -7398,6 +7491,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
     if (auto it = views_raw64_edram_.find(image.image); it != views_raw64_edram_.end()) {
       dfn_.vkDestroyImageView(device_, it->second, nullptr);
       views_raw64_edram_.erase(it);
+    }
+    if (auto it = views_raw32_edram_.find(image.image); it != views_raw32_edram_.end()) {
+      dfn_.vkDestroyImageView(device_, it->second, nullptr);
+      views_raw32_edram_.erase(it);
     }
     if (auto it = views_depth_edram_.find(image.image); it != views_depth_edram_.end()) {
       if (it->second.depth) dfn_.vkDestroyImageView(device_, it->second.depth, nullptr);
@@ -8707,9 +8804,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
   VkShaderModule fs_raw64_to_depth_edram_ = VK_NULL_HANDLE;
   bool raw64_edram_supported_ = false;
   std::unordered_map<VkImage, VkImageView> views_raw64_edram_;
+  std::unordered_map<VkImage, VkImageView> views_raw32_edram_;
   VkPipelineLayout layout_pipeline_conversion_edram_ = VK_NULL_HANDLE;
-  std::array<VkShaderModule, 9> shaders_conversion_edram_{};
-  std::array<VkPipeline, 9> pipelines_conversion_edram_{};
+  std::array<VkShaderModule, 13> shaders_conversion_edram_{};
+  std::array<VkPipeline, 13> pipelines_conversion_edram_{};
   VkDescriptorSetLayout layout_descriptors_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_descriptors_ = VK_NULL_HANDLE;
