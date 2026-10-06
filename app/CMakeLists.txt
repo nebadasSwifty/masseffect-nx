@@ -31,6 +31,8 @@ set(MASSEFFECT_SOURCES
     src/native/me_physx.cpp
     src/native/me_audio_hooks.cpp
     src/native/me_hot_guest.cpp
+    src/native/me_hang_watchdog.cpp
+    src/native/me_render_ring.cpp
     src/native/masseffect/masseffect_native_draws.cpp
     src/native/masseffect/masseffect_deferred_recording.cpp
     src/native/masseffect/masseffect_native_targets.cpp
