@@ -67,6 +67,8 @@ extern "C" void RexSwitchPerfHitch(uint64_t start, uint64_t end);
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
+extern "C" bool MeResolutionOutputSize(uint32_t* w, uint32_t* h);  // me_resolution.cpp
+
 namespace gr = rex::graphics;
 
 namespace masseffect::native {
@@ -2216,8 +2218,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
       return false;
     }
     Resolved& resolved = it->second;
-    const uint32_t w = std::min(width ? width : resolved.image.width, resolved.image.width);
-    const uint32_t h = std::min(height ? height : resolved.image.height, resolved.image.height);
+    uint32_t w = std::min(width ? width : resolved.image.width, resolved.image.width);
+    uint32_t h = std::min(height ? height : resolved.image.height, resolved.image.height);
+    // Internal resolution with a full-size front buffer (me_resolution.cpp): present only the scaled corner.
+    if (uint32_t crop_w = 0, crop_h = 0; MeResolutionOutputSize(&crop_w, &crop_h)) {
+      w = std::min(w, crop_w);
+      h = std::min(h, crop_h);
+    }
     bool painted = false;
     // How much of RefreshGuestOutput belongs to the SDK (before and after the callback) and how much to
     // PaintOutput.

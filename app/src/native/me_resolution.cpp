@@ -62,6 +62,14 @@ extern "C" volatile int64_t g_me_ui_width = 1280, g_me_ui_height = 720;
 // HUD world-to-screen Y factor read by the patched __fast_sub_827C07F0 (tools/pch_ui_world_to_screen.py).
 extern "C" volatile double g_me_ui_y_scale = 1.0;
 
+// The front buffer keeps the game's 1280x720 and only the output reads the WxH corner the back buffer is resolved
+// into. The game expects that size: with a WxH front buffer the character-creation cutscene (Anderson at the
+// window) drew Shepard as a black silhouette.
+REXCVAR_DEFINE_BOOL(masseffect_scene_front_full, true, "Mass Effect",
+                    "With an internal resolution set, keep the front buffer at 1280x720 (part 16 off) and present "
+                    "only its WxH corner. false = shrink the front buffer too (black characters in some cutscenes)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(masseffect_scene_ui, true, "Mass Effect",
                     "With an internal resolution set, lay the Scaleform UI stage out at that size too (viewport "
                     "of sub_82238FE8) instead of 1280x720")
@@ -91,6 +99,7 @@ const Size& Configured() {
     s.h = uint32_t(REXCVAR_GET(masseffect_scene_height));
     s.parts = uint32_t(REXCVAR_GET(masseffect_scene_parts));
     if (!s.w || !s.h) s.parts = 0;
+    if (REXCVAR_GET(masseffect_scene_front_full)) s.parts &= ~16u;
     if (s.parts && REXCVAR_GET(masseffect_scene_ui)) {
       g_me_ui_width = s.w;
       g_me_ui_height = s.h;
@@ -106,6 +115,16 @@ const Size& Configured() {
 inline bool Part(uint32_t bit) { return (Configured().parts & bit) != 0; }
 
 }  // namespace
+
+// The output (masseffect_native_targets.cpp, Present) shows only this corner of the front buffer when the back buffer
+// is scaled but the front buffer keeps its full size (masseffect_scene_front_full).
+extern "C" bool MeResolutionOutputSize(uint32_t* w, uint32_t* h) {
+  const Size& s = Configured();
+  if (!(s.parts & 8u) || (s.parts & 16u)) return false;
+  *w = s.w;
+  *h = s.h;
+  return true;
+}
 
 // 1. XenonClient::CreateViewportFrame(r4 client, r5 name, r6 SizeX, r7 SizeY, r8 fullscreen).
 REX_EXTERN(__imp__sub_826E5060);
