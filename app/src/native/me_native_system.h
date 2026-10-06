@@ -1,6 +1,7 @@
 // Native graphics system (see me_native_system.cpp).
 #pragma once
 
+#include <cstdint>
 #include <memory>
 
 #include <rex/system/interfaces/graphics.h>
@@ -29,5 +30,10 @@ void NoteDrawCall(const uint8_t* base, uint32_t type, uint32_t r5, uint32_t r6, 
 // Called by the ring thread after it writes the read pointer back: wakes the game's D3D GPU wait
 // (src/native/me_ring_wait.cpp, sub_8222FA98).
 void NotifyRingProgress();
+
+// Hang watchdog (src/native/me_hang_watchdog.cpp), nothing unless masseffect_hang_watchdog = true.
+// Start: once the guest image is loaded. Interval: the Swaps and draws of each 10-second renderer report.
+void StartHangWatchdog();
+void HangWatchdogInterval(uint64_t swaps, uint64_t draws);
 
 }  // namespace me::native

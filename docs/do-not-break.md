@@ -42,5 +42,11 @@ the edition overlays or the test tooling.
 8. **Do not press A while waiting for a screen**: it can pick the default profile and skip character creation. Wait for the
    screen, then press once (`switch_bot.py advance`).
 9. **HOME ignores input while it appears**: press A until the screen leaves HOME.
-10. **The hang watchdog (`masseffect_hang_watchdog`) currently stops the Russian build from starting** (its thread cannot be
-    created on the console). Keep it off until fixed.
+10. **The hang watchdog runs on the ring thread** (`masseffect_hang_watchdog = true`, optional
+    `masseffect_hang_peek`). Its first version created its own std::thread and the game did not start on the Switch:
+    do not add threads to it. Useful peek for the D3D device owner thread: `*82EA0F24+2A08` (Russian),
+    `*82EA0F04+2A08` (English).
+11. **The black start was a render command buffer deadlock** (fixed by `masseffect_render_ring_kb`, default 4096): while
+    the loading movie thread owns the Direct3D device, the rendering thread does not read commands; with the game's
+    256 KB buffer the game thread could fill it before the movie stopped and spin forever. Do not set it back to 256.
+    Checked: 12 launches out of 12 reached the title (before: black in 1 of 6, once 3 in a row).

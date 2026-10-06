@@ -52,6 +52,7 @@
 #include "rex/ui/switch_apm.h"
 #include "rex/ui/switch_saltynx.h"
 #include "rex/ui/switch_sysclk.h"
+#include "rex/ui/switch_thread_snapshot.h"
 
 extern "C" {
 void _start(void);
@@ -147,6 +148,12 @@ WindowHitch g_hitches[kMaxHitches];
 std::atomic<u32> g_num_hitches{0};
 Sample g_samples[kMaxSamples];
 size_t g_sample_count = 0;
+
+/*
+ * Held while a thread is paused by the sampler or by RexSwitchSnapshotThreads, so one of them never resumes a
+ * thread the other has just paused. The sampler only tries it (it skips that sample); the snapshot waits.
+ */
+std::atomic<bool> g_pause_busy{false};
 
 std::atomic<u64> g_counters[kCounterCount];
 
@@ -955,7 +962,11 @@ void ProfilerMain(void*) {
       if (!h || !s.busy) {
         continue;
       }
+      if (g_pause_busy.exchange(true, std::memory_order_acquire)) {
+        break;  // a hang snapshot is pausing threads right now
+      }
       if (R_FAILED(svcSetThreadActivity(h, ThreadActivity_Paused))) {
+        g_pause_busy.store(false, std::memory_order_release);
         break;
       }
       ThreadContext ctx;
@@ -985,6 +996,7 @@ void ProfilerMain(void*) {
         }
       }
       svcSetThreadActivity(h, ThreadActivity_Runnable);
+      g_pause_busy.store(false, std::memory_order_release);
       break;
     }
 
@@ -1220,5 +1232,73 @@ void RexSwitchPerfSetThreadName(u32 handle, const char* name) {
     }
   }
 }
+
+/*
+ * Hang diagnostics (switch_thread_snapshot.h): every registered thread, paused one at a time. Between pause and
+ * resume only system calls and stores into the caller's buffer run (no malloc, no stdio, no locks).
+ */
+size_t RexSwitchSnapshotThreads(RexSwitchThreadSnapshot* out, size_t max) {
+  if (!out || !max) {
+    return 0;
+  }
+  const u32 self = threadGetCurHandle();
+  while (g_pause_busy.exchange(true, std::memory_order_acquire)) {
+    __real_svcSleepThread(100000);  // the sampler holds it for a few microseconds
+  }
+  size_t n = 0;
+  for (size_t idx = 0; idx < kMaxThreads && n < max; ++idx) {
+    Slot& s = g_slots[idx];
+    const u32 h = s.handle.load();
+    if (!h) {
+      continue;
+    }
+    RexSwitchThreadSnapshot& o = out[n++];
+    std::memset(&o, 0, sizeof(o));
+    o.handle = h;
+    std::memcpy(o.name, s.name, sizeof(o.name));
+    o.name[sizeof(o.name) - 1] = 0;
+    if (h == self) {
+      o.state = kRexSwitchSnapshotSelf;
+      continue;
+    }
+    if (R_FAILED(svcSetThreadActivity(h, ThreadActivity_Paused))) {
+      o.state = kRexSwitchSnapshotPauseFailed;
+      continue;
+    }
+    ThreadContext ctx;
+    if (R_FAILED(svcGetThreadContext3(&ctx, h))) {
+      o.state = kRexSwitchSnapshotContextFailed;
+    } else {
+      o.state = kRexSwitchSnapshotOk;
+      o.pc = ctx.pc.x;
+      o.lr = ctx.lr;
+      o.sp = ctx.sp;
+      o.fp = ctx.fp;
+      o.in_kernel = AfterSvc(ctx.pc.x) ? 1 : 0;
+      // Same walk as the sampler: only frames inside the memory region of sp.
+      MemoryInfo smi;
+      u32 spi = 0;
+      if (R_SUCCEEDED(svcQueryMemory(&smi, &spi, ctx.sp)) && (smi.perm & Perm_R)) {
+        const u64 lo = smi.addr, hi = smi.addr + smi.size;
+        u64 fp = ctx.fp;
+        for (u32 k = 0; k < REX_SWITCH_SNAPSHOT_FRAMES && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; ++k) {
+          o.frames[k] = reinterpret_cast<const u64*>(fp)[1];
+          o.frame_count = k + 1;
+          const u64 next = reinterpret_cast<const u64*>(fp)[0];
+          if (next <= fp) {
+            break;
+          }
+          fp = next;
+        }
+      }
+    }
+    svcSetThreadActivity(h, ThreadActivity_Runnable);
+  }
+  g_pause_busy.store(false, std::memory_order_release);
+  return n;
+}
+
+uint64_t RexSwitchImageBase(void) { return g_base; }
+uint64_t RexSwitchImageTextEnd(void) { return g_text_hi; }
 
 }  // extern "C"

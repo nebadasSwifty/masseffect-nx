@@ -23,6 +23,11 @@ video_mode_height = 540
 masseffect_scene_width = 960
 masseffect_scene_height = 544
 
+# Full-screen quads whose vertex positions are packed (16_16, 8_8_8_8, ...) count as proven overwrites, so the
+# EDRAM content under them is not converted first (about 3 ms per frame less GPU time in cutscenes at 960x544,
+# picture checked on the Switch in the Anderson cutscene and the Normandy cockpit).
+masseffect_native_extent_packed_formats = true
+
 # Vertical sync (on by default). Turn off only to measure the uncapped frame rate.
 # vsync = true
 

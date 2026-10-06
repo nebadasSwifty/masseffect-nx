@@ -90,6 +90,11 @@ REXCVAR_DEFINE_BOOL(masseffect_renderer_native, true, "Mass Effect",
                     "Switch: use the native renderer (true) or ReXGlue's Xenos emulation (false, needs "
                     "gpu_plugin = \"xenos\")")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_extent_packed_formats, false, "Mass Effect",
+                    "Draw extent proofs also accept packed vertex position formats (16_16, 16_16_FLOAT, 16_16_16_16(_FLOAT), "
+                    "8_8_8_8, 2_10_10_10), decoded by the SDK interpreter: full-screen quads written with them become "
+                    "proven overwrites and skip the EDRAM conversion of the old content. false = 32-bit floats only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(masseffect_native_edram4_stencil_inert, true, "Mass Effect",
                     "EDRAM mode 4: a draw whose stencil test is ALWAYS and writes nothing counts as stencil-off "
                     "(full depth overwrite proof; lazy stencil kept where it is)");
@@ -2270,7 +2275,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           REXCVAR_GET(masseffect_native_edram4_several_rect)) {
         // Rect lists of several rectangles (D3D Clear of two regions): prove each one with the same
         // single-rectangle estimator on a register copy whose index offset selects that rectangle.
-        if (!draw_extent_estimator_) { draw_extent_estimator_ = std::make_unique<NativeDrawExtentEstimator>(*memory_); draw_extent_estimator_->AllowClipInside(REXCVAR_GET(masseffect_native_edram4_clip_inside)); draw_extent_estimator_->AllowQuadTriangles(REXCVAR_GET(masseffect_native_edram4_quad_triangles)); draw_extent_estimator_->AllowAlu(REXCVAR_GET(masseffect_native_edram4_vs_alu)); }
+        if (!draw_extent_estimator_) { draw_extent_estimator_ = std::make_unique<NativeDrawExtentEstimator>(*memory_); draw_extent_estimator_->AllowClipInside(REXCVAR_GET(masseffect_native_edram4_clip_inside)); draw_extent_estimator_->AllowQuadTriangles(REXCVAR_GET(masseffect_native_edram4_quad_triangles)); draw_extent_estimator_->AllowAlu(REXCVAR_GET(masseffect_native_edram4_vs_alu)); draw_extent_estimator_->AllowPackedFormats(REXCVAR_GET(masseffect_native_extent_packed_formats)); }
         ProveRectangleList(request, rect_vertices / 3u);
       } else if ((((initiator >> 6) & 3u) == uint32_t(xenos::SourceSelect::kAutoIndex) ||
                   (((initiator >> 6) & 3u) == uint32_t(xenos::SourceSelect::kDMA) &&
@@ -2279,7 +2284,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
            (REXCVAR_GET(masseffect_native_edram4_quad_triangles) &&
             (((initiator & 63u) == uint32_t(xenos::PrimitiveType::kTriangleList) && (initiator >> 16) == 6u) ||
              ((initiator & 63u) == uint32_t(xenos::PrimitiveType::kTriangleStrip) && (initiator >> 16) == 4u))))) {
-        if (!draw_extent_estimator_) { draw_extent_estimator_ = std::make_unique<NativeDrawExtentEstimator>(*memory_); draw_extent_estimator_->AllowClipInside(REXCVAR_GET(masseffect_native_edram4_clip_inside)); draw_extent_estimator_->AllowQuadTriangles(REXCVAR_GET(masseffect_native_edram4_quad_triangles)); draw_extent_estimator_->AllowAlu(REXCVAR_GET(masseffect_native_edram4_vs_alu)); }
+        if (!draw_extent_estimator_) { draw_extent_estimator_ = std::make_unique<NativeDrawExtentEstimator>(*memory_); draw_extent_estimator_->AllowClipInside(REXCVAR_GET(masseffect_native_edram4_clip_inside)); draw_extent_estimator_->AllowQuadTriangles(REXCVAR_GET(masseffect_native_edram4_quad_triangles)); draw_extent_estimator_->AllowAlu(REXCVAR_GET(masseffect_native_edram4_vs_alu)); draw_extent_estimator_->AllowPackedFormats(REXCVAR_GET(masseffect_native_extent_packed_formats)); }
         NativeDrawExtentEstimator::Diagnostics diagnostic;
         request.edram_used_height_estimate = draw_extent_estimator_->Estimate(registers_, vs_microcode_, &diagnostic);
         if (request.edram_used_height_estimate && request.ps) {
@@ -2336,13 +2341,13 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
               request.edram_used_height_estimate.value_or(UINT32_MAX), diagnostic.reason);
           if (extent_diagnostics_.insert(key).second)
             REXLOG_INFO("[native] bounded draw extent: code={:016X} VS={} depth={:08X} surface={:08X} "
-                        "accepted={} maxY={} reason={} postVS=[{},{},{},{}; {},{},{},{}; {},{},{},{}]",
+                        "accepted={} maxY={} reason={} format={} postVS=[{},{},{},{}; {},{},{},{}; {},{},{},{}]",
                         current_vs_hash_, request.vs->number,
                         Register(rex::graphics::XE_GPU_REG_RB_DEPTH_INFO),
                         Register(rex::graphics::XE_GPU_REG_RB_SURFACE_INFO),
                         bool(request.edram_used_height_estimate),
                         request.edram_used_height_estimate.value_or(UINT32_MAX), diagnostic.reason,
-                        diagnostic.position[0][0], diagnostic.position[0][1], diagnostic.position[0][2], diagnostic.position[0][3],
+                        diagnostic.rejected_format, diagnostic.position[0][0], diagnostic.position[0][1], diagnostic.position[0][2], diagnostic.position[0][3],
                         diagnostic.position[1][0], diagnostic.position[1][1], diagnostic.position[1][2], diagnostic.position[1][3],
                         diagnostic.position[2][0], diagnostic.position[2][1], diagnostic.position[2][2], diagnostic.position[2][3]);
         }
@@ -2485,6 +2490,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                 interrupts_.load() - reported_interrupts_, waits_timed_out_, shaders_identified_,
                 shaders_by_address_, shaders_unidentified_, st.drawn, st.rejected, st.pipelines, st.textures,
                 presented);
+    HangWatchdogInterval(swaps_ - reported_swaps_, draws_ - reported_draws_);
     std::string causes;
     for (size_t i = 0; i < st.causes.size() && i < 6; ++i) {
       causes += fmt::format(" {}x{}", st.causes[i].first, st.causes[i].second);

@@ -34,6 +34,9 @@ class NativeDrawExtentEstimator {
   // an axis-aligned rectangle split along one diagonal cover it exactly like a rectangle (fill rule).
   void AllowQuadTriangles(bool allow) { allow_quad_triangles_ = allow; }
   void AllowAlu(bool allow) { allow_alu_ = allow; }
+  // Packed vertex formats (16_16, 16_16_FLOAT, 16_16_16_16, 16_16_16_16_FLOAT, 8_8_8_8, 2_10_10_10): the SDK interpreter
+  // decodes them; only the 32-bit float formats are checked for non-finite words here.
+  void AllowPackedFormats(bool allow) { allow_packed_formats_ = allow; }
 
   explicit NativeDrawExtentEstimator(const rex::memory::Memory& memory) : memory_(memory) {}
 
@@ -151,11 +154,27 @@ class NativeDrawExtentEstimator {
               const bool float3 = fetch.data_format() == xenos::VertexFormat::k_32_32_32_FLOAT;
               // float2 (full-screen quads): z/w must then come from explicit 0/1 selectors (checked below).
               const bool float2 = allow_quad_triangles_ && fetch.data_format() == xenos::VertexFormat::k_32_32_FLOAT;
-              if (!float4 && !float3 && !float2) {
+              // Packed formats: words read from memory and decoded components.
+              uint32_t packed_words = 0, packed_components = 0;
+              if (allow_packed_formats_) {
+                switch (fetch.data_format()) {
+                  case xenos::VertexFormat::k_16_16:
+                  case xenos::VertexFormat::k_16_16_FLOAT:
+                    if (allow_quad_triangles_) packed_words = 1, packed_components = 2;
+                    break;
+                  case xenos::VertexFormat::k_16_16_16_16:
+                  case xenos::VertexFormat::k_16_16_16_16_FLOAT: packed_words = 2, packed_components = 4; break;
+                  case xenos::VertexFormat::k_8_8_8_8:
+                  case xenos::VertexFormat::k_2_10_10_10: packed_words = 1, packed_components = 4; break;
+                  default: break;
+                }
+              }
+              if (!float4 && !float3 && !float2 && !packed_words) {
                 d.rejected_format = uint32_t(fetch.data_format());
                 return reject("fetch-format");
               }
-              const uint32_t components = float4 ? 4 : float3 ? 3 : 2;
+              const uint32_t components = packed_words ? packed_components : float4 ? 4 : float3 ? 3 : 2;
+              const uint32_t words_read = packed_words ? packed_words : components;
               const auto binding = regs.GetVertexFetch(last_full_fetch->fetch_constant_index());
               if (binding.type != xenos::FetchConstantType::kVertex) return reject("fetch-constant-type");
               const uint64_t base = binding.address;
@@ -163,15 +182,15 @@ class NativeDrawExtentEstimator {
               if (!binding.size || end > (uint64_t(0x20000000) / 4)) return reject("fetch-buffer-bounds");
               for (uint32_t index : indices) {
                 const uint64_t first = base + uint64_t(last_full_fetch->stride()) * index + uint32_t(fetch.offset());
-                if (first < base || first + components > end) return reject("fetch-index-bounds");
+                if (first < base || first + words_read > end) return reject("fetch-index-bounds");
                 const auto* bytes = memory_.physical_membase() + first * 4;
                 // Query the actual physical mapping, not a possibly different virtual alias.
                 size_t readable_length = 0;
                 rex::memory::PageAccess access;
                 if (!rex::memory::QueryProtect(const_cast<uint8_t*>(bytes), readable_length, access) ||
                     !(uint32_t(access) & uint32_t(rex::memory::PageAccess::kReadOnly)) ||
-                    readable_length < components * 4) return reject("fetch-memory-unreadable");
-                for (uint32_t c = 0; c < components; ++c) {
+                    readable_length < words_read * 4) return reject("fetch-memory-unreadable");
+                for (uint32_t c = 0; c < (packed_words ? 0u : components); ++c) {
                   uint32_t bits;
                   std::memcpy(&bits, bytes + c * 4, 4);
                   bits = xenos::GpuSwap(bits, binding.endian);
@@ -463,6 +482,7 @@ class NativeDrawExtentEstimator {
   bool allow_clip_inside_ = false;
   bool allow_quad_triangles_ = false;
   bool allow_alu_ = false;
+  bool allow_packed_formats_ = false;
 };
 
 }  // namespace me::native

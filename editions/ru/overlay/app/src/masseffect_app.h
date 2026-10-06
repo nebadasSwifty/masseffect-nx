@@ -69,6 +69,7 @@ class MassEffectApp : public rex::ReXApp {
   // (image_base..image_base+image_size) so code pointers stored in data can be scanned for.
   // Does nothing unless the variable is set.
   void OnPostLoadXexImage() override {
+    me::native::StartHangWatchdog();  // diagnostics, off unless masseffect_hang_watchdog = true
     if (!runtime() || !runtime()->memory()) {
       return;
     }
