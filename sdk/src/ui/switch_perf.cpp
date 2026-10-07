@@ -236,26 +236,6 @@ constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
 std::atomic<bool> g_ab_active{false};
 std::atomic<u32> g_skip_mask{0};
 
-// Current CPU / GPU / memory clocks in Hz (0 when clkrst is unavailable). Own sessions: callable without the profiler.
-extern "C" void RexSwitchClocks(uint32_t hz_out[3]) {
-  static bool started = false, ok = false;
-  static ClkrstSession sessions[3];
-  if (!started) {
-    started = true;
-    if (R_SUCCEEDED(clkrstInitialize())) {
-      static const PcvModuleId modules[3] = {PcvModuleId_CpuBus, PcvModuleId_GPU, PcvModuleId_EMC};
-      ok = true;
-      for (unsigned i = 0; i < 3; ++i)
-        if (R_FAILED(clkrstOpenSession(&sessions[i], modules[i], 3))) ok = false;
-    }
-  }
-  for (unsigned i = 0; i < 3; ++i) {
-    u32 hz = 0;
-    if (ok) clkrstGetClockRate(&sessions[i], &hz);
-    hz_out[i] = hz;
-  }
-}
-
 extern "C" void RexSwitchPerfToggleAb(void) {
   const bool new_value = !g_ab_active.load(std::memory_order_relaxed);
   g_ab_active.store(new_value, std::memory_order_relaxed);
