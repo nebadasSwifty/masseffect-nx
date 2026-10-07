@@ -22,7 +22,16 @@ REXCVAR_DEFINE_INT32(masseffect_render_ring_kb, 4096, "Mass Effect",
     .range(256, 16384)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_INT32(masseffect_game_msaa, 1, "Mass Effect",
+                     "The game's 2x MSAA with predicated tiling (the scene drawn in two tiles): 1 = as the game decides "
+                     "(on in HD video modes), 0 = off (the word the D3D init clears in SD modes; Xenia's ME1 patch "
+                     "\"Black Shading Fix\" writes the same). Changes the picture: no 2x MSAA on edges")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace {
+// UE3's MSAA/predicated tiling switch (a 32-bit word in the data section; the D3D init sets it to 0 in SD video modes).
+constexpr uint32_t kMsaaTiling = 0x82E5DCD4;
 constexpr uint32_t kRing = 0x82EC1254;  // FRingBuffer: +0 start, +4 end, +8 write, +12 end of the last write, +20 read,
                                         // +24 alignment
 void Store32(uint8_t* base, uint32_t address, uint32_t value) {
@@ -34,6 +43,11 @@ void Store32(uint8_t* base, uint32_t address, uint32_t value) {
 REX_EXTERN(__imp__sub_82D3BDF0);
 REX_EXTERN(sub_823BF1F0);  // appMalloc(size)
 REX_HOOK_RAW(sub_82D3BDF0) {
+  // Runs in the game's static initializers, before the D3D init reads or writes the MSAA word.
+  if (REXCVAR_GET(masseffect_game_msaa) == 0) {
+    Store32(base, kMsaaTiling, 0);
+    REXLOG_INFO("[native] game MSAA and predicated tiling off (masseffect_game_msaa = 0)");
+  }
   const uint32_t kb = uint32_t(std::clamp(REXCVAR_GET(masseffect_render_ring_kb), 256, 16384));
   if (kb <= 256) {
     __imp__sub_82D3BDF0(ctx, base);
