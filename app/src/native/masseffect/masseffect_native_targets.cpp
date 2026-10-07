@@ -175,6 +175,9 @@ REXCVAR_DEFINE_BOOL(masseffect_native_conversion_same_layout, true, "MASSEFFECT"
 REXCVAR_DEFINE_BOOL(masseffect_native_resolve_bias_frag, false, "MASSEFFECT",
                     "Resolves with an exponent bias (the HDR chain, 6-7 per frame) as a fragment pass writing a color "
                     "attachment instead of a compute dispatch on storage images. false = compute, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_conversion_copy_32, false, "MASSEFFECT",
+                    "EDRAM mode 4: k_16_16 <-> k_8_8_8_8 conversions between views of the same tile layout as a plain "
+                    "image copy (the same 32-bit words) instead of a compute pass. false = compute, as before");
 REXCVAR_DEFINE_BOOL(masseffect_native_resolve_7e3_direct, false, "MASSEFFECT",
                     "EDRAM mode 4: a resolve of the k_2_10_10_10 (UNORM10) scene view whose tiles all belong to the "
                     "k_2_10_10_10_FLOAT (7e3) image reads that image directly (same 32-bit words) instead of "
@@ -6757,6 +6760,58 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     } else {
       return false;
     }
+    // masseffect_native_conversion_copy_32: k_16_16 <-> k_8_8_8_8 is the same 32-bit EDRAM word in both views. With
+    // the same tile layout the texels are the same texels, so a plain image copy (both formats are in the 32-bit
+    // compatibility class) moves the words bit for bit, without a compute pass.
+    if ((pipeline == 9u || pipeline == 10u) && REXCVAR_GET(masseffect_native_conversion_copy_32) && copy_image_ &&
+        !source.edram_64bpp && !target.edram_64bpp && PitchTilesEDRAM(source) == PitchTilesEDRAM(target) &&
+        tile_source_start == tile_target_start && source.edram_msaa_x == target.edram_msaa_x &&
+        source.edram_msaa_y == target.edram_msaa_y && source.raster_grid_x == target.raster_grid_x &&
+        !source.guest_width && !target.guest_width) {
+      const uint32_t pitch = PitchTilesEDRAM(target);
+      const uint32_t tile_w = 80u >> target.edram_msaa_x, tile_h = 16u >> target.edram_msaa_y;
+      const uint32_t width = std::min(source.width, target.width), height = std::min(source.height, target.height);
+      VkImageCopy regions[3]{};
+      uint32_t region_count = 0;
+      const auto add = [&](uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+        if (x >= width || y >= height) return;
+        w = std::min(w, width - x);
+        h = std::min(h, height - y);
+        if (!w || !h) return;
+        VkImageCopy& r = regions[region_count++];
+        r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.srcOffset = r.dstOffset = {int32_t(x), int32_t(y), 0};
+        r.extent = {w, h, 1};
+      };
+      if (!tiles_count) {
+        add(0, 0, width, height);
+      } else if (pitch) {
+        const uint32_t first = tile_target_start, last = tile_target_start + tiles_count - 1;
+        const uint32_t row0 = first / pitch, row1 = last / pitch;
+        if (row0 == row1) {
+          add((first % pitch) * tile_w, row0 * tile_h, (last - first + 1) * tile_w, tile_h);
+        } else {
+          add((first % pitch) * tile_w, row0 * tile_h, (pitch - first % pitch) * tile_w, tile_h);
+          if (row1 > row0 + 1) add(0, (row0 + 1) * tile_h, pitch * tile_w, (row1 - row0 - 1) * tile_h);
+          add(0, row1 * tile_h, (last % pitch + 1) * tile_w, tile_h);
+        }
+      }
+      if (region_count) {
+        if (draws_) draws_->FinishPass();
+        if (edram4_batch_.active) {
+          CloseComputeBatchEDRAM4();
+          if (!CloseImportBatchEDRAM4()) return false;
+        }
+        LabelMarkGpu((43u << 16) | std::min(tiles_count, 0xFFFFu));  // report label: 32-bit word copy
+        BarrierBeforeCopyResolve();
+        copy_image_(commands_work_, source.image, VK_IMAGE_LAYOUT_GENERAL, target.image, VK_IMAGE_LAYOUT_GENERAL,
+                    region_count, regions);
+        BarrierAfterCopyResolve();
+        if (draws_) draws_->NotifyGraphicsExternalState();
+        ++conversions_copy_32_;
+        return true;
+      }
+    }
     const bool raw_alias = REXCVAR_GET(masseffect_native_edram_alias_mode) == 4 &&
                            (source.edram_64bpp || target.edram_64bpp);
     VkImageView raw_source = VK_NULL_HANDLE, raw_destination = VK_NULL_HANDLE;
@@ -9037,6 +9092,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   int32_t storage_unorm10_ = -1;
   uint64_t resolves_direct_7e3_ = 0;
   uint64_t resolves_bias_frag_ = 0;
+  uint64_t conversions_copy_32_ = 0;
   VkDescriptorSetLayout layout_descriptors_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_descriptors_ = VK_NULL_HANDLE;

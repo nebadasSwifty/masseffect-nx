@@ -37,6 +37,10 @@ masseffect_native_resolve_7e3_direct = true
 # the cockpit at 960x544, picture checked on the Switch).
 masseffect_native_resolve_bias_frag = true
 
+# k_16_16 <-> k_8_8_8_8 EDRAM reinterpretations of the same tile layout as a plain image copy (same 32-bit words)
+# instead of a compute pass (cockpit at 960x544: EDRAM conversions 7.1 -> 6.0 ms per frame, picture checked).
+masseffect_native_conversion_copy_32 = true
+
 # XAudio mixer DSP kernels in native NEON code (validated bit for bit on the Switch: 0 mismatches in 500k+ calls,
 # English and Russian). 2 = validate against the recompiled originals, 0 = recompiled.
 masseffect_audio_dsp_native = 1
