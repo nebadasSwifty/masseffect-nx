@@ -168,6 +168,10 @@ REXCVAR_DEFINE_INT32(masseffect_native_edram4_stencil_copy_min_tiles, 32, "Mass 
                      "EDRAM mode 4: smallest import (tiles) whose stencil goes through the copy engine; smaller "
                      "ones use masked stencil draws in the import pass (no engine switches). 0 = always copy")
     .range(0, 2048);
+REXCVAR_DEFINE_BOOL(masseffect_native_resolve_7e3_direct, false, "MASSEFFECT",
+                    "EDRAM mode 4: a resolve of the k_2_10_10_10 (UNORM10) scene view whose tiles all belong to the "
+                    "k_2_10_10_10_FLOAT (7e3) image reads that image directly (same 32-bit words) instead of "
+                    "converting the tiles to the UNORM10 view and back. false = convert, as before");
 REXCVAR_DEFINE_BOOL(masseffect_native_depth_samples_x, true, "MASSEFFECT",
                     "Experimental MODE4: preserve horizontal samples in depth-only 4x MSAA draws. "
                     "Y samples remain collapsed; expanded-depth direct resolves and FragCoord shaders "
@@ -332,6 +336,9 @@ const uint32_t masseffect_edram_16f_to_16f_cs[] = {
 };
 const uint32_t me_resolve_exp_bias_cs[] = {
 #include "me_resolve_exp_bias.inc"
+};
+const uint32_t me_resolve_7e3_to_unorm10_cs[] = {
+#include "me_resolve_7e3_to_unorm10.inc"
 };
 const uint32_t me_edram_depth_to_rgba8_cs[] = {
 #include "me_edram_depth_to_rgba8.inc"
@@ -910,7 +917,7 @@ class TargetsVulkan final : public TargetsNative, public ContextTargets {
                                     &layout_pipeline_conversion_edram_) != VK_SUCCESS) {
       return false;
     }
-const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
+const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         {shaders::masseffect_edram_7e3_to_rgba8_cs, sizeof(shaders::masseffect_edram_7e3_to_rgba8_cs)},
         {shaders::masseffect_edram_rgba8_to_7e3_cs, sizeof(shaders::masseffect_edram_rgba8_to_7e3_cs)},
         {shaders::masseffect_edram_16f_to_16f_cs, sizeof(shaders::masseffect_edram_16f_to_16f_cs)},
@@ -924,6 +931,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
         {shaders::me_edram_rgba8_to_r16g16_cs, sizeof(shaders::me_edram_rgba8_to_r16g16_cs)},  // 10: k_8_8_8_8 -> k_16_16
         {shaders::me_edram_r16g16_to_16f_cs, sizeof(shaders::me_edram_r16g16_to_16f_cs)},      // 11: k_16_16 -> k_2_10_10_10_FLOAT (7e3/UNORM10)
         {shaders::me_edram_16f_to_r16g16_cs, sizeof(shaders::me_edram_16f_to_r16g16_cs)},      // 12: k_2_10_10_10_FLOAT (7e3/UNORM10) -> k_16_16
+        {shaders::me_resolve_7e3_to_unorm10_cs, sizeof(shaders::me_resolve_7e3_to_unorm10_cs)}, // 13: resolve UNORM10 from the 7e3 owner
     }};
     for (uint32_t i = 0; i < codes_conversion.size(); ++i) {
       VkShaderModuleCreateInfo info_module_conversion{};
@@ -1489,7 +1497,21 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
     }
     Prepare(*target_render);
     area_edram_ = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
-    if (REXCVAR_GET(masseffect_native_edram_alias_mode) == 4 && do_copy &&
+    // masseffect_native_resolve_7e3_direct: a resolve of the UNORM10 view whose tiles all belong to the 7e3 image
+    // reads that image directly; the tiles are not converted into the UNORM10 view (and back for the next draws).
+    Image* direct_7e3 = nullptr;
+    if (REXCVAR_GET(masseffect_native_resolve_7e3_direct) &&
+        REXCVAR_GET(masseffect_native_edram_alias_mode) == 4 && do_copy && !clear_color && resolved &&
+        target_render->edram_format == 2 && resolved->image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+        StorageUnorm10() && !me::native::ColorResolveExponentBias(command, reg.rb_copy_dest_info)) {
+      Image* owner = SingleOwnerEDRAM4(*target_render, area_edram_);
+      if (owner && owner->edram_format == 3 && owner->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+          owner->width >= target_render->width && owner->height >= target_render->height) {
+        Prepare(*owner);
+        if (owner->prepared) direct_7e3 = owner;
+      }
+    }
+    if (REXCVAR_GET(masseffect_native_edram_alias_mode) == 4 && do_copy && !direct_7e3 &&
         !(edram4_reason_ = 2, SynchronizeEDRAM4(*target_render, area_edram_))) return false;
     ActivateTargetColor(info_color & 0xFFF, pitch, *target_render);
     if (resolved) {
@@ -1570,7 +1592,15 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
                 format_resolved_target, uint32_t(resolved->image.format), base_resolved,
                 resolved->image.width, resolved->image.height, width, height, x0, y0, dx, dy);
           }
-          if (!blit_) {
+          if (direct_7e3) {
+            ResolverPreviousFront(base_resolved, dx == 0 && dy == 0 && width == resolved->image.width &&
+                                                     height == resolved->image.height);
+            if (!ResolverDirect7e3(*direct_7e3, resolved->image, x0, y0, dx, dy, width, height))
+              return Reject(14, "resolve from the 7e3 owner failed");
+            ++copies_;
+            ++converted_copies_;
+            ResolvedWritten(base_resolved, uint64_t(width) * height);
+          } else if (!blit_) {
             Reject(4, "copy with format conversion without vkCmdBlitImage");
           } else {
             VkImageBlit conversion{};
@@ -5190,6 +5220,94 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
     return true;
   }
 
+  // A2B10G10R10 as a storage image (resolve straight from the 7e3 owner). Asked once.
+  bool StorageUnorm10() {
+    if (storage_unorm10_ < 0) {
+      VkFormatProperties props{};
+      vulkan_device_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+          vulkan_device_->physical_device(), VK_FORMAT_A2B10G10R10_UNORM_PACK32, &props);
+      storage_unorm10_ = (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ? 1 : 0;
+      REXLOG_INFO("[native] targets: A2B10G10R10 storage images {}", storage_unorm10_ ? "supported" : "not supported");
+    }
+    return storage_unorm10_ == 1;
+  }
+
+  // The one image that owns every EDRAM tile of `area` in `view`'s layout (same base, pitch, sample layout and
+  // tile positions), or nullptr when the tiles are spread over several owners, owned by `view` itself or unowned.
+  Image* SingleOwnerEDRAM4(Image& view, const VkRect2D& area) {
+    RangeTiles4 range;
+    if (!RangeTilesEDRAM4(view, area, range)) return nullptr;
+    Image* owner = nullptr;
+    for (uint32_t ty = range.ty0; ty < range.ty1; ++ty) {
+      for (uint32_t tile = ty * range.pitch + range.tx0; tile < ty * range.pitch + range.tx1; ++tile) {
+        if (!TileUsedEDRAM4(view, tile, area)) continue;
+        const auto state = owners_tiles_edram4_[(view.edram_base + tile) & 2047u];
+        if (!state.image || state.image == &view || state.tile_local != tile) return nullptr;
+        if (owner && state.image != owner) return nullptr;
+        owner = state.image;
+      }
+    }
+    if (!owner || owner->edram_base != view.edram_base || PitchTilesEDRAM(*owner) != PitchTilesEDRAM(view) ||
+        owner->edram_msaa_x != view.edram_msaa_x || owner->edram_msaa_y != view.edram_msaa_y ||
+        owner->raster_grid_x != view.raster_grid_x || owner->edram_64bpp || view.edram_64bpp ||
+        owner->guest_width || owner->guest_height)
+      return nullptr;
+    return owner;
+  }
+
+  // Resolve of a UNORM10 view read straight from its 7e3 owner (me_resolve_7e3_to_unorm10.comp).
+  bool ResolverDirect7e3(Image& owner, Image& target, int32_t sx, int32_t sy, uint32_t dx, uint32_t dy,
+                         uint32_t width, uint32_t height) {
+    if (owner.format != VK_FORMAT_R16G16B16A16_SFLOAT || target.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+        owner.image == target.image || !width || !height || !pipelines_conversion_edram_[13] ||
+        !EnsureCapacityConversionEDRAM4("resolve from 7e3")) return false;
+    SlotWork& slot = slots_[slot_];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo reserve{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    reserve.descriptorPool = slot.pool_conversion_edram;
+    reserve.descriptorSetCount = 1;
+    reserve.pSetLayouts = &layout_conversion_edram_;
+    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    ++slot.conversions_edram;
+    const VkDescriptorImageInfo images[2] = {{VK_NULL_HANDLE, owner.view, VK_IMAGE_LAYOUT_GENERAL},
+                                             {VK_NULL_HANDLE, target.view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet writes[2]{};
+    for (uint32_t i = 0; i < 2; ++i) {
+      writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      writes[i].dstSet = set;
+      writes[i].dstBinding = i;
+      writes[i].descriptorCount = 1;
+      writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      writes[i].pImageInfo = &images[i];
+    }
+    dfn_.vkUpdateDescriptorSets(device_, 2, writes, 0, nullptr);
+    VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    before.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    dfn_.vkCmdPipelineBarrier(commands_work_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+    const struct {
+      int32_t source_offset[2];
+      int32_t destination_offset[2];
+      uint32_t extent[2];
+      int32_t unused;
+    } constants = {{sx, sy}, {int32_t(dx), int32_t(dy)}, {width, height}, 0};
+    static_assert(sizeof(constants) == 28);
+    dfn_.vkCmdBindPipeline(commands_work_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_conversion_edram_[13]);
+    dfn_.vkCmdBindDescriptorSets(commands_work_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                 layout_pipeline_conversion_edram_, 0, 1, &set, 0, nullptr);
+    dfn_.vkCmdPushConstants(commands_work_, layout_pipeline_conversion_edram_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                            sizeof(constants), &constants);
+    dfn_.vkCmdDispatch(commands_work_, (width + 7) / 8, (height + 7) / 8, 1);
+    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    dfn_.vkCmdPipelineBarrier(commands_work_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    ++resolves_direct_7e3_;
+    return true;
+  }
+
   bool ResolverWithBias(Image& source, Image& target, int32_t sx, int32_t sy,
                         uint32_t dx, uint32_t dy, uint32_t width, uint32_t height,
                         int32_t exp_bias) {
@@ -7063,7 +7181,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
     if (!reused && !Create(resolved.image, width, height,
                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | usage_target |
-                   ((host_format == VK_FORMAT_R16G16B16A16_SFLOAT || host_format == VK_FORMAT_R32_SFLOAT)
+                   ((host_format == VK_FORMAT_R16G16B16A16_SFLOAT || host_format == VK_FORMAT_R32_SFLOAT ||
+                     (host_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && StorageUnorm10()))
                         ? VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT) : VkImageUsageFlags(0)),
                host_format)) {
       Reject(10, "could not create a resolved texture");
@@ -8817,8 +8936,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 13> codes_conversion{{
   std::unordered_map<VkImage, VkImageView> views_raw64_edram_;
   std::unordered_map<VkImage, VkImageView> views_raw32_edram_;
   VkPipelineLayout layout_pipeline_conversion_edram_ = VK_NULL_HANDLE;
-  std::array<VkShaderModule, 13> shaders_conversion_edram_{};
-  std::array<VkPipeline, 13> pipelines_conversion_edram_{};
+  std::array<VkShaderModule, 14> shaders_conversion_edram_{};
+  std::array<VkPipeline, 14> pipelines_conversion_edram_{};
+  int32_t storage_unorm10_ = -1;
+  uint64_t resolves_direct_7e3_ = 0;
   VkDescriptorSetLayout layout_descriptors_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_descriptors_ = VK_NULL_HANDLE;

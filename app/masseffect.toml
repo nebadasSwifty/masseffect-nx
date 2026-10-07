@@ -28,6 +28,15 @@ masseffect_scene_height = 544
 # picture checked on the Switch in the Anderson cutscene and the Normandy cockpit).
 masseffect_native_extent_packed_formats = true
 
+# Resolves of the UNORM10 scene view read the 7e3 image that owns the EDRAM tiles directly, instead of converting
+# the tiles there and back (Normandy cockpit at 960x544: EDRAM conversions 20.8 -> 12.7 ms, GPU 50 -> 43.5 ms per
+# frame; picture checked on the Switch).
+masseffect_native_resolve_7e3_direct = true
+
+# XAudio mixer DSP kernels in native NEON code (validated bit for bit on the Switch: 0 mismatches in 500k+ calls,
+# English and Russian). 2 = validate against the recompiled originals, 0 = recompiled.
+masseffect_audio_dsp_native = 1
+
 # Vertical sync (on by default). Turn off only to measure the uncapped frame rate.
 # vsync = true
 

@@ -1,0 +1,34 @@
+#version 450
+// Resolve of a k_2_10_10_10 (UNORM10) view straight from the k_2_10_10_10_FLOAT (7e3) image that owns the EDRAM
+// tiles (masseffect_native_resolve_7e3_direct): the same 32-bit EDRAM word is packed from the 7e3 values and
+// decoded as UNORM10, bit for bit what converting the tiles to the UNORM10 view and copying them gives, without
+// moving the tiles' ownership (the round trip 7e3 -> UNORM10 -> 7e3 was ~13 ms per frame in cutscenes).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D source_image;
+layout(set = 0, binding = 1, rgb10_a2) uniform writeonly image2D destination_image;
+layout(push_constant) uniform Resolve {
+  ivec2 source_offset;
+  ivec2 destination_offset;
+  uvec2 extent;
+  int unused;
+} resolve;
+
+// Same word math as me_edram_color_to_color.frag (Pack32 format 3, Unpack32 format 2).
+uint A7e3(float value) {
+  uint f32 = floatBitsToUint(clamp(value, 0.0, 31.875));
+  uint denormal = ((f32 & 0x7FFFFFu) | 0x800000u) >> min(125u - (f32 >> 23u), 24u);
+  uint normal = f32 - (124u << 23u);
+  uint biased = f32 < 0x3E800000u ? denormal : normal;
+  return ((biased + 0x7FFFu + ((biased >> 16u) & 1u)) >> 16u) & 0x3FFu;
+}
+
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(pixel, resolve.extent))) return;
+  vec4 v = imageLoad(source_image, resolve.source_offset + ivec2(pixel));
+  uint word = A7e3(v.r) | (A7e3(v.g) << 10u) | (A7e3(v.b) << 20u) |
+              (uint(round(clamp(v.a, 0.0, 1.0) * 3.0)) << 30u);
+  vec4 unorm = vec4(float(word & 0x3FFu), float((word >> 10u) & 0x3FFu), float((word >> 20u) & 0x3FFu),
+                    float(word >> 30u)) / vec4(1023.0, 1023.0, 1023.0, 3.0);
+  imageStore(destination_image, resolve.destination_offset + ivec2(pixel), unorm);
+}
