@@ -41,6 +41,7 @@
 #include "me_depth_spirv.h"
 #include "me_depth_quantize_spirv.h"
 #include "me_fragcoord_xy_spirv.h"
+#include "me_texture_signs_spirv.h"
 #include "me_edram_ownership.h"
 #include "me_raster_state.h"
 #include "../me_vertex_fetch_selection.h"
@@ -779,6 +780,21 @@ REXCVAR_DEFINE_BOOL(masseffect_native_ps_alpha_only, true, "MASSEFFECT",
  * The "C6 early Z" report says how many draws are fixed and how many cannot be because they write
  * depth: that second figure is the exact size of what only a depth pre-pass would solve.
  */
+/*
+ * Texture signs folded into the pixel shader (me_texture_signs_spirv.h, docs/scene-shader-cost.md).
+ *
+ * Every texture fetch of the library shaders is followed by a loop over the four Xenos TextureSign values
+ * of the fetch, read at run time from bits 24-31 of the descriptor index. They are constant for a draw, so
+ * with this setting the signs of the first eight fetch registers the pixel shader samples go in the pipeline
+ * key, and the shader module gets them as constants: NAK drops the loop and its branches (65-80 % of the
+ * NAK instructions of the hottest pixel shaders when the textures are unsigned, ~40 % with gamma on RGB).
+ * The value folded is the one the shader would have read, so the image is identical. The cost is more
+ * pipelines: one per distinct set of signs a pixel shader is drawn with.
+ */
+REXCVAR_DEFINE_BOOL(masseffect_native_fold_texture_signs, false, "MASSEFFECT",
+                    "Native renderer: put the texture signs (unsigned, biased, gamma) of each draw in "
+                    "the pipeline key and fold them into the pixel shader as constants, so the GPU no "
+                    "longer runs the per-fetch sign loop. Exact (same image); more pipelines");
 REXCVAR_DEFINE_BOOL(masseffect_native_z_early, true, "MASSEFFECT",
                     "Native renderer: for draws that test depth but do NOT "
                     "write it (smoke, particles, glass, decals), declares EarlyFragmentTests in the "
@@ -1060,7 +1076,8 @@ constexpr const char* kFileOldList = "masseffect_native_pipelines_list.bin";
 // The pipeline prewarm list. It holds no game data: state keys, formats and fingerprints. A header of four
 // uint32 ("NFPL", version, record size and record count) followed by the records (RegisterPipeline).
 constexpr uint32_t kMagicPipelinesList = 0x4C50464Eu;  // "NFPL" in little-endian
-constexpr uint32_t kVersionPipelinesList = 2;
+// Version 3: PipelineKey grew the texture signs (signs_low, signs_high, signs_heaps).
+constexpr uint32_t kVersionPipelinesList = 3;
 constexpr size_t kHeaderList = 4 * sizeof(uint32_t);
 constexpr size_t kMaxRegistersList = 4096;
 // 296 bytes: MASSEFFECT's shader_common.h (g_NdcScale at +280 and g_NdcOffset at +288).
@@ -1090,6 +1107,9 @@ constexpr uint32_t kSpecFunctionAlphaDisplacement = 16;
 // Internal bit of the pipeline key that no shader reads (shader_common.h goes up to bit 19). It marks that
 // the pixel shader module is the copy with OpExecutionMode EarlyFragmentTests.
 constexpr uint32_t kSpecZEarly = uint32_t(1) << 20;
+// Renderer-only bit (shader_common.h leaves 23 free for the app): the texture signs carried in the key
+// (PipelineKey::signs_*) are folded into the pixel shader module (masseffect_native_fold_texture_signs).
+constexpr uint32_t kSpecSignsFolded = uint32_t(1) << 23;
 // Renderer-only pipeline/module variant: clamp fragment outputs to the numeric range of Xenos 7e3 RGB
 // render targets. The shader sources don't inspect this bit; it only keeps the pipeline key distinct.
 constexpr uint32_t kSpecTarget7e3 = uint32_t(1) << 24;
@@ -2147,6 +2167,21 @@ std::vector<uint32_t> WithEarlyTests(const std::vector<uint32_t>& spirv, const c
   return output;
 }
 
+// masseffect_native_fold_texture_signs: the fetch registers (below 16, like the sampler loop of the draw)
+// whose texture signs go in the key, ascending, at most eight. The draw and the module transform both call
+// it on the same ShaderEntry, so the n-th sign byte of the key always means the same register.
+inline uint32_t SignedRegistersPS(const ShaderEntry& ps, uint32_t (&registers)[8]) {
+  uint32_t mask = 0;
+  for (const SamplerShader& sampler : ps.samplers) {
+    if (sampler.register_value < 16) mask |= uint32_t(1) << sampler.register_value;
+  }
+  uint32_t n = 0;
+  for (uint32_t reg = 0; reg < 16 && n < 8; ++reg) {
+    if ((mask >> reg) & 1) registers[n++] = reg;
+  }
+  return n;
+}
+
 struct PipelineKey {
   uint32_t vs = 0;
   uint32_t ps = 0;
@@ -2158,11 +2193,17 @@ struct PipelineKey {
   uint32_t masks = 0;
   uint32_t depth = 0;
   uint32_t rasterization = 0;
-  // The key is hashed and compared byte by byte (PipelineFor). With 76 bytes of fields and 8-byte alignment
-  // it had 4 bytes of uninitialized implicit padding: stack garbage that made identical keys differ and
-  // created duplicate pipelines (125-134, and 193-203 in a later version, with no change in the image).
-  uint32_t fill = 0;
+  // The key is hashed and compared byte by byte (PipelineFor), so it must have no implicit padding (stack
+  // garbage once made identical keys differ and created duplicate pipelines). signs_low took the place of
+  // the old explicit padding word.
+  // With kSpecSignsFolded: the TextureSign byte (RemappedSigns) of the first eight fetch registers the
+  // pixel shader samples, in ascending register order (SignedRegistersPS), bytes 0-3 in signs_low and 4-7
+  // in signs_high; signs_heaps = the heap each one is bound to (2 bits each, 3 = all its words are 0) and,
+  // in bits 16-19, how many registers are folded. All zero without the bit.
+  uint32_t signs_low = 0;
   uint32_t fill2 = 0;
+  uint32_t signs_high = 0;
+  uint32_t signs_heaps = 0;
 };
 static_assert(std::has_unique_object_representations_v<PipelineKey>,
               "PipelineKey cannot have implicit padding: it is hashed and compared byte by byte");
@@ -2281,6 +2322,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         if (entry.module) dfn_.vkDestroyShaderModule(device_, entry.module, nullptr);
     }
     for (const auto& [hash, bucket] : modules_fragcoord_xy_) {
+      for (const auto& entry : bucket)
+        if (entry.module) dfn_.vkDestroyShaderModule(device_, entry.module, nullptr);
+    }
+    for (const auto& [hash, bucket] : modules_texture_signs_) {
       for (const auto& entry : bucket)
         if (entry.module) dfn_.vkDestroyShaderModule(device_, entry.module, nullptr);
     }
@@ -3592,6 +3637,35 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (outputs_mask_7e3) {
       specialization |= kSpecTarget7e3 |
                           (outputs_mask_7e3 << kSpecMask7e3Displacement);
+    }
+    // The texture signs of this draw, for the pixel shader module (masseffect_native_fold_texture_signs).
+    // Only with the UBO: me_texture_signs_spirv.h relies on the 64-bit pointer path being dead.
+    if (fold_signs_ && ps && ps->shader && (specialization & kSpecConstantsUbo)) {
+      uint32_t registers[8];
+      const uint32_t n = SignedRegistersPS(*ps, registers);
+      uint64_t signs = 0;
+      uint32_t heaps = 0, folded = 0;
+      for (; folded < n; ++folded) {
+        const uint32_t reg = registers[folded];
+        uint32_t heap = 3, value = 0;
+        bool single = true;
+        for (uint32_t h = 0; h < 3; ++h) {
+          if (const uint32_t v = shared[h * 16 + reg] >> 24) {
+            single &= heap == 3;
+            heap = h;
+            value = v;
+          }
+        }
+        if (!single) break;  // never expected: one heap per register; fold the registers before it only
+        signs |= uint64_t(value) << (8 * folded);
+        heaps |= heap << (2 * folded);
+      }
+      if (folded) {
+        key.signs_low = uint32_t(signs);
+        key.signs_high = uint32_t(signs >> 32);
+        key.signs_heaps = heaps | (folded << 16);
+        specialization |= kSpecSignsFolded;
+      }
     }
     key.specialization = specialization;
     std::copy(std::begin(pass_formats_), std::end(pass_formats_), std::begin(key.formats));
@@ -5137,6 +5211,16 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         inv_tex_size_ = new_value;
         REXLOG_INFO("[native] C2 texture size: {}",
                     new_value ? "by constant" : "asked from the texture");
+      }
+    }
+    // The texture signs in the key change the pipelines too: once per frame.
+    {
+      const bool new_value = REXCVAR_GET(masseffect_native_fold_texture_signs);
+      if (new_value != fold_signs_) {
+        fold_signs_ = new_value;
+        REXLOG_INFO("[native] texture signs: {}", new_value
+                        ? "folded into the pixel shader (in the pipeline key)"
+                        : "read by the shader at run time, as before");
       }
     }
     /*
@@ -10022,6 +10106,74 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     return VK_NULL_HANDLE;
   }
 
+  /*
+   * The texture signs of the key folded into the pixel shader (masseffect_native_fold_texture_signs). It runs
+   * on the ACTUAL selected material variant (7e3, without colour writes, early Z or the plain one), before
+   * the FragCoord and depth transforms, which find the folded code through codes_modules_depth_. Without the
+   * bit, or when there is nothing to fold or the transform fails, the selected module is returned: it reads
+   * the same signs at run time, so the image is the same either way and only the saving is lost.
+   */
+  VkShaderModule ModuleTextureSigns(VkShaderModule selected, const PipelineKey& key, const ShaderEntry& ps) {
+    if (!selected || !(key.specialization & kSpecSignsFolded)) return selected;
+    uint8_t signs[48] = {};
+    uint64_t known = 0;
+    uint32_t registers[8];
+    const uint32_t n = std::min(SignedRegistersPS(ps, registers), (key.signs_heaps >> 16) & 0xFu);
+    const uint64_t packed = key.signs_low | (uint64_t(key.signs_high) << 32);
+    for (uint32_t k = 0; k < n; ++k) {
+      const uint32_t heap = (key.signs_heaps >> (2 * k)) & 3;
+      for (uint32_t h = 0; h < 3; ++h) {
+        const uint32_t word = h * 16 + registers[k];
+        known |= uint64_t(1) << word;
+        signs[word] = h == heap ? uint8_t(packed >> (8 * k)) : 0;
+      }
+    }
+    if (!known) return selected;
+    std::lock_guard<std::mutex> lock(modules_depth_mutex_);
+    const auto source = codes_modules_depth_.find(selected);
+    if (source == codes_modules_depth_.end()) {
+      if (++signs_fold_failures_ <= 8)
+        REXLOG_WARN("[native] texture signs: PS n{} final module has no tracked SPIR-V; not folded", ps.number);
+      return selected;
+    }
+    const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
+    const uint64_t hash = XXH3_64bits_withSeed(signs, sizeof(signs),
+                                               XXH3_64bits(code.data(), code.size() * sizeof(uint32_t)) ^ known);
+    auto& bucket = modules_texture_signs_[hash];
+    for (const auto& entry : bucket) {
+      if (entry.known == known && std::memcmp(entry.signs, signs, sizeof(signs)) == 0 && entry.original == code)
+        return entry.module ? entry.module : selected;
+    }
+    std::vector<uint32_t> folded;
+    me::native::TextureSignsFold stats;
+    std::string reason;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (!me::native::FoldTextureSigns(code, signs, known, folded, stats, reason)) {
+      if (++signs_fold_failures_ <= 8)
+        REXLOG_WARN("[native] texture signs: PS n{} not folded: {}", ps.number, reason);
+    } else if (stats.folded) {
+      VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      info.codeSize = folded.size() * sizeof(uint32_t);
+      info.pCode = folded.data();
+      if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
+    }
+    ModuleTextureSignsEntry entry;
+    entry.original = code;
+    std::memcpy(entry.signs, signs, sizeof(signs));
+    entry.known = known;
+    entry.module = module;
+    bucket.push_back(std::move(entry));
+    if (!module) return selected;  // cached as "not folded"; never destroyed twice
+    if (++signs_folded_modules_ <= 32 || (signs_folded_modules_ & 255) == 0)
+      REXLOG_INFO("[native] texture signs folded: PS n{} ({} modules so far), {} shifts folded, {} of other "
+                  "registers left, signs {:08X}{:08X} heaps {:05X}", ps.number, signs_folded_modules_,
+                  stats.folded, stats.unknown, key.signs_high, key.signs_low, key.signs_heaps);
+    ModuleCodeDepth tracked;
+    tracked.owned = std::move(folded);
+    codes_modules_depth_.insert_or_assign(module, std::move(tracked));
+    return module;
+  }
+
   VkShaderModule ModuleDepthHalf(VkShaderModule selected) {
     if (!selected) return VK_NULL_HANDLE;
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
@@ -10501,7 +10653,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     const char* field = nullptr;
     if (raw.vs != canonical.vs || raw.ps != canonical.ps || raw.entry != canonical.entry ||
         raw.topology != canonical.topology || raw.specialization != canonical.specialization ||
-        raw.rasterization != canonical.rasterization || raw.fill != canonical.fill ||
+        raw.rasterization != canonical.rasterization || raw.signs_low != canonical.signs_low ||
+        raw.signs_high != canonical.signs_high || raw.signs_heaps != canonical.signs_heaps ||
         raw.fill2 != canonical.fill2 ||
         !Equal(raw.formats, canonical.formats, sizeof(raw.formats))) {
       field = "shaders, input, topology, specialization, rasterization or formats";
@@ -11110,6 +11263,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     } else if (key.ps) {
       ps = ModuleFor(*p.ps);
     }
+    if (key.ps) ps = ModuleTextureSigns(ps, key, *p.ps);
     if (key.ps && ((key.specialization & kSpecRasterGridX) ||
                     (key.rasterization & me::native::kNativeMsaa2PhaseProbe))) {
       ps = ModuleGuestFragCoordXY(ps, key, p.vs, p.ps);
@@ -11592,7 +11746,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       return normal(e);
     };
     const auto pixel = [&](const PipelineKey& key, const ShaderEntry& e) {
-      auto selected = pixel_no_half(key, e);
+      auto selected = ModuleTextureSigns(pixel_no_half(key, e), key, e);
       if ((key.specialization & kSpecRasterGridX) ||
           (key.rasterization & me::native::kNativeMsaa2PhaseProbe)) {
         selected = ModuleGuestFragCoordXY(selected, key, nullptr, &e);
@@ -11621,7 +11775,12 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           (r.key.ps && (!ps || ps->vertices || !ps->shader || ps->shader->fingerprint != r.ps_fingerprint))) {
         state = kListNoShader;
         ++no_shader;
-      } else if (r.key.fill2 != prewarmed_eds_) {
+      } else if (r.key.fill2 != prewarmed_eds_ ||
+                 ((r.key.specialization & kSpecSignsFolded) &&
+                  !REXCVAR_GET(masseffect_native_fold_texture_signs))) {
+        // Another dynamic state mode, or texture signs folded while this session does not fold them: the
+        // ring would never ask for this key. (The opposite case cannot be told apart from a pixel shader
+        // with nothing to fold, so those records are still prewarmed.)
         state = kOtherListMode;
         ++other_mode;
       } else {
@@ -11950,6 +12109,15 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   std::unordered_map<uint64_t, std::vector<ModuleDepthHalfEntry>> modules_depth_half_;
   std::unordered_map<uint64_t, std::vector<ModuleDepthQuantizeEntry>> modules_depth_quantize_;
   std::unordered_map<uint64_t, std::vector<ModuleFragCoordXYEntry>> modules_fragcoord_xy_;
+  struct ModuleTextureSignsEntry {
+    std::vector<uint32_t> original;
+    uint8_t signs[48] = {};
+    uint64_t known = 0;
+    VkShaderModule module = VK_NULL_HANDLE;  // null: nothing folded, the selected module is used
+  };
+  std::unordered_map<uint64_t, std::vector<ModuleTextureSignsEntry>> modules_texture_signs_;
+  uint64_t signs_folded_modules_ = 0;  // under modules_depth_mutex_
+  uint64_t signs_fold_failures_ = 0;
   std::unordered_map<const ShaderEntry*, me::native::RectangleShader> shaders_rectangle_;
   std::unordered_map<const ShaderEntry*, VkShaderModule> modules_rectangle_;
   std::unordered_set<uint32_t> recorded_rectangles_;
@@ -12538,6 +12706,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   std::array<uint64_t, kGpuCategories> texels_per_category_{};
   std::array<uint64_t, kGpuCategories> draws_per_category_{};
   bool inv_tex_size_ = false;
+  bool fold_signs_ = false;  // masseffect_native_fold_texture_signs, read once per frame
   bool pcf_cheap_ = false;                    // a single shadow map sample
   // Deduplication of vertex uploads within the frame.
   DedupeVertices dedupe_;

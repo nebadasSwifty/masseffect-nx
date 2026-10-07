@@ -41,6 +41,11 @@ masseffect_native_resolve_bias_frag = true
 # instead of a compute pass (cockpit at 960x544: EDRAM conversions 7.1 -> 6.0 ms per frame, picture checked).
 masseffect_native_conversion_copy_32 = true
 
+# Texture sign handling (signed/biased/gamma per component) folded into each pixel shader at pipeline creation from
+# the draw's fetch constants: the same values the shader would read, 69-81 % fewer GM20B instructions in the heavy
+# pixel shaders (cockpit at 960x544: scene pass 21.1 -> 16.0 ms per frame, picture checked on the Switch).
+masseffect_native_fold_texture_signs = true
+
 # XAudio mixer DSP kernels in native NEON code (validated bit for bit on the Switch: 0 mismatches in 500k+ calls,
 # English and Russian). 2 = validate against the recompiled originals, 0 = recompiled.
 masseffect_audio_dsp_native = 1
