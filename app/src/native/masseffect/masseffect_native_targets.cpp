@@ -168,6 +168,10 @@ REXCVAR_DEFINE_INT32(masseffect_native_edram4_stencil_copy_min_tiles, 32, "Mass 
                      "EDRAM mode 4: smallest import (tiles) whose stencil goes through the copy engine; smaller "
                      "ones use masked stencil draws in the import pass (no engine switches). 0 = always copy")
     .range(0, 2048);
+REXCVAR_DEFINE_BOOL(masseffect_native_conversion_same_layout, true, "MASSEFFECT",
+                    "EDRAM mode 4 fragment color conversions: when both views have the same pitch, sample layout and "
+                    "tile offset, the source texel is the target texel (no per-pixel division by the pitch). false = "
+                    "the general tile mapping, as before");
 REXCVAR_DEFINE_BOOL(masseffect_native_resolve_7e3_direct, false, "MASSEFFECT",
                     "EDRAM mode 4: a resolve of the k_2_10_10_10 (UNORM10) scene view whose tiles all belong to the "
                     "k_2_10_10_10_FLOAT (7e3) image reads that image directly (same 32-bit words) instead of "
@@ -6599,7 +6603,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       uint32_t source_msaa_x, source_msaa_y, target_msaa_x, target_msaa_y;
     } constants{{source.width, source.height}, {target.width, target.height},
                  PitchTilesEDRAM(source), PitchTilesEDRAM(target), source_start, target_start, count,
-                 uint32_t(source.edram_format) | (source_8888 ? 0x10000u : 0u),
+                 uint32_t(source.edram_format) | (source_8888 ? 0x10000u : 0u) |
+                     (variant == 0 && REXCVAR_GET(masseffect_native_conversion_same_layout) &&
+                      PitchTilesEDRAM(source) == PitchTilesEDRAM(target) && source_start == target_start &&
+                      source.edram_msaa_x == target.edram_msaa_x && source.edram_msaa_y == target.edram_msaa_y
+                          ? 0x20000u : 0u),
                  uint32_t(target.edram_format) | (target_8888 ? 0x10000u : 0u), variant, variant,
                  source.edram_msaa_x, source.edram_msaa_y, target.edram_msaa_x, target.edram_msaa_y};
     static_assert(sizeof(Constants) == 68);

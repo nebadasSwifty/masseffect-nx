@@ -14,7 +14,7 @@ layout(push_constant) uniform Constants {
   uint tile_source_start;
   uint tile_target_start;
   uint tiles_count;
-  uint source_format;   // class (0 RGBA8, 2 UNORM10, 3 7e3), bit 16 = the host view is RGBA8
+  uint source_format;   // class (0 RGBA8, 2 UNORM10, 3 7e3), bit 16 = the host view is RGBA8, bit 17 = same layout
   uint target_format;  // idem
   uint source_64bpp;     // always 0 here
   uint target_64bpp;    // always 0 here
@@ -70,11 +70,18 @@ void main() {
   uvec2 physical = pixel << uvec2(c.target_msaa_x, c.target_msaa_y);
   uint tile_target = (physical.y / 16u) * c.pitch_tiles_target + physical.x / 80u;
   if (tile_target < c.tile_target_start || tile_target - c.tile_target_start >= c.tiles_count) discard;
-  uint tile_source = c.tile_source_start + (tile_target - c.tile_target_start);
-  uint word_local = physical.x % 80u;
-  uvec2 p = uvec2((tile_source % c.pitch_tiles_source) * 80u + word_local,
-                  (tile_source / c.pitch_tiles_source) * 16u + physical.y % 16u) >>
-            uvec2(c.source_msaa_x, c.source_msaa_y);
+  uvec2 p;
+  if ((c.source_format & 0x20000u) != 0u) {
+    // Same pitch, sample layout and tile offset on both sides (the host sets bit 17): the source texel is the
+    // target texel, without the per-pixel division by the source pitch.
+    p = pixel;
+  } else {
+    uint tile_source = c.tile_source_start + (tile_target - c.tile_target_start);
+    uint word_local = physical.x % 80u;
+    p = uvec2((tile_source % c.pitch_tiles_source) * 80u + word_local,
+              (tile_source / c.pitch_tiles_source) * 16u + physical.y % 16u) >>
+        uvec2(c.source_msaa_x, c.source_msaa_y);
+  }
   uint word = 0u;
   if (!any(greaterThanEqual(p, c.source_size))) {
     vec4 v = texelFetch(source, ivec2(p), 0);
