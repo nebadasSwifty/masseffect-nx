@@ -21,6 +21,12 @@ layout(push_constant) uniform Constants {
   uint source_msaa_x, source_msaa_y;
   uint target_msaa_x, target_msaa_y;
 } c;
+
+// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
+// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
+// floors to the exact integer one.
+uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
+uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
 layout(location = 0) out vec4 output_value;
 
 uint A7e3(float value) {
@@ -78,8 +84,8 @@ void main() {
   } else {
     uint tile_source = c.tile_source_start + (tile_target - c.tile_target_start);
     uint word_local = physical.x % 80u;
-    p = uvec2((tile_source % c.pitch_tiles_source) * 80u + word_local,
-              (tile_source / c.pitch_tiles_source) * 16u + physical.y % 16u) >>
+    p = uvec2(ModPitch(tile_source, c.pitch_tiles_source) * 80u + word_local,
+              DivPitch(tile_source, c.pitch_tiles_source) * 16u + physical.y % 16u) >>
         uvec2(c.source_msaa_x, c.source_msaa_y);
   }
   uint word = 0u;

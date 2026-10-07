@@ -26,6 +26,12 @@ layout(push_constant) uniform Constants {
   uint stencil_mask;
 } c;
 
+// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
+// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
+// floors to the exact integer one.
+uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
+uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+
 
 void main() {
   if (c.source_64bpp != 0u || c.target_64bpp != 0u || c.tiles_count == 0u ||
@@ -37,8 +43,8 @@ void main() {
   uint tile = (physical.y / 16u) * c.pitch_tiles_target + physical.x / 80u;
   if (tile < c.tile_target_start || tile - c.tile_target_start >= c.tiles_count) discard;
   uint source_tile = c.tile_source_start + tile - c.tile_target_start;
-  uvec2 source_pixel = uvec2((source_tile % c.pitch_tiles_source) * 80u + physical.x % 80u,
-                            (source_tile / c.pitch_tiles_source) * 16u + physical.y % 16u) >>
+  uvec2 source_pixel = uvec2(ModPitch(source_tile, c.pitch_tiles_source) * 80u + physical.x % 80u,
+                            DivPitch(source_tile, c.pitch_tiles_source) * 16u + physical.y % 16u) >>
                        uvec2(c.source_msaa_x, c.source_msaa_y);
   if (any(greaterThanEqual(source_pixel, c.source_size))) discard;
   uint stencil = texelFetch(source_stencil, ivec2(source_pixel), 0).r & 255u;

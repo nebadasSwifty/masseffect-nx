@@ -26,6 +26,12 @@ layout(push_constant) uniform Constants {
   uint stencil_mask; // 0 for the initial depth+zero-stencil pass, otherwise one bit.
 } c;
 
+// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
+// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
+// floors to the exact integer one.
+uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
+uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+
 uint A7e3(float value) {
   uint bits = floatBitsToUint(clamp(value, 0.0, 31.875));
   uint denormal = ((bits & 0x7FFFFFu) | 0x800000u) >> min(125u - (bits >> 23u), 24u);
@@ -61,8 +67,8 @@ void main() {
   uint word_x = physical.x % 80u;
   // Color and depth permute the two 40-word columns of each physical tile.
   word_x = word_x < 40u ? word_x + 40u : word_x - 40u;
-  uvec2 source_pixel = uvec2((source_tile % c.pitch_tiles_source) * 80u + word_x,
-                            (source_tile / c.pitch_tiles_source) * 16u + physical.y % 16u) >>
+  uvec2 source_pixel = uvec2(ModPitch(source_tile, c.pitch_tiles_source) * 80u + word_x,
+                            DivPitch(source_tile, c.pitch_tiles_source) * 16u + physical.y % 16u) >>
                        uvec2(c.source_msaa_x, c.source_msaa_y);
   if (any(greaterThanEqual(source_pixel, c.source_size))) discard;
   uint packed = Pack(texelFetch(source, ivec2(source_pixel), 0));

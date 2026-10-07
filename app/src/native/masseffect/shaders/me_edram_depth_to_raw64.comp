@@ -24,6 +24,12 @@ layout(push_constant) uniform Constants {
   uint target_msaa_x, target_msaa_y;
 } c;
 
+// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
+// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
+// floors to the exact integer one.
+uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
+uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+
 // ReXGlue xenos.cpp::Float32To20e4, without the SDK's half-range remapping.
 uint A20e4(float z) {
   if (!(z > 0.0)) return 0u;
@@ -63,8 +69,8 @@ vec4 Unpack32(uint word) {
 
 uint ReadWord(uint tile, uint word_local, uint row_local) {
   uint x_depth = word_local < 40u ? word_local + 40u : word_local - 40u;
-  uvec2 p = uvec2((tile % c.pitch_tiles_source) * 80u + x_depth,
-                  (tile / c.pitch_tiles_source) * 16u + row_local) >>
+  uvec2 p = uvec2(ModPitch(tile, c.pitch_tiles_source) * 80u + x_depth,
+                  DivPitch(tile, c.pitch_tiles_source) * 16u + row_local) >>
              uvec2(c.source_msaa_x, c.source_msaa_y);
   if (any(greaterThanEqual(p, c.source_size))) return 0u;
   float z = texelFetch(source_depth, ivec2(p), 0).r;
@@ -89,9 +95,9 @@ void main() {
   uint tile_target = range ? c.tile_target_start + relative
       : (q.y / 16u) * c.pitch_tiles_target + relative;
   uint tile_source = range ? c.tile_source_start + relative : tile_target;
-  uvec2 p = uvec2((tile_target % c.pitch_tiles_target) * (80u >> c.target_64bpp) +
+  uvec2 p = uvec2(ModPitch(tile_target, c.pitch_tiles_target) * (80u >> c.target_64bpp) +
                       (word_local >> c.target_64bpp),
-                  (tile_target / c.pitch_tiles_target) * 16u + q.y % 16u) >>
+                  DivPitch(tile_target, c.pitch_tiles_target) * 16u + q.y % 16u) >>
              uvec2(c.target_msaa_x, c.target_msaa_y);
   if (any(greaterThanEqual(p, c.target_size))) return;
   uint lo = ReadWord(tile_source, word_local, q.y % 16u);

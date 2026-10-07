@@ -25,6 +25,12 @@ layout(push_constant) uniform Constants {
   uint stencil_mask;
 } c;
 
+// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
+// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
+// floors to the exact integer one.
+uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
+uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+
 void main() {
   // Only D24S8(0), D24FS8(1), or half-range D24FS8(257). Metadata cannot
   // silently request mixed encoding, grid X, collapsed Y or raw 64bpp.
@@ -52,8 +58,8 @@ void main() {
   uint tile = (physical.y / 16u) * c.pitch_tiles_target + physical.x / 80u;
   if (tile < c.tile_target_start || tile - c.tile_target_start >= c.tiles_count) discard;
   uint source_tile = c.tile_source_start + tile - c.tile_target_start;
-  uvec2 source_physical = uvec2((source_tile % c.pitch_tiles_source) * 80u + physical.x % 80u,
-                               (source_tile / c.pitch_tiles_source) * 16u + physical.y % 16u);
+  uvec2 source_physical = uvec2(ModPitch(source_tile, c.pitch_tiles_source) * 80u + physical.x % 80u,
+                               DivPitch(source_tile, c.pitch_tiles_source) * 16u + physical.y % 16u);
   ivec2 source_pixel = ivec2(source_physical.x, source_physical.y / 2u);
   if (any(greaterThanEqual(uvec2(source_pixel), c.source_size))) discard;
   int source_sample = int((source_physical.y & 1u) ^ 1u);

@@ -22,6 +22,12 @@ layout(push_constant) uniform Constants {
   uint target_msaa_x, target_msaa_y;
 } c;
 
+// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
+// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
+// floors to the exact integer one.
+uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
+uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+
 uint Pack32(vec4 v) {
   uvec2 u16 = uvec2(round(clamp(v.rg, 0.0, 1.0) * 65535.0));
   return u16.r | (u16.g << 16u);
@@ -39,16 +45,16 @@ void main() {
                            : (q.y / 16u) * c.pitch_tiles_target + relative;
   uint tile_source = range ? c.tile_source_start + relative : tile_target;
 
-  uvec2 ps = uvec2((tile_source % c.pitch_tiles_source) * (80u >> c.source_64bpp) + (word_local >> c.source_64bpp),
-                   (tile_source / c.pitch_tiles_source) * 16u + q.y % 16u)
+  uvec2 ps = uvec2(ModPitch(tile_source, c.pitch_tiles_source) * (80u >> c.source_64bpp) + (word_local >> c.source_64bpp),
+                   DivPitch(tile_source, c.pitch_tiles_source) * 16u + q.y % 16u)
              >> uvec2(c.source_msaa_x, c.source_msaa_y);
   if (any(greaterThanEqual(ps, c.source_size))) return;
 
   vec4 v = imageLoad(source, ivec2(ps));
   uint word = Pack32(v);
 
-  uvec2 pt = uvec2((tile_target % c.pitch_tiles_target) * 80u + word_local,
-                   (tile_target / c.pitch_tiles_target) * 16u + q.y % 16u)
+  uvec2 pt = uvec2(ModPitch(tile_target, c.pitch_tiles_target) * 80u + word_local,
+                   DivPitch(tile_target, c.pitch_tiles_target) * 16u + q.y % 16u)
              >> uvec2(c.target_msaa_x, c.target_msaa_y);
   if (any(greaterThanEqual(pt, c.target_size))) return;
 

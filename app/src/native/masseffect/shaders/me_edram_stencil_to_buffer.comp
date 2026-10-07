@@ -23,12 +23,18 @@ layout(push_constant) uniform Constants {
   uint rect_x, rect_y, rect_w, rect_h;  // destination pixels; rect_w is a multiple of 4
 } c;
 
+// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
+// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
+// floors to the exact integer one.
+uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
+uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+
 uint Stencil(uvec2 pixel) {
   uint tile = (pixel.y / 16u) * c.pitch_tiles_target + pixel.x / 80u;
   if (tile < c.tile_target_start || tile - c.tile_target_start >= c.tiles_count) return 0u;
   uint source_tile = c.tile_source_start + tile - c.tile_target_start;
-  uvec2 source_physical = uvec2((source_tile % c.pitch_tiles_source) * 80u + pixel.x % 80u,
-                               (source_tile / c.pitch_tiles_source) * 16u + pixel.y % 16u);
+  uvec2 source_physical = uvec2(ModPitch(source_tile, c.pitch_tiles_source) * 80u + pixel.x % 80u,
+                               DivPitch(source_tile, c.pitch_tiles_source) * 16u + pixel.y % 16u);
 #ifdef SOURCE_MSAA2
   ivec2 source_pixel = ivec2(source_physical.x, source_physical.y / 2u);
   if (any(greaterThanEqual(uvec2(source_pixel), c.source_size))) return 0u;
