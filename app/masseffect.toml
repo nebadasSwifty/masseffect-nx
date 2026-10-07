@@ -33,6 +33,10 @@ masseffect_native_extent_packed_formats = true
 # frame; picture checked on the Switch).
 masseffect_native_resolve_7e3_direct = true
 
+# Resolves with an exponent bias (HDR chain) as fragment passes instead of compute (about 1 ms less GPU per frame in
+# the cockpit at 960x544, picture checked on the Switch).
+masseffect_native_resolve_bias_frag = true
+
 # XAudio mixer DSP kernels in native NEON code (validated bit for bit on the Switch: 0 mismatches in 500k+ calls,
 # English and Russian). 2 = validate against the recompiled originals, 0 = recompiled.
 masseffect_audio_dsp_native = 1

@@ -310,7 +310,8 @@ void HangWatchdogInterval(uint64_t swaps, uint64_t draws) {
     g_quiet_swaps.store(0, std::memory_order_relaxed);
     return;
   }
-  if (!swaps || !g_seen_draws) {
+  // Both hangs count: Swaps with no draws (the movie thread keeps presenting) and no Swaps at all.
+  if (!g_seen_draws) {
     g_quiet_intervals.store(0, std::memory_order_relaxed);
     g_quiet_swaps.store(0, std::memory_order_relaxed);
     return;
@@ -319,7 +320,7 @@ void HangWatchdogInterval(uint64_t swaps, uint64_t draws) {
   const uint32_t quiet = g_quiet_intervals.fetch_add(1, std::memory_order_relaxed) + 1;
   if (quiet >= uint32_t(REXCVAR_GET(masseffect_hang_watchdog_intervals))) {
     g_auto_done = true;
-    const std::string reason = fmt::format("{} renderer reports in a row with Swaps but no draws ({} Swaps)",
+    const std::string reason = fmt::format("{} renderer reports in a row without draws ({} Swaps)",
                                            g_quiet_intervals.load(), g_quiet_swaps.load());
     Dump(reason.c_str());
   }

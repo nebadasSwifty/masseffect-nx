@@ -172,6 +172,9 @@ REXCVAR_DEFINE_BOOL(masseffect_native_conversion_same_layout, true, "MASSEFFECT"
                     "EDRAM mode 4 fragment color conversions: when both views have the same pitch, sample layout and "
                     "tile offset, the source texel is the target texel (no per-pixel division by the pitch). false = "
                     "the general tile mapping, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_resolve_bias_frag, false, "MASSEFFECT",
+                    "Resolves with an exponent bias (the HDR chain, 6-7 per frame) as a fragment pass writing a color "
+                    "attachment instead of a compute dispatch on storage images. false = compute, as before");
 REXCVAR_DEFINE_BOOL(masseffect_native_resolve_7e3_direct, false, "MASSEFFECT",
                     "EDRAM mode 4: a resolve of the k_2_10_10_10 (UNORM10) scene view whose tiles all belong to the "
                     "k_2_10_10_10_FLOAT (7e3) image reads that image directly (same 32-bit words) instead of "
@@ -343,6 +346,9 @@ const uint32_t me_resolve_exp_bias_cs[] = {
 };
 const uint32_t me_resolve_7e3_to_unorm10_cs[] = {
 #include "me_resolve_7e3_to_unorm10.inc"
+};
+const uint32_t me_resolve_exp_bias_fs[] = {
+#include "me_resolve_exp_bias_frag.inc"
 };
 const uint32_t me_edram_depth_to_rgba8_cs[] = {
 #include "me_edram_depth_to_rgba8.inc"
@@ -674,6 +680,7 @@ class TargetsVulkan final : public TargetsNative, public ContextTargets {
     for (const auto& [image, view] : views_raw64_rt_edram_) dfn_.vkDestroyImageView(device_, view, nullptr);
     views_raw64_rt_edram_.clear();
     if (fs_conv_r64_frag_) dfn_.vkDestroyShaderModule(device_, fs_conv_r64_frag_, nullptr);
+    if (fs_bias_frag_) dfn_.vkDestroyShaderModule(device_, fs_bias_frag_, nullptr);
     for (const auto& [format, pass] : passes_conv_color_frag_) {
       if (pass.pipeline) dfn_.vkDestroyPipeline(device_, pass.pipeline, nullptr);
       if (pass.render_pass) dfn_.vkDestroyRenderPass(device_, pass.render_pass, nullptr);
@@ -5297,6 +5304,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       int32_t unused;
     } constants = {{sx, sy}, {int32_t(dx), int32_t(dy)}, {width, height}, 0};
     static_assert(sizeof(constants) == 28);
+    LabelMarkGpu((40u << 16) | 0u);  // report label: resolve from the 7e3 owner
     dfn_.vkCmdBindPipeline(commands_work_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_conversion_edram_[13]);
     dfn_.vkCmdBindDescriptorSets(commands_work_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                  layout_pipeline_conversion_edram_, 0, 1, &set, 0, nullptr);
@@ -5312,12 +5320,87 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     return true;
   }
 
+  // The exponent-bias resolve as a fragment pass (me_resolve_exp_bias_frag.frag): same math, color attachment
+  // writes instead of storage images. false = not possible here (the compute version runs).
+  bool ResolverWithBiasFrag(Image& source, Image& target, int32_t sx, int32_t sy, uint32_t dx, uint32_t dy,
+                            uint32_t width, uint32_t height, int32_t exp_bias) {
+    if (!me::native::IsSingleSample(uint32_t(target.sample_count)) ||
+        dx + width > target.width || dy + height > target.height) return false;
+    PassConversionColorFrag* pass = EnsureConversionColorFrag(VK_FORMAT_R16G16B16A16_SFLOAT, 2);
+    if (!pass) return false;
+    auto [framebuffer, new_value] = framebuffers_conv_color_frag_.try_emplace({target.image, 2u}, VK_NULL_HANDLE);
+    if (new_value) {
+      VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+      info.renderPass = pass->render_pass;
+      info.attachmentCount = 1;
+      info.pAttachments = &target.view;
+      info.width = target.width;
+      info.height = target.height;
+      info.layers = 1;
+      if (dfn_.vkCreateFramebuffer(device_, &info, nullptr, &framebuffer->second) != VK_SUCCESS) {
+        framebuffers_conv_color_frag_.erase(framebuffer);
+        return false;
+      }
+    }
+    const VkFramebuffer framebuffer_bias = framebuffer->second;
+    if (!EnsureCapacityConversionEDRAM4("resolve bias")) return false;
+    SlotWork& slot = slots_[slot_];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo reserve{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    reserve.descriptorPool = slot.pool_conv_color_frag;
+    reserve.descriptorSetCount = 1;
+    reserve.pSetLayouts = &layout_conv_color_frag_;
+    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    ++slot.conversions_edram;
+    VkDescriptorImageInfo sampled{sampler_depth_edram_, source.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &sampled;
+    dfn_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    const struct {
+      int32_t source_offset[2];
+      int32_t destination_offset[2];
+      int32_t exponent_bias;
+    } constants = {{sx, sy}, {int32_t(dx), int32_t(dy)}, exp_bias};
+    if (draws_) draws_->FinishPass();
+    if (edram4_batch_.active) {
+      CloseComputeBatchEDRAM4();
+      if (!CloseImportBatchEDRAM4()) return false;
+    }
+    LabelMarkGpu((41u << 16) | 0u);  // report label: exponent-bias resolve (fragment)
+    const VkRect2D area{{int32_t(dx), int32_t(dy)}, {width, height}};
+    VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    begin.renderPass = pass->render_pass;
+    begin.framebuffer = framebuffer_bias;
+    begin.renderArea = area;
+    dfn_.vkCmdBeginRenderPass(commands_work_, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    const VkViewport viewport{float(dx), float(dy), float(width), float(height), 0, 1};
+    dfn_.vkCmdSetViewport(commands_work_, 0, 1, &viewport);
+    dfn_.vkCmdSetScissor(commands_work_, 0, 1, &area);
+    dfn_.vkCmdBindPipeline(commands_work_, VK_PIPELINE_BIND_POINT_GRAPHICS, pass->pipeline);
+    dfn_.vkCmdBindDescriptorSets(commands_work_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_conv_color_frag_, 0,
+                                 1, &set, 0, nullptr);
+    dfn_.vkCmdPushConstants(commands_work_, layout_pipeline_conv_color_frag_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                            sizeof(constants), &constants);
+    dfn_.vkCmdDraw(commands_work_, 3, 1, 0, 0);
+    dfn_.vkCmdEndRenderPass(commands_work_);
+    if (draws_) draws_->NotifyGraphicsExternalState();
+    ++resolves_bias_frag_;
+    return true;
+  }
+
   bool ResolverWithBias(Image& source, Image& target, int32_t sx, int32_t sy,
                         uint32_t dx, uint32_t dy, uint32_t width, uint32_t height,
                         int32_t exp_bias) {
     if (source.format != VK_FORMAT_R16G16B16A16_SFLOAT ||
         target.format != VK_FORMAT_R16G16B16A16_SFLOAT ||
         source.image == target.image || !width || !height) return false;
+    if (REXCVAR_GET(masseffect_native_resolve_bias_frag) &&
+        ResolverWithBiasFrag(source, target, sx, sy, dx, dy, width, height, exp_bias))
+      return true;
     if (!pipelines_conversion_edram_[3] ||
         !EnsureCapacityConversionEDRAM4("resolve bias")) return false;
     SlotWork& slot = slots_[slot_];
@@ -5358,6 +5441,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       int32_t exponent_bias;
     } constants = {{sx, sy}, {int32_t(dx), int32_t(dy)}, {width, height}, exp_bias};
     static_assert(sizeof(constants) == 28);
+    LabelMarkGpu((42u << 16) | 0u);  // report label: exponent-bias resolve (compute)
     dfn_.vkCmdBindPipeline(commands_work_, VK_PIPELINE_BIND_POINT_COMPUTE,
                            pipelines_conversion_edram_[3]);
     dfn_.vkCmdBindDescriptorSets(commands_work_, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -6405,6 +6489,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       module.codeSize = sizeof(shaders::me_edram_r64_to_r64_fs);
       module.pCode = shaders::me_edram_r64_to_r64_fs;
       if (dfn_.vkCreateShaderModule(device_, &module, nullptr, &fs_conv_r64_frag_) != VK_SUCCESS) return fail();
+      module.codeSize = sizeof(shaders::me_resolve_exp_bias_fs);
+      module.pCode = shaders::me_resolve_exp_bias_fs;
+      if (dfn_.vkCreateShaderModule(device_, &module, nullptr, &fs_bias_frag_) != VK_SUCCESS) return fail();
       VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kConversionsEDRAMPerSlot};
       VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
       pool.maxSets = kConversionsEDRAMPerSlot;
@@ -6464,7 +6551,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     stages[0].module = vs_conv_color_frag_;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = variant ? fs_conv_r64_frag_ : fs_conv_color_frag_;
+    stages[1].module = variant == 2 ? fs_bias_frag_ : variant ? fs_conv_r64_frag_ : fs_conv_color_frag_;
     stages[1].pName = "main";
     VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -7637,7 +7724,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       if (it->second.stencil) dfn_.vkDestroyImageView(device_, it->second.stencil, nullptr);
       views_depth_edram_.erase(it);
     }
-    for (uint32_t variant = 0; variant < 2; ++variant)
+    for (uint32_t variant = 0; variant < 3; ++variant)  // 2 = the exponent-bias resolve pass
       if (auto it = framebuffers_conv_color_frag_.find({image.image, variant});
           it != framebuffers_conv_color_frag_.end()) {
         if (it->second) dfn_.vkDestroyFramebuffer(device_, it->second, nullptr);
@@ -8877,6 +8964,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   std::map<std::pair<VkImage, uint32_t>, VkFramebuffer> framebuffers_conv_color_frag_;  // (image, variant)
   std::unordered_map<VkImage, VkImageView> views_raw64_rt_edram_;  // UINT views as color attachments
   VkShaderModule fs_conv_r64_frag_ = VK_NULL_HANDLE;
+  VkShaderModule fs_bias_frag_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout layout_conv_color_frag_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_pipeline_conv_color_frag_ = VK_NULL_HANDLE;
   VkShaderModule vs_conv_color_frag_ = VK_NULL_HANDLE;
@@ -8948,6 +9036,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   std::array<VkPipeline, 14> pipelines_conversion_edram_{};
   int32_t storage_unorm10_ = -1;
   uint64_t resolves_direct_7e3_ = 0;
+  uint64_t resolves_bias_frag_ = 0;
   VkDescriptorSetLayout layout_descriptors_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_descriptors_ = VK_NULL_HANDLE;
