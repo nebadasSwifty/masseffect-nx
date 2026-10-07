@@ -366,3 +366,20 @@ The newest dated evidence is preferred in each case.
   the first log line of a warm run. They start the clock at different moments.
 - **Package size.** 861 MB, about 930 MB, and 929 MB are quoted for the shader package in different notes (different
   package versions).
+
+## 2026-10-07 night (Russian edition, Switch, CPU 1785 / GPU 768 MHz)
+
+Route: new game -> character creation -> Anderson window cutscene -> intro -> Normandy cockpit (mass-effect-recomp
+tools/me1_anderson.sh, LONG=1). Frames per 10 s in the cockpit part; GPU = mean "GPU per Swap" of the last minute.
+
+| build / config | cockpit Swaps per 10 s | GPU ms per frame | EDRAM conversions ms | picture |
+|---|---|---|---|---|
+| internal resolution actually off (stale overlay object, 1280x720) | 140-225 | ~60-75 | ~45 | Shepard lit |
+| 960x544, front buffer 1280 + crop (4696f65) | 138-226 | ~50 | ~21 | correct |
+| + packed-format overwrite proofs (f1f36f3) | 146-229 | ~48 | ~19 | correct |
+| + native audio DSP | 190-237 | 50.0 | 20.8 | correct |
+| + resolve UNORM10 from the 7e3 owner (d99b234) | 161-253 | 43.5 | 12.7 | correct |
+| same at 800x448 + present_effect = "fsr" | 250-299 | 36.1 (gap 6.0) | 8.2 | FSR upscale, close to 960 |
+
+Black start (deadlock on the 256 KB render command buffer while the loading movie owns the device): fixed by
+masseffect_render_ring_kb = 4096 (034eac8), 12 of 12 launches reached the title.
