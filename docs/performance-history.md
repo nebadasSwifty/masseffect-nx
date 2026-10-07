@@ -380,6 +380,7 @@ tools/me1_anderson.sh, LONG=1). Frames per 10 s in the cockpit part; GPU = mean 
 | + native audio DSP | 190-237 | 50.0 | 20.8 | correct |
 | + resolve UNORM10 from the 7e3 owner (d99b234) | 161-253 | 43.5 | 12.7 | correct |
 | same at 800x448 + present_effect = "fsr" | 250-299 | 36.1 (gap 6.0) | 8.2 | FSR upscale, close to 960 |
+| + same-layout conversions, no pitch division, bias resolves as fragments (d3a5ad1), 960x544 | 250-299 | ~37 | ~7 | correct |
 
 Black start (deadlock on the 256 KB render command buffer while the loading movie owns the device): fixed by
 masseffect_render_ring_kb = 4096 (034eac8), 12 of 12 launches reached the title.
