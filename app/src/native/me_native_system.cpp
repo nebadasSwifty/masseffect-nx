@@ -61,6 +61,11 @@
 #include "masseffect/masseffect_native_shaders.h"
 #include "masseffect/masseffect_shader_library.h"
 
+#include <rex/platform.h>
+#if REX_PLATFORM_SWITCH
+extern "C" void RexSwitchClocks(uint32_t hz_out[3]);  // sdk/src/ui/switch_perf.cpp
+#endif
+
 namespace masseffect::native {
 extern const ShadersNative* g_active_library;  // me_masseffect_glue.cpp
 }
@@ -2491,6 +2496,20 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                 shaders_by_address_, shaders_unidentified_, st.drawn, st.rejected, st.pipelines, st.textures,
                 presented);
     HangWatchdogInterval(swaps_ - reported_swaps_, draws_ - reported_draws_);
+#if REX_PLATFORM_SWITCH
+    {
+      // The clocks in the normal log (first report and on every change): a measurement is only valid at the agreed
+      // clocks, and the profiler is not always on.
+      static uint32_t last[3] = {0, 0, 0};
+      uint32_t hz[3];
+      RexSwitchClocks(hz);
+      if (hz[0] != last[0] || hz[1] != last[1] || hz[2] != last[2]) {
+        REXLOG_INFO("[native] clocks: CPU {:.1f} MHz, GPU {:.1f} MHz, memory {:.1f} MHz", hz[0] / 1.0e6,
+                    hz[1] / 1.0e6, hz[2] / 1.0e6);
+        std::memcpy(last, hz, sizeof(last));
+      }
+    }
+#endif
     std::string causes;
     for (size_t i = 0; i < st.causes.size() && i < 6; ++i) {
       causes += fmt::format(" {}x{}", st.causes[i].first, st.causes[i].second);
