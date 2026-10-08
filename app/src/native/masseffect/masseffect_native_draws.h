@@ -14,6 +14,7 @@
 #include <rex/ui/vulkan/device.h>
 #include "me_sample_count_contract.h"
 #include "me_stencil_clear_ownership.h"
+#include "../me_constants_dirty.h"
 
 #include <array>
 #include <atomic>
@@ -262,6 +263,9 @@ struct SubmissionDraw {
   uint64_t generation_vs = 0;                // changes with every VS IM_LOAD
   uint64_t generation_constants_vs = 0;     // changes when 0x4000-0x43FF are written
   uint64_t generation_constants_ps = 0;     // changes when 0x4400-0x47FF are written
+  // masseffect_native_constants_dirty: the ring sink's changed-vector bits (taken and cleared by the draws side), or
+  // nullptr when the switch is off. Same thread as the ring sink (docs/batched-constants.md).
+  me::native::ConstantDirtyBits* constants_dirty = nullptr;
   /*
    * The two most expensive stages of recording a draw on the console are "textures" (4.1 ms per frame) and
    * the viewport/scissor that the C6 report includes in "pipeline". Both are pure functions of registers

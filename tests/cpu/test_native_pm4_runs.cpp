@@ -1,6 +1,7 @@
 // Host test of app/src/native/me_pm4_runs.h: ApplyRunRaw (NEON, from guest big-endian words) against the original
 // per-word loop (ApplyRunReference) over random runs, including runs that straddle the VS/PS/fetch boundaries, runs
-// that change nothing, runs with a single changed word at every position, and unaligned guest pointers.
+// that change nothing, runs with a single changed word at every position, and unaligned guest pointers. Also
+// ApplyRunRawDirty (masseffect_native_constants_dirty): same result plus exactly the changed constant vectors marked.
 //   clang++ -std=c++20 -O2 -I app/src/native tests/cpu/test_native_pm4_runs.cpp -o /tmp/test_native_pm4_runs && /tmp/test_native_pm4_runs
 #include <cstdio>
 #include <cstdlib>
@@ -24,10 +25,10 @@ static int g_failures = 0;
 int main() {
   std::mt19937_64 rng(7);
   constexpr uint32_t kFirst = 0x4000, kEnd = 0x48C0, kRegs = 0x5003;
-  std::vector<uint32_t> a(kRegs), b(kRegs);
+  std::vector<uint32_t> a(kRegs), b(kRegs), c(kRegs);
   uint64_t runs = 0, changed_runs = 0;
   for (int iteration = 0; iteration < 3000000; ++iteration) {
-    for (uint32_t i = kFirst - 8; i < kEnd + 8; ++i) a[i] = b[i] = uint32_t(rng() % 5 == 0 ? rng() : 0x11111111u);
+    for (uint32_t i = kFirst - 8; i < kEnd + 8; ++i) a[i] = b[i] = c[i] = uint32_t(rng() % 5 == 0 ? rng() : 0x11111111u);
     uint32_t count = 1 + uint32_t(rng() % 40);
     if (iteration % 17 == 0) count = 1 + uint32_t(rng() % 600);
     uint32_t index;
@@ -57,6 +58,19 @@ int main() {
     uint32_t i = 0;
     const RunChange want = ApplyRunReference(&b[index], index, count, [&] { return guest_host[i++]; });
     const RunChange got = ApplyRunRaw(a.data(), index, count, aligned.data());
+    // ApplyRunRawDirty: same registers and RunChange, and exactly the vectors with a changed word marked
+    uint64_t dirty[8] = {}, expected_dirty[8] = {};
+    for (uint32_t k = 0; k < count; ++k) {
+      const uint32_t reg = index + k;
+      if (reg < 0x4800 && c[reg] != guest_host[k]) {
+        const uint32_t v = (reg - 0x4000) >> 2;
+        expected_dirty[v >> 6] |= uint64_t(1) << (v & 63);
+      }
+    }
+    const RunChange got_dirty = ApplyRunRawDirty(c.data(), index, count, aligned.data(), dirty);
+    CHECK(want == got_dirty);
+    CHECK(c == b);
+    CHECK(std::memcmp(dirty, expected_dirty, sizeof(dirty)) == 0);
     ++runs;
     changed_runs += want.vs || want.ps || want.fetch;
     CHECK(want == got);

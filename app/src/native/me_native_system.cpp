@@ -13,6 +13,7 @@
 #include "me_shader_candidate_policy.h"
 #include "me_native_draw_extent_estimator.h"
 #include "me_pm4_runs.h"
+#include "me_constants_dirty.h"
 #include "me_object_table.h"
 #include "me_record_table.h"
 #include "me_native_ps_no_kill.h"
@@ -213,6 +214,12 @@ REXCVAR_DEFINE_BOOL(masseffect_native_pm4_fast, false, "Mass Effect",
                     "Ring: runs of constant/fetch register writes (type 0, SET_CONSTANT2/SET_SHADER_CONSTANTS, "
                     "LOAD_ALU_CONSTANT) are byte-swapped, compared and stored four words at a time with NEON "
                     "straight from the guest words; same register contents and generation bumps")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_constants_dirty, false, "Mass Effect",
+                    "Ring (exact): every write into the VS/PS constants marks the float4 vectors whose value changed; "
+                    "the draws side then compares and copies only those vectors (instead of the whole bank) to decide "
+                    "whether the last constants upload can be reused and to keep its CPU copy up to date. Check: "
+                    "masseffect_native_constants_dirty_verify. docs/batched-constants.md")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(masseffect_native_load_memo, false, "Mass Effect",
                     "Ring: a shader IM_LOAD whose raw guest words equal the last load from the same address and "
@@ -813,6 +820,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     g_record_fast = pairing_fast_ = REXCVAR_GET(masseffect_native_fast_pair);
     raw_microcode_ = REXCVAR_GET(masseffect_native_raw_microcode);
     pm4_fast_ = REXCVAR_GET(masseffect_native_pm4_fast);
+    constants_dirty_on_ = REXCVAR_GET(masseffect_native_constants_dirty);
+    if (constants_dirty_on_)
+      REXLOG_INFO("[native] constants by vector (masseffect_native_constants_dirty): ON; changed float4 vectors are "
+                  "marked at the register writes (docs/batched-constants.md)");
     query_mode_ = REXCVAR_GET(masseffect_native_query_mode);
     query_skip_boxes_ = REXCVAR_GET(masseffect_native_query_skip_boxes);
     query_pair_by_address_ = REXCVAR_GET(masseffect_native_query_pair_by_address);
@@ -1030,6 +1041,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     if (registers_[index] != value) {  // generations: what a draw must re-upload
       if (index >= 0x4000 && index < 0x4800) {
         ++(index < 0x4400 ? gen_constants_vs_ : gen_constants_ps_);
+        if (constants_dirty_on_) {  // masseffect_native_constants_dirty
+          constants_dirty_.Mark(index);
+          ++constants_dirty_.bumps[index < 0x4400 ? 0 : 1];
+        }
       } else if (index >= kRegFetchFirst && index <= kRegFetchLast) {
         ++gen_fetch_;
       } else if (IsViewportRegister(index)) {
@@ -1078,11 +1093,16 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         if (r < 0x4400) vs = true;
         else if (r < 0x4800) ps = true;
         else fetch = true;
+        if (constants_dirty_on_ && r < 0x4800) constants_dirty_.Mark(r);
       }
     }
     if (vs) ++gen_constants_vs_;
     if (ps) ++gen_constants_ps_;
     if (fetch) ++gen_fetch_;
+    if (constants_dirty_on_) {
+      constants_dirty_.bumps[0] += vs;
+      constants_dirty_.bumps[1] += ps;
+    }
     if (split_on_) journal_.Regs(index, regs + index, count);
   }
 
@@ -1111,10 +1131,16 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     }
     __builtin_prefetch(guest + count);
     __builtin_prefetch(guest + count + 16);
-    const RunChange change = ApplyRunRaw(regs, index, count, guest);
+    const RunChange change = constants_dirty_on_
+                                 ? ApplyRunRawDirty(regs, index, count, guest, constants_dirty_.bits)
+                                 : ApplyRunRaw(regs, index, count, guest);
     if (change.vs) ++gen_constants_vs_;
     if (change.ps) ++gen_constants_ps_;
     if (change.fetch) ++gen_fetch_;
+    if (constants_dirty_on_) {  // masseffect_native_constants_dirty
+      constants_dirty_.bumps[0] += change.vs;
+      constants_dirty_.bumps[1] += change.ps;
+    }
     if (check) {  // the original loop on the saved words
       std::vector<uint32_t> expected(before);
       uint32_t i = 0;
@@ -1126,6 +1152,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                      want.ps, change.fetch, want.fetch);
         pm4_fast_ = false;
         for (uint32_t k = 0; k < count; ++k) regs[index + k] = __builtin_bswap32(guest[k]);
+        if (constants_dirty_on_) constants_dirty_.MarkRange(index, index + count);  // conservative
       }
     }
     if (split_on_) journal_.Regs(index, regs + index, count);
@@ -2919,6 +2946,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     request.generation_vs = gen_vs_;
     request.generation_constants_vs = gen_constants_vs_;
     request.generation_constants_ps = gen_constants_ps_;
+    request.constants_dirty = constants_dirty_on_ ? &constants_dirty_ : nullptr;
     request.generation_fetch = gen_fetch_;
     request.generation_framing = gen_viewport_;
     request.occlusion_query = query_open_ && query_mode_ >= 2;
@@ -3588,6 +3616,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // Ring CPU switches (masseffect_native_flat_identity, _fast_pair, _raw_microcode, _pm4_fast) and the
   // remaining self-check uses of each.
   bool identity_flat_ = false, pairing_fast_ = false, raw_microcode_ = false, pm4_fast_ = false;
+  // masseffect_native_constants_dirty: changed constant vectors since the draws side took them (me_constants_dirty.h).
+  bool constants_dirty_on_ = false;
+  me::native::ConstantDirtyBits constants_dirty_;
   uint32_t check_identity_ = 0, check_pairing_ = 0, check_raw_ = 0, check_pm4_ = 0, check_objects_ = 0;
   std::vector<uint32_t> raw_vs_, raw_ps_;  // the guest words of the last IM_LOAD of each stage (raw_microcode_)
   // masseffect_native_load_memo (me_shader_load_memo.h); null when off or after a self-check DIFFERENCE.

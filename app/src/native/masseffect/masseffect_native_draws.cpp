@@ -562,6 +562,19 @@ REXCVAR_DEFINE_INT32(masseffect_native_constants_same_verify, 2048, "MASSEFFECT"
                      "uploaded bytes with the registers (DIFFERENCE turns the switch off). 0 = no check")
     .range(0, 100000000)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_constants_dirty_verify, 4096, "MASSEFFECT",
+                     "Native renderer, with masseffect_native_constants_dirty: the first N constant bank decisions "
+                     "are also taken the old way (full compare with the CPU copy) and the bytes the draw binds are "
+                     "read back from the upload buffer and compared with the registers (DIFFERENCE turns the switch "
+                     "off). 0 = no check")
+    .range(0, 100000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_constants_dedupe, false, "MASSEFFECT",
+                    "Native renderer, with masseffect_native_constants_dirty: a constant bank that must be uploaded "
+                    "again is looked up (XXH3 of the bytes the shader reads) among the last 8 uploads of the same "
+                    "bank in this upload buffer; an equal one is bound instead of copying again. The first "
+                    "masseffect_native_constants_dirty_verify hits are compared byte by byte with the upload buffer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(masseffect_native_dedupe_hash_after_copy, false, "MASSEFFECT",
                     "Native renderer: a vertex binding with no live dedupe entry of the same address, size and byte "
                     "order is copied first and its dedupe fingerprint is computed afterwards, from the same guest "
@@ -3967,11 +3980,23 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       if (format == 3 || format == 7 || format == 12) me_constant_audit_hdr_ = true;
     }
     const uint32_t bytes_vs = std::min<uint32_t>(p.vs->constants_bytes, kRegistersConstants * 4);
+    // masseffect_native_constants_dirty: decided from the changed vectors (docs/batched-constants.md); otherwise
+    // (switch off, not in sync yet) the older path below.
+    bool vs_by_vector = false;
+    if (p.constants_dirty && constants_dirty_ok_) {
+      constants_dirty_seen_ = true;
+      bank_tracker_[0].Take(*p.constants_dirty, 0, p.generation_constants_vs);
+      vs_by_vector = ConstantsByVector(0, p.vs->number, r + kRegConstantsVs, bytes_vs, p.generation_constants_vs,
+                                       kUboBytesVs, constants_vs_offset_, constants_vs_generation_,
+                                       constants_vs_epoch_, constants_vs_bytes_, reuploaded_vs_);
+    }
     // masseffect_native_constants_same_content: a new generation whose bytes equal this buffer's last upload.
-    const bool vs_same = constants_vs_generation_ != p.generation_constants_vs &&
+    const bool vs_same = !vs_by_vector && constants_vs_generation_ != p.generation_constants_vs &&
                          constants_vs_epoch_ == epoch_upload_ && bytes_vs <= constants_vs_bytes_ &&
                          ConstantsSame(true, r + kRegConstantsVs, bytes_vs, constants_vs_offset_, 0, 0.0f);
-    if (vs_same) {
+    if (vs_by_vector) {
+      // done
+    } else if (vs_same) {
       // The upload at constants_vs_offset_ holds these bytes of the new generation, and only these: a later shader of
       // the same generation that reads more must upload again.
       constants_vs_generation_ = p.generation_constants_vs;
@@ -3987,6 +4012,11 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                constants_vs_offset_);
       std::memcpy(upload_data_ + constants_vs_offset_, r + kRegConstantsVs, bytes_vs);
       ShadowConstants(true, r + kRegConstantsVs, bytes_vs);
+      if (p.constants_dirty && constants_dirty_ok_) {  // masseffect_native_constants_dirty: in sync from here
+        bank_tracker_[0].Resync(shadow_vs_.data(), r + kRegConstantsVs, bytes_vs);
+        shadow_valid_[0] = true;
+        ++cd_fallback_[0];
+      }
       constants_vs_generation_ = p.generation_constants_vs;
       constants_vs_epoch_ = epoch_upload_;
       constants_vs_bytes_ = bytes_vs;
@@ -4020,13 +4050,26 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       // The patch key: a different patch of the same guest generation must not reuse the previous upload.
       tonemap_scale_bits = uint32_t(XXH3_64bits(constants_ps_source, bytes_ps)) | 1u;
     }
-    const bool ps_same = ps && constants_ps_generation_ != p.generation_constants_ps &&
+    bool ps_by_vector = false;
+    if (ps && p.constants_dirty && constants_dirty_ok_) {
+      bank_tracker_[1].Take(*p.constants_dirty, 1, p.generation_constants_ps);
+      if (constants_mode_ps != 0) {
+        bank_tracker_[1].Desync();  // the bank is patched (tone map, motion blur): the older path, then a resync
+      } else if (constants_ps_mode_ == 0 && constants_ps_tonemap_scale_bits_ == 0) {
+        ps_by_vector = ConstantsByVector(1, ps->number, constants_ps_source, bytes_ps, p.generation_constants_ps,
+                                         kUboBytesPs, constants_ps_offset_, constants_ps_generation_,
+                                         constants_ps_epoch_, constants_ps_bytes_, reuploaded_ps_);
+      }
+    }
+    const bool ps_same = !ps_by_vector && ps && constants_ps_generation_ != p.generation_constants_ps &&
                          constants_ps_epoch_ == epoch_upload_ && bytes_ps <= constants_ps_bytes_ &&
                          constants_mode_ps == constants_ps_mode_ &&
                          tonemap_scale_bits == constants_ps_tonemap_scale_bits_ &&
                          ConstantsSame(false, constants_ps_source, bytes_ps, constants_ps_offset_, constants_mode_ps,
                                        tonemap_scale);
-    if (ps_same) {
+    if (ps_by_vector) {
+      // done (mode 0: constants_ps_mode_ and constants_ps_tonemap_scale_bits_ stay 0)
+    } else if (ps_same) {
       constants_ps_generation_ = p.generation_constants_ps;  // as for the VS constants above
       constants_ps_bytes_ = bytes_ps;
     } else if (ps && (constants_ps_generation_ != p.generation_constants_ps ||
@@ -4040,6 +4083,11 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                constants_ps_offset_);
       std::memcpy(upload_data_ + constants_ps_offset_, constants_ps_source, bytes_ps);
       ShadowConstants(false, constants_ps_source, bytes_ps);
+      if (p.constants_dirty && constants_dirty_ok_ && constants_mode_ps == 0) {  // masseffect_native_constants_dirty
+        bank_tracker_[1].Resync(shadow_ps_.data(), constants_ps_source, bytes_ps);
+        shadow_valid_[1] = true;
+        ++cd_fallback_[1];
+      }
       if (constants_mode_ps == 1) {
         // UE3 writes this composition with SCENE_COLOR_BIAS_FACTOR=8 for Xenos' packed 7e3
         // output path. In the native renderer the EDRAM view is canonical FP16, so carrying that
@@ -5244,6 +5292,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
             d[4], d[5], d[4] + d[5] ? 100.0 * double(d[5]) / double(d[4] + d[5]) : 0.0, d[7], d[6], d[8]);
       }
     }
+    if (!first) ReportConstantsByVector();
     set4_changes_.fill(0);
     set4_first_ = 0;
     set4_draws_ = 0;
@@ -5749,6 +5798,153 @@ class DrawsVulkanImpl final : public DrawsVulkan {
    * switch off (report only). The first constants_same_verify_left_ reuses read the upload buffer back and compare it
    * with the registers (with the override applied); a difference turns the switch off.
    */
+  /*
+   * masseffect_native_constants_dirty (docs/batched-constants.md). Bank s (0 VS, 1 PS) of a draw that reads `bytes`
+   * of `current` (the registers). Same decision as the generation + same-content path, but from the vectors the ring
+   * marked as changed: reuse the last upload of this upload buffer if every changed vector the shader reads still
+   * equals the CPU copy of that upload; otherwise upload (or, with masseffect_native_constants_dedupe, bind an equal
+   * earlier upload) and bring the CPU copy up to date by copying only the changed vectors. False if the tracker is not
+   * in sync: the caller runs the older path, which resyncs it on its next upload.
+   */
+  bool ConstantsByVector(uint32_t s, uint32_t shader, const uint32_t* current, uint32_t bytes, uint64_t generation,
+                         VkDeviceSize ubo_bytes, VkDeviceSize& offset, uint64_t& bank_generation, uint64_t& bank_epoch,
+                         uint32_t& bank_bytes, std::array<uint64_t, 3>& reuploaded) {
+    me::native::ConstantBankTracker& tracker = bank_tracker_[s];
+    if (!tracker.synced()) {
+      return false;
+    }
+    uint32_t* shadow = (s ? shadow_ps_ : shadow_vs_).data();
+    ++cd_draws_[s];
+    const bool valid = bank_epoch == epoch_upload_ && bytes <= bank_bytes && bytes <= tracker.shadow_bytes();
+    const bool clean = valid && !tracker.AnyPendingIn(bytes);
+    const bool check = cd_verify_left_ > 0;
+    // The older decision, for the check: the full compare of the bank with the CPU copy (before Same clears bits).
+    const bool old_same = check && valid && std::memcmp(shadow, current, bytes) == 0;
+    uint32_t compared = 0;
+    const bool same = valid && (clean || tracker.Same(shadow, current, bytes, compared));
+    cd_compared_ += compared;
+    if (check) {
+      --cd_verify_left_;
+      ++cd_verified_;
+      if (same != old_same) {
+        return ConstantsByVectorFailed(s, current, bytes, ubo_bytes, offset, bank_generation, generation, bank_epoch,
+                                       bank_bytes, same ? "reused although the bank differs from the last upload"
+                                                        : "uploaded although the bank equals the last upload");
+      }
+    }
+    if (same) {
+      ++(clean ? cd_reused_clean_ : cd_reused_compared_)[s];
+      if (bank_generation == generation) {
+        AuditCacheConstants(s == 0, shader, generation, current, offset, bytes);
+      }
+      tracker.Reused(bytes);
+      bank_generation = generation;
+      bank_bytes = bytes;
+      if (check && std::memcmp(upload_data_ + offset, current, bytes) != 0) {
+        return ConstantsByVectorFailed(s, current, bytes, ubo_bytes, offset, bank_generation, generation, bank_epoch,
+                                       bank_bytes, "the reused upload differs from the registers");
+      }
+      return true;
+    }
+    ++reuploaded[bank_generation != generation ? 0 : bank_epoch != epoch_upload_ ? 1 : 2];
+    ++cd_uploads_[s];
+    cd_upload_bytes_ += bytes;
+    bool deduped = false;
+    uint64_t hash = 0;
+    if (cd_dedupe_ && bytes) {
+      hash = XXH3_64bits(current, bytes);
+      ++cd_dedupe_lookups_;
+      for (const ConstantsDedupeEntry& e : cd_dedupe_entries_[s]) {
+        if (e.epoch != epoch_upload_ || e.bytes != bytes || e.hash != hash) continue;
+        if (cd_dedupe_verify_left_ > 0) {
+          --cd_dedupe_verify_left_;
+          ++cd_dedupe_verified_;
+          if (std::memcmp(upload_data_ + e.offset, current, bytes) != 0) {
+            REXLOG_ERROR("[native] DIFFERENCE: {} constants deduplicated by hash ({} bytes at offset {}) differ from "
+                         "the registers; masseffect_native_constants_dedupe is off from now on",
+                         s ? "PS" : "VS", bytes, e.offset);
+            cd_dedupe_ = false;
+            break;
+          }
+        }
+        offset = e.offset;
+        deduped = true;
+        ++cd_dedupe_hits_;
+        cd_dedupe_bytes_ += bytes;
+        break;
+      }
+    }
+    if (!deduped) {
+      Reserve(use_ubo_ ? std::max<VkDeviceSize>(bytes, ubo_bytes) : bytes, use_ubo_ ? alignment_ubo_ : 16, offset);
+      std::memcpy(upload_data_ + offset, current, bytes);
+      if (cd_dedupe_ && bytes) {
+        ConstantsDedupeEntry& e = cd_dedupe_entries_[s][cd_dedupe_next_[s]++ & 7];
+        e.hash = hash;
+        e.epoch = epoch_upload_;
+        e.offset = offset;
+        e.bytes = bytes;
+      }
+    }
+    cd_shadow_bytes_ += tracker.Uploaded(shadow, current, bytes);
+    shadow_valid_[s] = true;
+    bank_generation = generation;
+    bank_epoch = epoch_upload_;
+    bank_bytes = bytes;
+    if (check && (std::memcmp(shadow, current, bytes) != 0 || std::memcmp(upload_data_ + offset, current, bytes) != 0)) {
+      return ConstantsByVectorFailed(s, current, bytes, ubo_bytes, offset, bank_generation, generation, bank_epoch,
+                                     bank_bytes, "the CPU copy or the upload differs from the registers after an upload");
+    }
+    return true;
+  }
+
+  // A failed check of masseffect_native_constants_dirty: the switch goes off for good and this draw gets a plain
+  // upload of the registers (with a full CPU copy, so the older content path stays exact).
+  bool ConstantsByVectorFailed(uint32_t s, const uint32_t* current, uint32_t bytes, VkDeviceSize ubo_bytes,
+                               VkDeviceSize& offset, uint64_t& bank_generation, uint64_t generation,
+                               uint64_t& bank_epoch, uint32_t& bank_bytes, const char* what) {
+    REXLOG_ERROR("[native] DIFFERENCE: {} constants by vector ({} bytes): {}; masseffect_native_constants_dirty is off "
+                 "from now on",
+                 s ? "PS" : "VS", bytes, what);
+    ++cd_mismatches_;
+    constants_dirty_ok_ = false;
+    bank_tracker_[0].Desync();
+    bank_tracker_[1].Desync();
+    Reserve(use_ubo_ ? std::max<VkDeviceSize>(bytes, ubo_bytes) : bytes, use_ubo_ ? alignment_ubo_ : 16, offset);
+    std::memcpy(upload_data_ + offset, current, bytes);
+    std::memcpy((s ? shadow_ps_ : shadow_vs_).data(), current, bytes);
+    shadow_valid_[s] = true;
+    bank_generation = generation;
+    bank_epoch = epoch_upload_;
+    bank_bytes = bytes;
+    return true;
+  }
+
+  // Every 10 s (with ReportSet4): what masseffect_native_constants_dirty did.
+  void ReportConstantsByVector() {
+    if (!constants_dirty_seen_) return;
+    const uint64_t draws = cd_draws_[0] + cd_draws_[1];
+    const uint64_t uploads = cd_uploads_[0] + cd_uploads_[1];
+    MASSEFFECT_REPORT_RING(
+        "[native] constants by vector ({}): VS {} decisions ({} reused clean, {} reused after comparing, {} uploaded, "
+        "{} by the older path), PS {} ({} / {} / {} / {}); {:.2f} vectors compared per decision; CPU copy {:.1f} "
+        "bytes per upload instead of {:.1f}; dedupe {}: {} lookups, {} hits ({:.1f} KB not copied); lost sync VS {} "
+        "PS {}; checked {} ({} mismatches)",
+        constants_dirty_ok_ ? "on" : "SWITCHED OFF", cd_draws_[0], cd_reused_clean_[0], cd_reused_compared_[0],
+        cd_uploads_[0], cd_fallback_[0], cd_draws_[1], cd_reused_clean_[1], cd_reused_compared_[1], cd_uploads_[1],
+        cd_fallback_[1], draws ? double(cd_compared_) / double(draws) : 0.0,
+        uploads ? double(cd_shadow_bytes_) / double(uploads) : 0.0,
+        uploads ? double(cd_upload_bytes_) / double(uploads) : 0.0, cd_dedupe_ ? "on" : "off", cd_dedupe_lookups_,
+        cd_dedupe_hits_, double(cd_dedupe_bytes_) / 1024.0, bank_tracker_[0].lost_sync(),
+        bank_tracker_[1].lost_sync(), cd_verified_, cd_mismatches_);
+    cd_draws_.fill(0);
+    cd_reused_clean_.fill(0);
+    cd_reused_compared_.fill(0);
+    cd_uploads_.fill(0);
+    cd_fallback_.fill(0);
+    cd_compared_ = cd_shadow_bytes_ = cd_upload_bytes_ = 0;
+    cd_dedupe_lookups_ = cd_dedupe_hits_ = cd_dedupe_bytes_ = 0;
+  }
+
   bool ConstantsSame(bool vs, const uint32_t* current, uint32_t bytes, VkDeviceSize offset, uint8_t mode_ps,
                      float tonemap_scale) {
     if (!constants_same_ && !report_tex_up_) return false;
@@ -8586,6 +8782,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     constants_same_ = REXCVAR_GET(masseffect_native_constants_same_content);
     constants_same_verify_left_ =
         constants_same_ ? std::max<int32_t>(0, REXCVAR_GET(masseffect_native_constants_same_verify)) : 0;
+    // masseffect_native_constants_dirty (the ring sink's switch; seen here through SubmissionDraw::constants_dirty).
+    cd_verify_left_ = std::max<int32_t>(0, REXCVAR_GET(masseffect_native_constants_dirty_verify));
+    cd_dedupe_ = REXCVAR_GET(masseffect_native_constants_dedupe);
+    cd_dedupe_verify_left_ = cd_dedupe_ ? cd_verify_left_ : 0;
     dedupe_after_copy_ = REXCVAR_GET(masseffect_native_dedupe_hash_after_copy);
     dedupe_after_verify_left_ = dedupe_after_copy_ ? 4096 : 0;
     REXLOG_INFO("[native] C6 round 3: report textures/uploads {}; invalidation by address {} (first {} hits "
@@ -14647,6 +14847,24 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   VkDeviceSize constants_ps_offset_ = 0;
   uint32_t constants_vs_bytes_ = 0;
   uint32_t constants_ps_bytes_ = 0;
+  // masseffect_native_constants_dirty / _dedupe (ConstantsByVector, docs/batched-constants.md).
+  bool constants_dirty_ok_ = true;     // false after a failed check
+  bool constants_dirty_seen_ = false;  // a draw came with the ring's bits (the switch is on)
+  std::array<me::native::ConstantBankTracker, 2> bank_tracker_{};
+  struct ConstantsDedupeEntry {
+    uint64_t hash = 0;
+    uint64_t epoch = UINT64_MAX;
+    VkDeviceSize offset = 0;
+    uint32_t bytes = 0;
+  };
+  std::array<std::array<ConstantsDedupeEntry, 8>, 2> cd_dedupe_entries_{};
+  std::array<uint32_t, 2> cd_dedupe_next_{};
+  bool cd_dedupe_ = false;
+  int64_t cd_verify_left_ = 0, cd_dedupe_verify_left_ = 0;
+  uint64_t cd_verified_ = 0, cd_mismatches_ = 0, cd_dedupe_verified_ = 0;
+  std::array<uint64_t, 2> cd_draws_{}, cd_reused_clean_{}, cd_reused_compared_{}, cd_uploads_{}, cd_fallback_{};
+  uint64_t cd_compared_ = 0, cd_shadow_bytes_ = 0, cd_upload_bytes_ = 0;
+  uint64_t cd_dedupe_lookups_ = 0, cd_dedupe_hits_ = 0, cd_dedupe_bytes_ = 0;
 
   bool active_pass_ = false;
   uint32_t category_pass_ = kGpuOther;

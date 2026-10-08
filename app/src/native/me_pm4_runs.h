@@ -70,4 +70,51 @@ inline RunChange ApplyRunRaw(uint32_t* regs, uint32_t index, uint32_t count, con
   return change;
 }
 
+// ApplyRunRaw that also sets, in `dirty` (8 words: 512 bits, bit v = constant vector v = (register - 0x4000) / 4),
+// the bit of every VS/PS constant vector with a word that changed value (masseffect_native_constants_dirty). Same
+// register values and same RunChange as ApplyRunRaw. Fetch constants (0x4800-0x48BF) set no bits.
+inline RunChange ApplyRunRawDirty(uint32_t* regs, uint32_t index, uint32_t count, const uint32_t* guest,
+                                  uint64_t* dirty) {
+  const auto mark = [dirty](uint32_t reg) {
+    const uint32_t v = (reg - 0x4000) >> 2;
+    dirty[v >> 6] |= uint64_t(1) << (v & 63);
+  };
+  const uint32_t end = index + count;
+  const uint32_t constants_end = std::min<uint32_t>(end, 0x4800);
+  RunChange change;
+  uint32_t r = index;
+#if defined(__ARM_NEON)
+  for (; r + 4 <= constants_end; r += 4) {
+    const uint32x4_t incoming =
+        vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(vld1q_u32(guest + (r - index)))));
+    const uint32x4_t difference = veorq_u32(incoming, vld1q_u32(regs + r));
+    vst1q_u32(regs + r, incoming);
+    if (vmaxvq_u32(difference) != 0) {  // rare per group: find the words (a group may straddle two vectors or 0x4400)
+      uint32_t lanes[4];
+      vst1q_u32(lanes, difference);
+      for (uint32_t k = 0; k < 4; ++k) {
+        if (!lanes[k]) continue;
+        mark(r + k);
+        if (r + k < 0x4400) change.vs = true;
+        else change.ps = true;
+      }
+    }
+  }
+#endif
+  for (; r < constants_end; ++r) {
+    const uint32_t v = __builtin_bswap32(guest[r - index]);
+    if (regs[r] != v) {
+      regs[r] = v;
+      mark(r);
+      if (r < 0x4400) change.vs = true;
+      else change.ps = true;
+    }
+  }
+  if (end > 0x4800) {
+    const uint32_t from = std::max<uint32_t>(index, 0x4800);
+    change.fetch = ApplyRunRaw(regs, from, end - from, guest + (from - index)).fetch;
+  }
+  return change;
+}
+
 }  // namespace me::native
