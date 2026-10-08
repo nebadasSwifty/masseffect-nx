@@ -389,6 +389,7 @@ stores identical for the first 6 M stores (the args-in-registers method), differ
 | Asynchronous pipeline compile with skipped draws (E32b, t121) | 4515 draws skipped (pop-in) | performance-history.md |
 | Submitting every N draws (t206, t207) | no gain or worse; about 2 submissions per frame anyway | performance-history.md |
 | Cross-frame vertex cache | rejected: verifying content costs as much as the copy | optimization-paths.md |
+| Zero-copy vertices (GPU reads guest memory, `VK_EXT_external_memory_host`) | infeasible exact: big-endian data vs fixed-function vertex formats (all 275 VS would need shader-side swap), GPU reads a frame after ring-time fences (breaks R1), no exact write tracking, CPU cache clean per range; a cross-frame arena validated by C3 events is the better route | zero-copy-vertices.md |
 | Epoch invalidation instead of fingerprints (C4) | rejected: not provably exact | optimization-paths.md |
 | Hardware CRC32 fingerprint | no faster than XXH3's NEON loop (analysis; mode 2 kept for an A/B) | ring-cpu.md |
 | Vertex dedupe off (C41, t155) | 12.7 fps, ring 72 ms per frame: dedupe saves a lot | performance-history.md |

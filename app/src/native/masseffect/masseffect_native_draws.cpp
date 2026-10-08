@@ -39,6 +39,7 @@
 #include "../me_frame_coherence.h"  // masseffect_native_coherence_stats (measurement)
 #include "../me_texture_coherency.h"  // masseffect_native_texture_coherency
 #include "me_draw_cache.h"  // masseffect_native_draw_cache_* (docs/frame-coherence.md)
+#include "me_vertex_arena.h"  // masseffect_native_vertex_arena* (docs/zero-copy-vertices.md)
 #include "me_primitives.h"
 #include "me_depth.h"
 #include "me_rectangle_spirv.h"
@@ -684,6 +685,7 @@ REXCVAR_DEFINE_BOOL(masseffect_native_pipelines_prewarm, false, "MASSEFFECT",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 #include "masseffect_pipelines_cold_cvars.inc"  // cold-start pipeline hitches (docs/cold-start-hitches.md)
 #include "me_draw_cache_cvars.inc"  // per-component draw cache (docs/frame-coherence.md)
+#include "me_vertex_arena_cvars.inc"  // cross-frame vertex arena (docs/zero-copy-vertices.md)
 #include "masseffect_ps_descriptors_cvars.inc"  // pixel shader descriptor and clamp rewrites (docs/scene-shader-cost.md)
 /*
  * This test has been answered: there is nothing to gain.
@@ -2679,6 +2681,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     SaveCachePipelines();
     StopWriterCache();  // writes whatever is still pending
     DcDestroy();  // draw cache: the persistent index arena
+    VaDestroy();  // cross-frame vertex arena
     for (auto& [key, par] : pipelines_) {
       dfn_.vkDestroyPipeline(device_, par.second, nullptr);
     }
@@ -3825,6 +3828,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
     CutUpload(0, up_mark);  // texture uploads
     std::array<VkDeviceSize, 16> offsets_vertices{};
+    uint32_t va_mask = 0;  // bindings served from the cross-frame vertex arena (me_vertex_arena_members.inc)
     // If the guest has waited for the GPU since the last draw, it may legally have rewritten an already
     // referenced range: what was recorded is no longer valid.
     if (dedupe_active_) {
@@ -3858,7 +3862,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       };
       // masseffect_native_dedupe_hash_after_copy: with no live entry of this key and size, Search cannot hit and the
       // fingerprint only goes into Note, so it is taken after the (synchronous) copy, from the same guest bytes.
-      const bool hash_after_copy = with_fingerprint && dedupe_after_copy_ && !active_copies_ &&
+      bool hash_after_copy = with_fingerprint && dedupe_after_copy_ && !active_copies_ &&
                                    !dedupe_.Candidate(source.address, source.bytes, uint32_t(source.order));
       // While its check runs, the fingerprint is also taken before the copy, as without the switch.
       uint64_t vertices_fingerprint =
@@ -3883,6 +3887,36 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         REXLOG_WARN("[native] stale vertex reuse prevented: address {:08X}, {} bytes, "
                     "frame {}, discrepancy {}", source.address, source.bytes,
                     frame_, dedupe_.discrepancies());
+      }
+      // masseffect_native_vertex_arena_measure: every range copied today (measurement only, same image).
+      if (va_measure_ && type != 8) {
+        VaMeasure(source.data, source.address, source.bytes, uint32_t(source.order), entry->bindings[b].stride);
+      }
+      /*
+       * masseffect_native_vertex_arena: a copy of this range made in an earlier draw or frame, still valid by the
+       * coherency stamps and the content check, or the range copied into the arena instead of the upload buffer.
+       * Not noted in the in-frame dedupe (its offsets are upload buffer offsets): a repeat asks the arena again.
+       */
+      if (va_on_ && type != 8) {
+        uint64_t arena_fingerprint = vertices_fingerprint;
+        const int outcome = VaBinding(source.data, source.address, source.bytes, source.order,
+                                      entry->bindings[b].stride, arena_fingerprint, fingerprint_of, offset);
+        if (with_fingerprint && arena_fingerprint && !vertices_fingerprint) {
+          // Taken before the copy with the same function: the dedupe does not hash again after it.
+          vertices_fingerprint = arena_fingerprint;
+          hash_after_copy = false;
+        }
+        if (outcome != kVaCopy) {
+          offsets_vertices[b] = offset;
+          va_mask |= 1u << b;
+          if (outcome == kVaStored) {
+            bytes_vertices_ += source.bytes;
+            up_bytes_copied_ += source.bytes;
+            ++up_copies_;
+          }
+          CutUpload(3, up_mark);  // vertex copies
+          continue;
+        }
       }
       // With a single binding, at a multiple of its stride (masseffect_native_vertices_base_zero).
       if (vertices_base_zero_ && entry->bindings.size() == 1) {
@@ -4602,6 +4636,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       c.stencil[1] = stencil_back;
       c.n_bindings = uint32_t(entry->bindings.size());
       c.offsets_vertices = offsets_vertices;
+      c.va_mask = va_mask;  // bindings read from the cross-frame vertex arena
       c.with_indices = with_indices;
       c.indices_from_16 = indices_from_16;
       c.indices = uint32_t(indices_from_16 ? indices16_.size() : indices_.size());
@@ -4748,7 +4783,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
      */
     bool base_zero = false;
     uint32_t first_vertex = 0;  // offset / stride: where the copy starts, in vertices
-    if (vertices_base_zero_ && type != 8 && entry->bindings.size() == 1) {
+    // A binding from the vertex arena binds at its own offset (CheckBaseZero checks upload buffer limits).
+    if (vertices_base_zero_ && type != 8 && entry->bindings.size() == 1 && !va_mask) {
       const VkDeviceSize stride = entry->bindings[0].stride;
       if (offsets_vertices[0] % stride == 0) {
         base_zero = CheckBaseZero(offsets_vertices[0], stride, sources[0].bytes, vmin, first_vertex);
@@ -4777,14 +4813,25 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       static constexpr VkDeviceSize kBindingInZero = 0;
       const VkDeviceSize* a_bind = base_zero ? &kBindingInZero : offsets_vertices.data();
       const uint32_t n_bindings = uint32_t(entry->bindings.size());
-      bool equal = n_bindings == recorded_bindings_;
+      // Bindings served by the cross-frame vertex arena read its buffer; the others the upload buffer.
+      const VkBuffer* a_buffers = buffers_vertices_.data();
+      std::array<VkBuffer, 16> buffers_arena;
+      if (va_mask) {
+        buffers_arena = buffers_vertices_;
+        for (uint32_t i = 0; i < n_bindings; ++i) {
+          if ((va_mask >> i) & 1) buffers_arena[i] = va_buffer_;
+        }
+        a_buffers = buffers_arena.data();
+      }
+      bool equal = n_bindings == recorded_bindings_ && va_mask == va_recorded_mask_;
       for (uint32_t i = 0; equal && i < n_bindings; ++i) {
         equal = a_bind[i] == offsets_recorded_[i];
       }
       if (!equal) {
-        MASSEFFECT_SUB(8, dfn_.vkCmdBindVertexBuffers(cmd, 0, n_bindings, buffers_vertices_.data(), a_bind));
+        MASSEFFECT_SUB(8, dfn_.vkCmdBindVertexBuffers(cmd, 0, n_bindings, a_buffers, a_bind));
         ++base_zero_recorded_bindings_;
         recorded_bindings_ = n_bindings;
+        va_recorded_mask_ = va_mask;
         for (uint32_t i = 0; i < n_bindings; ++i) {
           offsets_recorded_[i] = a_bind[i];
         }
@@ -4928,6 +4975,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (c.n_bindings) {
       std::array<VkBuffer, 16> buffers{};
       buffers.fill(c.buffer);
+      for (uint32_t i = 0; i < c.n_bindings; ++i) {
+        if ((c.va_mask >> i) & 1) buffers[i] = va_buffer_;  // cross-frame vertex arena
+      }
       dfn_.vkCmdBindVertexBuffers(cmd, 0, c.n_bindings, buffers.data(), c.offsets_vertices.data());
     }
     const uint32_t query = !diag_stats_draw_
@@ -6112,6 +6162,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     // binding.
     CollectBindings(true);
     DcFlush();  // draw cache: the index arena bytes written for this submission
+    VaFlush();  // cross-frame vertex arena: the copies stored for this submission
     if (used_upload_ && !coherent_upload_) {
       rex::ui::vulkan::util::FlushMappedMemoryRange(vulkan_device_, upload_memory_, upload_type_, 0,
                                                     upload_real_size_, used_upload_);
@@ -6129,6 +6180,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     ReportCoherency();  // masseffect_native_texture_coherency, every 10 s
     ReportTexturesUploads();  // masseffect_native_report_texture_uploads, every 10 s
     DcReport();  // draw cache, every 10 s
+    VaReport();  // cross-frame vertex arena and its measurement, every 10 s
     // A texture may arrive here with its bind in flight (it was prepared before this submission's first
     // Record) and that is normal; what it cannot have is its data already in the upload buffer just
     // submitted.
@@ -6155,6 +6207,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     // SendAndWait, which goes through here.
     dedupe_.NewFrame(frame_);
     DcSlotStarted(slot);  // draw cache: this slot's previous frame is complete on the GPU
+    VaSlotStarted(slot);  // cross-frame vertex arena: same rule
     sent_after_shadows_ = false;  // the post-shadow submission is once per frame
     /*
      * Diagnostic cvars are read once per frame, not per draw.
@@ -8795,6 +8848,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                 frames_verify_left_, constants_same_ ? "ON" : "off", constants_same_verify_left_,
                 dedupe_after_copy_ ? "ON" : "off", dedupe_after_verify_left_);
     DcInit();  // per-component draw cache (me_draw_cache_members.inc)
+    VaInit();  // cross-frame vertex arena (me_vertex_arena_members.inc)
     mipmaps_ = REXCVAR_GET(masseffect_native_mipmaps);
     REXLOG_INFO("[native] C3: texture mip levels (masseffect_native_mipmaps) = {}", mipmaps_ ? "YES" : "no");
     textures_mb_max_ = REXCVAR_GET(masseffect_native_textures_mb_max);
@@ -14945,6 +14999,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     uint32_t stencil[2] = {};          // RB_STENCILREFMASK for front and back
     uint32_t n_bindings = 0;
     std::array<VkDeviceSize, 16> offsets_vertices{};
+    uint32_t va_mask = 0;  // bindings from the cross-frame vertex arena (va_buffer_), not c.buffer
     bool with_indices = false;
     bool indices_from_16 = false;
     uint32_t indices = 0;
@@ -15505,6 +15560,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
 
 #include "masseffect_pipelines_cold_members.inc"  // cold-start pipeline hitches (docs/cold-start-hitches.md)
 #include "me_draw_cache_members.inc"  // per-component draw cache (docs/frame-coherence.md)
+#include "me_vertex_arena_members.inc"  // cross-frame vertex arena (docs/zero-copy-vertices.md)
 #include "masseffect_ps_descriptors_members.inc"  // pixel shader descriptor and clamp rewrites (docs/scene-shader-cost.md)
 };
 
