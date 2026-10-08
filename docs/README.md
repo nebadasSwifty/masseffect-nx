@@ -54,6 +54,7 @@ This is the path the game follows, from the Xbox 360 disc to the Switch screen:
 | [mesa.md](mesa.md) | The graphics driver and this port's changes to it |
 | [platform-notes.md](platform-notes.md) | Things about the Switch system that cost a lot of time to find out |
 | [audio-and-video.md](audio-and-video.md) | The game's audio and movies on the Switch |
+| [audio-cpu.md](audio-cpu.md) | What the audio costs on the CPU, the native audio code and how it is verified |
 | [editions.md](editions.md) | How the supported edition is identified, and how to add another |
 | [measuring.md](measuring.md) | How to measure performance on the console without being misled |
 | [performance-history.md](performance-history.md) | How the frame rate went from a few fps to about 25, step by step |
