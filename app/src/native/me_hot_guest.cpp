@@ -262,3 +262,8 @@ ME_HOT_CVAR(masseffect_hot_audio_resampler_stereo,
             "Native sub_82AAFE20 (XAudio voice resampler, stereo variant: interleaved s16 -> two float planes; NEON; not "
             "part of masseffect_hot_guest)");
 ME_HOT_HOOK_OWN(82AAFE20, masseffect_hot_audio_resampler_stereo, me::hot::n_82AAFE20)
+
+// CRT memset: the mixer clears its buffers with it (~6 % of the audio thread in combat); own cvar only, pending a
+// console A/B.
+ME_HOT_CVAR(masseffect_hot_crt_memset, "Native sub_82AC4A50 (CRT memset; not part of masseffect_hot_guest)");
+ME_HOT_HOOK_OWN(82AC4A50, masseffect_hot_crt_memset, me::hot::n_82AC4A50)
