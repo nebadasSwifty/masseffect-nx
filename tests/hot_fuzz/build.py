@@ -55,6 +55,7 @@ def main():
         for m in re.finditer(r'^// ORIG:(.*)$', txt, re.M):
             names += re.findall(r'sub_[0-9A-F]{8}', m.group(1))
         natives += re.findall(r'^// NATIVE:\s*(\S+)', txt, re.M)
+    names = list(dict.fromkeys(names))  # cases may share a callee original
     with open(os.path.join(out, 'natives_all.inc'), 'w') as f:
         for n in natives:
             f.write('#include "%s"\n' % os.path.join(ROOT, 'app', 'src', 'native', 'hot', n))

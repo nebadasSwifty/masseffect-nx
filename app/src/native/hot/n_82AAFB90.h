@@ -1,5 +1,6 @@
 // sub_82AAFB90 - XAudio voice resampler: mono 16-bit PCM -> float, linear interpolation with a 32.32 fixed-point read
 // position and a linear volume ramp (RU edition: sub_82B2D4F0, same instructions, other .rdata addresses).
+// The stereo variant (the next function, n_82AAFE20.h) shares this code: Run<true> below.
 //
 //   r3 = source (big-endian s16 samples), r5 = destination (floats, written as 16-byte vectors), r6 = output samples,
 //   r7 = voice state st:
@@ -30,6 +31,11 @@
 //    FPSCR. liveness.py: the only direct call site reads nothing after the call.
 //  * Declines (the original runs) when st+13 is 0 (the original traps) or when (s32)r6 < INT32_MIN + 8 (the counter would
 //    wrap); nothing has been modified at that point.
+//
+// Stereo variant (Run<true>): interleaved L/R s16 frames (4 bytes per source sample, src += 4 * (pos >> 32)), the left
+// channel written at dst, the right one at dst + 1024 (two planes of 256 floats). Per block the stores are R[0..3]
+// (dst+1024), R[4..7] (dst+1040), L[4..7] (dst+16), L[0..3] (dst), after all loads of the block; same gains, ramp, state
+// update and epilogue as the mono version.
 #pragma once
 
 #include <climits>
@@ -151,8 +157,10 @@ inline uint32_t Blocks(int32_t count) {
 
 }  // namespace detail
 
-inline bool Native(PPCContext& ctx, uint8_t* base) {
-  using namespace detail;
+namespace detail {
+
+template <bool kStereo>
+inline bool Run(PPCContext& ctx, uint8_t* base) {
   const uint32_t st = ctx.r7.u32;
   const int32_t count = ctx.r6.s32;
   if (Ld8(base, st + 13) == 0 || count < INT32_MIN + 8) return false;
@@ -198,41 +206,80 @@ inline bool Native(PPCContext& ctx, uint8_t* base) {
   uint32_t src = ctx.r3.u32;
   uint32_t dst = ctx.r5.u32;
   int64_t left = ctx.r6.s64;
+  // s0/s1: the two interpolation points of the (left) channel; t0/t1: the right channel (stereo only).
   alignas(16) int16_t s0[8];
   alignas(16) int16_t s1[8];
+  [[maybe_unused]] alignas(16) int16_t t0[8];
+  [[maybe_unused]] alignas(16) int16_t t1[8];
+  constexpr uint32_t kShift = kStereo ? 2 : 1;  // bytes per source sample: 2 << (kShift - 1)
   // An even source stays even (it advances by whole samples): no halfword can then start at offset 15 of a 16-byte
   // block, and each sample pair is one big-endian 32-bit load.
   const bool even = (src & 1u) == 0;
   do {
     if (even) [[likely]] {
       for (int k = 0; k < 8; ++k) {
-        const uint32_t a = src + (uint32_t(pos >> 32) << 1);
+        const uint32_t a = src + (uint32_t(pos >> 32) << kShift);
         pos += rate;
-        const uint32_t pair = Ld32(base, a);
-        s0[k] = int16_t(uint16_t(pair >> 16));
-        s1[k] = int16_t(uint16_t(pair));
+        const uint32_t p0 = Ld32(base, a);
+        s0[k] = int16_t(uint16_t(p0 >> 16));
+        if constexpr (kStereo) {
+          const uint32_t p1 = Ld32(base, a + 4);
+          t0[k] = int16_t(uint16_t(p0));
+          s1[k] = int16_t(uint16_t(p1 >> 16));
+          t1[k] = int16_t(uint16_t(p1));
+        } else {
+          s1[k] = int16_t(uint16_t(p0));
+        }
       }
     } else {
       for (int k = 0; k < 8; ++k) {
-        const uint32_t a = src + (uint32_t(pos >> 32) << 1);
+        const uint32_t a = src + (uint32_t(pos >> 32) << kShift);
         pos += rate;
-        s0[k] = Sample(base, a);
-        s1[k] = Sample(base, a + 2);
+        if constexpr (kStereo) {
+          s0[k] = Sample(base, a);
+          t0[k] = Sample(base, a + 2);
+          s1[k] = Sample(base, a + 4);
+          t1[k] = Sample(base, a + 6);
+        } else {
+          s0[k] = Sample(base, a);
+          s1[k] = Sample(base, a + 2);
+        }
       }
     }
-    src += uint32_t(pos >> 32) << 1;
+    src += uint32_t(pos >> 32) << kShift;
     pos &= 0xFFFFFFFFull;
-    const V4 a0 = S16ToF(s0), a1 = S16ToF(s0 + 4);
-    const V4 b0 = S16ToF(s1), b1 = S16ToF(s1 + 4);
     const V4 f_lo = FracToF(frac_lo), f_hi = FracToF(frac_hi);
-    const V4 v4 = Mul(a0, g_lo);
-    const V4 d_lo = Sub(b0, a0);
-    const V4 fg_lo = Mul(f_lo, g_lo);
-    const V4 v3 = Mul(a1, g_hi);
-    const V4 d_hi = Sub(b1, a1);
-    const V4 fg_hi = Mul(f_hi, g_hi);
-    StoreBE(base, dst, Add(Mul(d_lo, fg_lo), v4));
-    StoreBE(base, dst + 16, Add(Mul(d_hi, fg_hi), v3));
+    if constexpr (kStereo) {
+      const V4 r0l = S16ToF(t0), r0h = S16ToF(t0 + 4);
+      const V4 r1l = S16ToF(t1), r1h = S16ToF(t1 + 4);
+      const V4 fg_lo = Mul(f_lo, g_lo);
+      const V4 rg_lo = Mul(r0l, g_lo);
+      const V4 rd_lo = Sub(r1l, r0l);
+      const V4 rg_hi = Mul(r0h, g_hi);
+      const V4 rd_hi = Sub(r1h, r0h);
+      const V4 fg_hi = Mul(f_hi, g_hi);
+      StoreBE(base, dst + 1024, Add(Mul(rd_lo, fg_lo), rg_lo));
+      StoreBE(base, dst + 1040, Add(Mul(rd_hi, fg_hi), rg_hi));
+      const V4 l0l = S16ToF(s0), l0h = S16ToF(s0 + 4);
+      const V4 l1l = S16ToF(s1), l1h = S16ToF(s1 + 4);
+      const V4 lg_hi = Mul(l0h, g_hi);
+      const V4 ld_hi = Sub(l1h, l0h);
+      const V4 lg_lo = Mul(l0l, g_lo);
+      const V4 ld_lo = Sub(l1l, l0l);
+      StoreBE(base, dst + 16, Add(Mul(ld_hi, fg_hi), lg_hi));
+      StoreBE(base, dst, Add(Mul(ld_lo, fg_lo), lg_lo));
+    } else {
+      const V4 a0 = S16ToF(s0), a1 = S16ToF(s0 + 4);
+      const V4 b0 = S16ToF(s1), b1 = S16ToF(s1 + 4);
+      const V4 v4 = Mul(a0, g_lo);
+      const V4 d_lo = Sub(b0, a0);
+      const V4 fg_lo = Mul(f_lo, g_lo);
+      const V4 v3 = Mul(a1, g_hi);
+      const V4 d_hi = Sub(b1, a1);
+      const V4 fg_hi = Mul(f_hi, g_hi);
+      StoreBE(base, dst, Add(Mul(d_lo, fg_lo), v4));
+      StoreBE(base, dst + 16, Add(Mul(d_hi, fg_hi), v3));
+    }
     left -= 8;
     g_hi = Add(g_hi, vstep8);
     g_lo = Add(g_lo, vstep8);
@@ -267,16 +314,24 @@ inline bool Native(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-inline void Writes(const PPCContext& ctx, const uint8_t*, me::hot::Writes& w) {
+template <bool kStereo>
+inline void RunWrites(const PPCContext& ctx, me::hot::Writes& w) {
   const int32_t count = ctx.r6.s32;
   if (count < INT32_MIN + 8) return;  // declined
   w.Add(ctx.r7.u32, 52);
-  const uint64_t bytes = uint64_t(detail::Blocks(count)) * 32 + 16;
+  const uint64_t bytes = uint64_t(Blocks(count)) * 32 + 16;
   if (bytes > me::hot::Writes::kMaxBytes) {
     w.overflow = true;
     return;
   }
   w.Add(ctx.r5.u32 & ~0xFu, uint32_t(bytes));
+  if constexpr (kStereo) w.Add((ctx.r5.u32 + 1024) & ~0xFu, uint32_t(bytes));
 }
+
+}  // namespace detail
+
+inline bool Native(PPCContext& ctx, uint8_t* base) { return detail::Run<false>(ctx, base); }
+inline void Writes(const PPCContext& ctx, const uint8_t*, me::hot::Writes& w) { detail::RunWrites<false>(ctx, w); }
+
 
 }  // namespace me::hot::n_82AAFB90
