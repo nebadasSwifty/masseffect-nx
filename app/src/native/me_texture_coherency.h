@@ -44,7 +44,7 @@ inline constexpr uint32_t kPages = uint32_t(kPhysicalBytes >> kPageShift);
 inline constexpr uint64_t kSlack = 0x1000;
 
 struct Table {
-  std::atomic<bool> on{false};     // marks are only recorded while a consumer is on
+  std::atomic<uint32_t> consumers{0};  // kConsumer* bits; marks are only recorded while a consumer is on
   std::atomic<uint32_t> seq{0};    // last stamp handed out; 0 = no event yet
   std::array<std::atomic<uint32_t>, kPages> page{};
   // Measurement (cumulative; the report takes differences).
@@ -59,8 +59,23 @@ enum Source : uint32_t { kSourceBaseWrite = 0, kSourceWait, kSourceMmio, kSource
 
 inline Table g;
 
-inline void Enable(bool on) { g.on.store(on, std::memory_order_release); }
-inline bool Enabled() { return g.on.load(std::memory_order_relaxed); }
+// Consumers of the stamps. Each one switches only its own bit, so the texture recheck turning itself off (a
+// DIFFERENCE) does not stop the marks the vertex arena relies on, and the other way round. A consumer must switch
+// its bit on before it takes the first stamp it will trust, and must never trust a stamp again after its bit was off
+// (marks are lost while no consumer is on).
+inline constexpr uint32_t kConsumerTextures = 1;  // masseffect_native_texture_coherency
+inline constexpr uint32_t kConsumerVertices = 2;  // masseffect_native_vertex_arena / _measure
+
+inline void EnableConsumer(uint32_t bit, bool on) {
+  if (on) {
+    g.consumers.fetch_or(bit, std::memory_order_acq_rel);
+  } else {
+    g.consumers.fetch_and(~bit, std::memory_order_acq_rel);
+  }
+}
+// The texture recheck's switch (its historical name).
+inline void Enable(bool on) { EnableConsumer(kConsumerTextures, on); }
+inline bool Enabled() { return g.consumers.load(std::memory_order_relaxed) != 0; }
 
 // The newest stamp handed out so far. Take it BEFORE reading the bytes it will vouch for.
 inline uint32_t Current() { return g.seq.load(std::memory_order_acquire); }
