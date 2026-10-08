@@ -253,3 +253,9 @@ ME_HOT_HOOK(8264EBB0, masseffect_hot_sprite_render, me::hot::n_8264E178)
 ME_HOT_CVAR(masseffect_hot_lzo,
             "Native sub_827D3388 (LZO1X decompressor of the package streaming threads; not part of masseffect_hot_guest)");
 ME_HOT_HOOK_OWN(827D3388, masseffect_hot_lzo, me::hot::n_827D2A00)
+
+// Audio: the XAudio voice resampler (own cvar only, pending a console A/B; fuzzed on EN and RU, tests/hot_fuzz).
+ME_HOT_CVAR(masseffect_hot_audio_resampler,
+            "Native sub_82B2D4F0 (XAudio voice resampler: s16 -> float, linear interpolation, volume ramp; NEON; not part "
+            "of masseffect_hot_guest)");
+ME_HOT_HOOK_OWN(82B2D4F0, masseffect_hot_audio_resampler, me::hot::n_82AAFB90)
