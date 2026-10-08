@@ -15,7 +15,7 @@ namespace c82AAFB90 {
 constexpr uint32_t kWin = 0x40000000, kLen = 0x40000;
 uint64_t g_k1, g_k2;
 uint32_t g_kf, g_ca[4], g_cb[4];
-uint64_t n_calls = 0, n_odd = 0, n_wild = 0, n_short = 0, n_declined = 0, n_restack = 0;
+uint64_t n_calls = 0, n_odd = 0, n_wild = 0, n_short = 0, n_declined = 0, n_restack = 0, n_console = 0;
 
 void Env(uint8_t* base) {
   namespace n = me::hot::n_82AAFB90;
@@ -147,13 +147,28 @@ void gen(fuzz::Rng& r, uint8_t* base, PPCContext& ctx) {
   ctx.r5.u64 = dst;
   ctx.r6.u64 = (r.chance(0.2) ? (uint64_t(r.u32()) << 32) : 0) | uint32_t(count);
   ctx.r7.u64 = st;
+  // Console regression (2026-10-09, RU spacewalk, sub_82B2D780): 256 outputs into a 16-byte aligned buffer, r9 = r5,
+  // r4 = 0x6500, r10 = 0x64FF. The native result was right; the guard compared overlapping declared ranges wrongly
+  // (the guard replay in main.cpp now runs the console guard's algorithm on every iteration).
+  if (r.chance(0.1)) {
+    ++n_console;
+    const uint32_t d = kWin + 0x20000 + 16 * r.below(0x80);
+    ctx.r5.u64 = d;
+    ctx.r6.u64 = 0x100;
+    ctx.r9.u64 = d;
+    ctx.r4.u64 = 0x6500;
+    ctx.r10.u64 = 0x64FF;
+    me::hot::St32(base, st + 20, d);
+    me::hot::St32(base, st + 24, 256);
+  }
   Env(base);
 }
 struct Stat {
   ~Stat() {
-    std::printf("   [82AAFB90 coverage: calls=%llu odd sources=%llu wild=%llu short/negative counts=%llu declined=%llu reads kept off the stack frame=%llu]\n",
+    std::printf("   [82AAFB90 coverage: calls=%llu odd sources=%llu wild=%llu short/negative counts=%llu declined=%llu reads kept off the stack frame=%llu console regression inputs=%llu]\n",
                 (unsigned long long)n_calls, (unsigned long long)n_odd, (unsigned long long)n_wild,
-                (unsigned long long)n_short, (unsigned long long)n_declined, (unsigned long long)n_restack);
+                (unsigned long long)n_short, (unsigned long long)n_declined, (unsigned long long)n_restack,
+                (unsigned long long)n_console);
   }
 } stat;
 }  // namespace c82AAFB90

@@ -39,6 +39,23 @@ by the guard of the hot hooks. Each one has its own cvar, **default off**.
 | `ChainPhase` of the native smoother: two channels per float64x2 lane pair, up to three pairs interleaved (`app/src/native/me_audio_dsp.h`) | part of `masseffect_audio_dsp_native` (mask bit 1) | inside an existing native | x3.4 (3.19 -> 0.95 us per 6-channel call; the recompiled original is 20.6 us) | `tests/audio_dsp/run.sh`, 30000 iterations, 1-8 channels, 0 failures; console: `masseffect_audio_dsp_native = 2` |
 | Host output stage: 5.1 fold and accumulate in one NEON pass (`sequential_6_BE_fold_add_interleaved_2_LE`), NEON float -> s16 quantizer with the same peak / saturation counters (`mix_to_s16`), `sdk/include/rex/audio/conversion.h`, used by `sdk/src/audio/switch/switch_audio_system.cpp` | none (always on, same results) | host code | not measured (removes a 2 KB temporary and a second add loop per frame, and the per-sample lrint / clamp / isfinite loop) | `tests/cpu/test_audio_output.cpp` (4000 random frames incl. NaN / inf / denormals: fold outputs bit-equal, NaN-vs-NaN aside; PCM, peak and counters identical) |
 
+### Console guard finding (2026-10-09) and its fix
+
+First console run (RU, spacewalk, guard period 4096): `[hot] DIFFERENCE sub_82B2D780: memory 0x40063084 (+4 of range
+0x40063080+1040) native=0x00 original=0xb7` right after start, inputs `r5 = 0x40062c80`, `r6 = 0x100`; mono and memset guard OK.
+**Cause: the guard, not the native code.** For 256 outputs the stereo `Writes()` declared the left plane as
+`[dst & ~15, +32 * blocks + 16)` and the right plane as `[(dst + 1024) & ~15, ...)`: the extra 16 bytes made the two ranges overlap.
+`Check()` copied the native result of range 0, rolled range 0 back, and only then copied range 1: the overlapping bytes of range 1
+were already the pre-call values (here 0, the buffer cleared by memset), and the comparison with the original reported them.
+Fixes: (1) `Check()` copies every range before rolling any back (shared helpers `SaveRanges` / `RestoreRanges` /
+`FirstRangeDiff` in `me_hot_common.h`), so overlapping declared ranges are safe for every hook; (2) the resampler declares the exact
+extents (`32 * blocks` bytes per plane; one merged range when the planes overlap, more than 32 blocks). (3) The fuzzer now replays
+the guard's algorithm on every iteration of every case with the same helpers (`tests/hot_fuzz/main.cpp`, "guard replay"); with the
+old copy order it reproduces the console report on 78 % of the stereo inputs, with the fix 0 failures (EN and RU, 100000 iterations),
+and the generators include the console inputs (256 outputs into an aligned buffer, `r9 = r5`, `r4 = 0x6500`, `r10 = 0x64FF`). The
+native stereo resampler was never wrong; after the guard switched it off, the run continued on the original. Rerun the console
+check with the new build.
+
 ### Resampler details
 
 `r3` source, `r5` destination, `r6` output samples, `r7` voice state (`+0` source start, `+4` length, `+8` consumed (out), `+13` byte

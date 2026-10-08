@@ -155,6 +155,7 @@ int main(int argc, char** argv) {
       c.writes(*co, A.base, w);
       const uint64_t in_r[6] = {co->r3.u64, co->r4.u64, co->r5.u64, co->r6.u64, co->r7.u64, co->r8.u64};
       PPCContext* cn = new PPCContext(*co);
+      PPCContext* c0 = new PPCContext(*co);  // the inputs, for the guard replay
       c.orig(*co, A.base);
       const uint32_t hw_o = co->fpscr.getcsr();
       co->fpscr.setcsr(hw0);
@@ -191,6 +192,43 @@ int main(int argc, char** argv) {
           }
         }
       }
+      // Guard replay: the console guard (me_hot_guest.cpp Check) on arena B from the same inputs, with the same shared
+      // snapshot / rollback helpers: snapshot the declared ranges, native, copy its result, roll back, original, compare.
+      // Catches Writes() ranges that the guard cannot verify (2026-10-09: overlapping ranges gave a false DIFFERENCE).
+      if (diff.empty() && !w.overflow) {
+        std::memcpy(B.base + c.win_addr, init.data(), c.win_len);
+        const size_t total = me::hot::TotalBytes(w);
+        std::vector<uint8_t> before(total), native_out(total);
+        me::hot::SaveRanges(w, B.base, before.data());
+        PPCContext* g = new PPCContext(*c0);
+        g->fpscr.setcsr(hw0);
+        c.nat(*g, B.base);
+        me::hot::SaveRanges(w, B.base, native_out.data());
+        me::hot::RestoreRanges(w, B.base, before.data());
+        *g = *c0;
+        g->fpscr.setcsr(hw0);
+        c.orig(*g, B.base);
+        g->fpscr.setcsr(hw0);
+        // Same comparison as the guard, within the window and except the callee-owned stack scratch (the scope of the
+        // comparisons above).
+        size_t o = 0;
+        for (int i = 0; i < w.n && diff.empty(); ++i) {
+          for (uint32_t k = 0; k < w.r[i].len; ++k) {
+            const uint32_t a = w.r[i].addr + k;
+            const uint8_t now = *me::hot::Raw(B.base, a);
+            if (now != native_out[o + k] && !scratch(a) && a - c.win_addr < c.win_len) {
+              char buf[200];
+              std::snprintf(buf, sizeof buf, "guard replay: memory %#x (+%u of range %#x+%u) native=%02x original=%02x", a,
+                            k, w.r[i].addr, w.r[i].len, native_out[o + k], now);
+              diff = buf;
+              break;
+            }
+          }
+          o += w.r[i].len;
+        }
+        delete g;
+      }
+      delete c0;
       st.iters++;
       (co->r3.u64 == 0 ? st.r3zero : co->r3.u64 == 1 ? st.r3one : st.r3other)++;
       if (!diff.empty()) {
