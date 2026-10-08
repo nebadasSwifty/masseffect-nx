@@ -10,8 +10,10 @@
 */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -49,6 +51,29 @@ extern "C" {
 #pragma warning(pop)
 #endif
 }  // extern "C"
+
+REXCVAR_DEFINE_BOOL(audio_xma_diag, true, "Audio",
+                    "Stuck-voice diagnostics, measurement only (nothing decoded changes): logs a context that "
+                    "writes the same non-silent 256-byte block many times in a row, a context that is still "
+                    "kicked but has produced nothing for a second, and loops whose start and end are the same "
+                    "frame; counts them in the 10 s report ('XMA:' on the audio line). Hashes each block written "
+                    "(about 165 contexts/s, a few blocks each)");
+
+REXCVAR_DEFINE_BOOL(audio_xma_loop_zero_end_off, true, "Audio",
+                    "XMA loops whose end offset is below the first frame of a packet (loop_end < 32 bits, "
+                    "typically loop count 255 with start = end = 0) are treated as no loop, as on the hardware: "
+                    "no frame can start at such an offset, so the loop end is never reached. false = old "
+                    "behavior (the offset was clamped to 32, the first frame of the buffer became the loop end "
+                    "and the context repeated its first 128-sample subframe forever: the 344.5 Hz buzz)");
+
+#if defined(__SWITCH__)
+// switch_perf.cpp (in the executable): 56 = repeated-block runs, 57 = stalls of 1 s or more,
+// 58 = output blocks written by the XMA contexts.
+extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
+#define REX_XMA_PERF_ADD(id, value) RexSwitchPerfAdd((id), (value))
+#else
+#define REX_XMA_PERF_ADD(id, value) ((void)0)
+#endif
 
 // Credits for most of this code goes to:
 // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
@@ -281,6 +306,51 @@ namespace rex::audio {
 
 using stream::BitStream;
 
+namespace {
+
+/*
+ * Fork fix (audio_xma_loop_zero_end_off). XMA_CONTEXT_DATA.loop_start / loop_end are the bit offsets, from the
+ * start of the input buffer and counting the 32-bit packet headers, of the frames that hold the loop start and
+ * loop end samples (XMA_LOOP_DATA LoopStartOffset / LoopEndOffset in the XDK's xma2defs.h); loop_count 255 is
+ * XAUDIO2_LOOP_INFINITE / XMA_INFINITE_LOOP, 0 is no loop. A frame never starts inside a packet header, so an end
+ * offset below 32 matches no frame and the hardware never takes that loop. ME1's voices program loop count 255
+ * with start = end = 0 on ordinary sounds (XAudio2 loops a whole buffer by resubmitting it: several of those
+ * contexts show both input buffers valid with the same packet count). Upstream Xenia clamps the offsets to 32,
+ * which turns the first frame of every buffer into the loop end: canary (UpdateLoopStatus before the decode)
+ * only cuts that frame to loop_subframe_end + 1 subframes, but this fork jumps back after decoding the loop end
+ * frame without advancing, so it decoded frame 0 and emitted its first subframe forever.
+ *
+ * Returns whether the context has an active loop; *loop_end gets the end offset to compare with the read offset.
+ */
+bool ActiveLoopEnd(const XMA_CONTEXT_DATA& data, uint32_t* loop_end) {
+  if (data.loop_count == 0) {
+    return false;
+  }
+  if (data.loop_end < XmaContext::kBitsPerPacketHeader && REXCVAR_GET(audio_xma_loop_zero_end_off)) {
+    return false;
+  }
+  *loop_end = std::max(XmaContext::kBitsPerPacketHeader, uint32_t(data.loop_end));
+  return true;
+}
+
+// audio_xma_diag: once per context and sound (the decoder state reset clears it), at most 50 lines per run.
+void NoteLoopDisabled(uint32_t context, const XMA_CONTEXT_DATA& data, bool* reported) {
+  if (*reported || !REXCVAR_GET(audio_xma_diag) || data.loop_count == 0 ||
+      data.loop_end >= XmaContext::kBitsPerPacketHeader || !REXCVAR_GET(audio_xma_loop_zero_end_off) ||
+      data.input_buffer_read_offset != XmaContext::kBitsPerPacketHeader) {
+    return;
+  }
+  *reported = true;
+  static std::atomic<uint32_t> lines{0};
+  if (lines.fetch_add(1, std::memory_order_relaxed) < 50) {
+    REXLOG_INFO("[xma] loop off: context {} has loop count {} with start {} end {} (below the first frame): "
+                "decoded as no loop (audio_xma_loop_zero_end_off); the old path would loop frame 0 here",
+                context, uint32_t(data.loop_count), uint32_t(data.loop_start), uint32_t(data.loop_end));
+  }
+}
+
+}  // namespace
+
 const uint32_t XmaContext::kBitsPerPacketHeader;
 const uint32_t XmaContext::kOutputMaxSizeBytes;
 
@@ -352,9 +422,27 @@ void XmaContext::NoteProduction(bool produced, uint8_t reason, const XMA_CONTEXT
       in_silence_ = true;
       silence_from_ = now;
       passed_silence_ = 0;
+      stall_reported_ = false;
     }
     ++passed_silence_;
     silence_reason_ = reason;
+    // audio_xma_diag: the game still kicks this context (it expects PCM) but nothing has come out for
+    // a second. While that lasts the voice reading this context may keep rendering its last block,
+    // which is a constant buzz at sample_rate / 128 (344.5 Hz for 44.1 kHz). Once per silence.
+    if (!stall_reported_ && REXCVAR_GET(audio_xma_diag) && now - silence_from_ >= std::chrono::seconds(1)) {
+      stall_reported_ = true;
+      REX_XMA_PERF_ADD(57, 1);
+      static std::atomic<uint32_t> stall_lines{0};
+      if (stall_lines.fetch_add(1, std::memory_order_relaxed) < 100) {
+        char state[512];
+        DescribeState(data, state, sizeof(state));
+        REXLOG_INFO("[xma] stall: context {} kicked {} times in {} ms without producing (last reason {}: 1 flush "
+                    "only, 2 no input, 3 no progress, 4 error); {}",
+                    id_, passed_silence_,
+                    int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - silence_from_).count()),
+                    reason, state);
+      }
+    }
     return;
   }
   if (!in_silence_) {
@@ -368,6 +456,67 @@ void XmaContext::NoteProduction(bool produced, uint8_t reason, const XMA_CONTEXT
                 "loops {})",
                 id_, ms, passed_silence_, silence_reason_, uint32_t(data.input_buffer_0_valid),
                 uint32_t(data.input_buffer_1_valid), uint32_t(data.current_buffer), uint32_t(data.loop_count));
+  }
+}
+
+void XmaContext::DescribeState(const XMA_CONTEXT_DATA& data, char* out, size_t size) const {
+  std::snprintf(out, size,
+                "rate id %u, %s, inputs %u%u (packets %u/%u), current buffer %u, read offset %u bits, output "
+                "valid %u, blocks %u (read %u, write %u), padding %u, subframe decode count %u, loop count %u "
+                "start %u end %u subframe skip %u end %u, error %u, pending subframes %u",
+                uint32_t(data.sample_rate), data.is_stereo ? "stereo" : "mono",
+                uint32_t(data.input_buffer_0_valid), uint32_t(data.input_buffer_1_valid),
+                uint32_t(data.input_buffer_0_packet_count), uint32_t(data.input_buffer_1_packet_count),
+                uint32_t(data.current_buffer), uint32_t(data.input_buffer_read_offset),
+                uint32_t(data.output_buffer_valid), uint32_t(data.output_buffer_block_count),
+                uint32_t(data.output_buffer_read_offset), uint32_t(data.output_buffer_write_offset),
+                uint32_t(data.output_buffer_padding), uint32_t(data.subframe_decode_count),
+                uint32_t(data.loop_count), uint32_t(data.loop_start), uint32_t(data.loop_end),
+                uint32_t(data.loop_subframe_skip), uint32_t(data.loop_subframe_end), uint32_t(data.error_status),
+                uint32_t(current_frame_remaining_subframes_));
+}
+
+/*
+ * Fork addition (audio_xma_diag), measurement only. The 2026-10-08 captures carry a constant comb at
+ * exactly 44100/128 Hz: one 128-sample block of a 44.1 kHz mono voice repeated for tens of seconds.
+ * If this decoder is what writes the same block again and again, it shows here: a run of identical,
+ * non-silent 256-byte blocks in one context. If it never fires while the comb is audible, the repeat
+ * happens in the game's voice (it re-reads a block we did not refresh): look at the "[xma] stall" lines.
+ */
+void XmaContext::NoteBlocksWritten(const uint8_t* blocks, uint32_t count, const XMA_CONTEXT_DATA& data) {
+  REX_XMA_PERF_ADD(58, count);
+  for (uint32_t b = 0; b < count; ++b) {
+    const uint8_t* block = blocks + size_t(b) * kOutputBytesPerBlock;
+    uint64_t hash = 1469598103934665603ull;  // FNV-1a over 64-bit words
+    uint64_t any = 0;
+    for (uint32_t i = 0; i < kOutputBytesPerBlock; i += 8) {
+      uint64_t word;
+      std::memcpy(&word, block + i, 8);
+      any |= word;
+      hash = (hash ^ word) * 1099511628211ull;
+    }
+    if (!any) {  // silence repeats legitimately
+      identical_blocks_ = 0;
+      last_block_hash_ = 0;
+      continue;
+    }
+    if (hash != last_block_hash_) {
+      last_block_hash_ = hash;
+      identical_blocks_ = 0;
+      repeat_reported_ = false;
+      continue;
+    }
+    // 16 identical blocks after the first: 2048 samples (46 ms at 44.1 kHz mono), never real audio.
+    if (++identical_blocks_ == 16 && !repeat_reported_) {
+      repeat_reported_ = true;
+      REX_XMA_PERF_ADD(56, 1);
+      static std::atomic<uint32_t> repeat_lines{0};
+      if (repeat_lines.fetch_add(1, std::memory_order_relaxed) < 100) {
+        char state[512];
+        DescribeState(data, state, sizeof(state));
+        REXLOG_INFO("[xma] repeat: context {} wrote the same non-silent block 17 times in a row; {}", id_, state);
+      }
+    }
   }
 }
 
@@ -536,6 +685,12 @@ void XmaContext::ResetDecoderState() {
   }
   raw_frame_.fill(0);
   in_silence_ = false;  // a new sound does not inherit the previous one's silence
+  stall_reported_ = false;
+  last_block_hash_ = 0;
+  identical_blocks_ = 0;
+  repeat_reported_ = false;
+  one_frame_loop_reported_ = false;
+  loop_off_reported_ = false;
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
@@ -567,12 +722,12 @@ void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
 }
 
 void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
-  if (data->loop_count == 0) {
+  uint32_t loop_end = 0;
+  if (!ActiveLoopEnd(*data, &loop_end)) {
     return;
   }
 
   const uint32_t loop_start = std::max(kBitsPerPacketHeader, data->loop_start);
-  const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
 
   if (data->input_buffer_read_offset != loop_end) {
     return;
@@ -580,6 +735,18 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
 
   data->input_buffer_read_offset = loop_start;
   loop_start_skip_pending_ = true;
+
+  // audio_xma_diag: a loop whose start frame is its end frame. Each wrap then decodes the same frame
+  // again and only subframes skip..end of it reach the output: a period of a few 128-sample blocks.
+  if (loop_start == loop_end && !one_frame_loop_reported_ && REXCVAR_GET(audio_xma_diag)) {
+    one_frame_loop_reported_ = true;
+    static std::atomic<uint32_t> loop_lines{0};
+    if (loop_lines.fetch_add(1, std::memory_order_relaxed) < 50) {
+      char state[512];
+      DescribeState(*data, state, sizeof(state));
+      REXLOG_INFO("[xma] one-frame loop: context {}; {}", id_, state);
+    }
+  }
 
   if (data->loop_count < 255) {
     data->loop_count--;
@@ -843,6 +1010,10 @@ uint32_t XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DA
   // Diagnostic (audio_dump_xma_s): the blocks as they reach the game's buffer.
   DumpXma(id(), 1, GetSampleRate(data->sample_rate), data->is_stereo ? 2 : 1,
             raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset), written);
+  if (REXCVAR_GET(audio_xma_diag)) {
+    NoteBlocksWritten(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
+                      written / kOutputBytesPerBlock, *data);
+  }
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                               ? data->output_buffer_padding
@@ -934,10 +1105,12 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   // Loop-end frame: decode it here (output limited to loop_subframe_end),
   // jump to loop_start afterwards in the next-offset step.
+  // A loop end below 32 bits matches no frame (see ActiveLoopEnd).
   bool is_loop_end_frame = false;
-  if (data->loop_count > 0) {
-    const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
+  if (uint32_t loop_end = 0; ActiveLoopEnd(*data, &loop_end)) {
     is_loop_end_frame = (data->input_buffer_read_offset == loop_end);
+  } else {
+    NoteLoopDisabled(id(), *data, &loop_off_reported_);
   }
 
   if (!data->output_buffer_block_count) {

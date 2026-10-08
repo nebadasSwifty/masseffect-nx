@@ -24,10 +24,18 @@
 #include <unordered_set>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 
 #include "native/me_native_system.h"
+
+// The Switch has no environment variables: set this in masseffect.toml instead (for example
+// masseffect_shader_dump_dir = "/switch/masseffect-nx/shader_dump"). It does the same as MASSEFFECT_SHADER_DUMP.
+REXCVAR_DEFINE_STRING(masseffect_shader_dump_dir, "", "Mass Effect",
+                      "Debug aid: write the game's shader containers (also the ones it builds at run time, e.g. menu and HUD "
+                      "shaders) into this folder; the same as the MASSEFFECT_SHADER_DUMP environment variable")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace {
 
@@ -51,7 +59,12 @@ bool g_enabled = false;
 
 void Init() {
   const char* folder = std::getenv("MASSEFFECT_SHADER_DUMP");
-  if (!folder || !*folder) return;
+  std::string from_cvar;
+  if (!folder || !*folder) {
+    from_cvar = REXCVAR_GET(masseffect_shader_dump_dir);
+    if (from_cvar.empty()) return;
+    folder = from_cvar.c_str();
+  }
   g_folder = folder;
   std::error_code ec;
   std::filesystem::create_directories(g_folder, ec);

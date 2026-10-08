@@ -17,6 +17,7 @@
 #include <thread>
 
 #include <rex/cvar.h>
+#include <rex/filesystem/block_cache.h>
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/host_path_file.h>
@@ -59,6 +60,21 @@ REXCVAR_DEFINE_INT32(masseffect_io_us_per_kb, 0, "Filesystem",
                      "emulate the Switch SD card (~100 = 13 ms per 128 KiB); 0 = off.");
 REXCVAR_DEFINE_INT32(masseffect_io_summary_s, 15, "Filesystem",
                      "How many seconds between [io] summaries (0 = never).");
+
+/*
+ * Disc swap (docs/disc-swap.md). The executable has no disc-swap logic (its execution id says disc 1 of 1 and
+ * XamGetExecutionId already reports that); the two-disc Russian repack only fills the other disc's files with
+ * placeholders. A movie the game opens (`...\Movies\<name>.bik`) that exists but is not a Bink file (such a
+ * placeholder), or whose name is listed in masseffect_disc_swap_movies, is opened as `Layer0\Movies\BWLogo.bik`
+ * instead, so the BioWare logo plays and loading goes on. A movie that does not exist is left alone: the game
+ * probes `<name>_RUS.bik` before `<name>.bik` and must keep seeing that probe fail.
+ */
+REXCVAR_DEFINE_BOOL(masseffect_skip_disc_swap, true, "Filesystem",
+                    "Movies (Movies\\*.bik) that are other-disc placeholders (not Bink) or listed in "
+                    "masseffect_disc_swap_movies are opened as Layer0\\Movies\\BWLogo.bik (docs/disc-swap.md).");
+REXCVAR_DEFINE_STRING(masseffect_disc_swap_movies, "", "Filesystem",
+                      "Comma-separated movie names (no path, no .bik, any case) that are always replaced by "
+                      "BWLogo.bik while masseffect_skip_disc_swap is on, e.g. a valid Bink 'insert disc' movie.");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -332,6 +348,17 @@ void MaybeSummaryIo(uint64_t now_us) {
       ranges.bytes_live / (1024.0 * 1024.0), ranges.cap_mb, ranges.cap_drops, ranges.low_floor,
       ranges.floor_kb, ranges.over_ceiling, ranges.sequential,
       ranges.sequential_bytes / (1024.0 * 1024.0), ranges.no_memory ? " [OFF: out of memory]" : "");
+
+  // Block cache and its ghost simulation (masseffect_io_bcache_*, docs/streaming-io.md). Nothing is
+  // printed while both are off.
+  const std::string bc_lines = rex::filesystem::block_cache::SummaryLine(period_s);
+  size_t from = 0;
+  while (from < bc_lines.size()) {
+    size_t end = bc_lines.find('\n', from);
+    if (end == std::string::npos) end = bc_lines.size();
+    REXKRNL_INFO("{}", std::string_view(bc_lines).substr(from, end - from));
+    from = end + 1;
+  }
 }
 
 // Always measured: reading the monotonic clock on Horizon is a processor register read, not a system call.
@@ -350,6 +377,64 @@ inline void NoteOpening(uint64_t us, bool ok, const std::string_view path) {
     REXKRNL_WARN("[io] SLOW: open '{}' took {:.1f} ms ({})", path, us / 1000.0,
                  ok ? "opened" : "does not exist");
   }
+}
+
+std::string LowerAscii(std::string_view s) {
+  std::string out(s);
+  for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return out;
+}
+
+// True when `name` (lower case) is in the comma-separated cvar list (spaces and quotes ignored).
+bool DiscSwapListed(const std::string_view name) {
+  const std::string list = LowerAscii(REXCVAR_GET(masseffect_disc_swap_movies));
+  size_t from = 0;
+  while (from <= list.size()) {
+    size_t end = list.find(',', from);
+    if (end == std::string::npos) end = list.size();
+    std::string_view item = std::string_view(list).substr(from, end - from);
+    while (!item.empty() && (item.front() == ' ' || item.front() == '"')) item.remove_prefix(1);
+    while (!item.empty() && (item.back() == ' ' || item.back() == '"')) item.remove_suffix(1);
+    if (item.size() > 4 && item.substr(item.size() - 4) == ".bik") item.remove_suffix(4);
+    if (!item.empty() && item == name) return true;
+    from = end + 1;
+  }
+  return false;
+}
+
+// Disc swap: the path to open instead of `path` (a movie the game just opened as `file`), or "" to keep it.
+// Only `...\Movies\<name>.bik` is considered; BWLogo itself is never replaced.
+std::string DiscSwapMovieReplacement(const std::string_view path, rex::filesystem::File* file) {
+  const std::string lower = LowerAscii(path);
+  if (lower.size() < 4 || lower.compare(lower.size() - 4, 4, ".bik") != 0) return {};
+  const size_t movies = lower.rfind("movies\\");
+  if (movies == std::string::npos || (movies != 0 && lower[movies - 1] != '\\' && lower[movies - 1] != ':')) {
+    return {};
+  }
+  const size_t name_at = movies + 7;
+  const std::string name = lower.substr(name_at, lower.size() - 4 - name_at);
+  if (name.empty() || name.find('\\') != std::string::npos || name == "bwlogo") return {};
+
+  bool replace = DiscSwapListed(name);
+  if (!replace) {
+    // Bink 1 files start with "BIK", Bink 2 with "KB2". A placeholder (junk from the other disc) does not.
+    uint8_t head[4] = {};
+    size_t got = 0;
+    if (XFAILED(file->ReadSync(std::span<uint8_t>(head, sizeof(head)), 0, &got))) return {};
+    const bool bink = got >= 3 && ((head[0] == 'B' && head[1] == 'I' && head[2] == 'K') ||
+                                   (head[0] == 'K' && head[1] == 'B' && head[2] == '2'));
+    replace = !bink;
+  }
+  if (!replace) return {};
+
+  // "D:\Layer1\Movies\X.bik" -> "D:\Layer0\Movies\BWLogo.bik" (BWLogo is a Layer0 file);
+  // "<prefix>Movies\X.bik" -> "<prefix>Movies\BWLogo.bik" when there is no LayerN component.
+  const size_t component = movies >= 2 ? lower.rfind('\\', movies - 2) : std::string::npos;
+  const size_t component_at = component == std::string::npos ? 0 : component + 1;
+  if (lower.compare(component_at, 5, "layer") == 0 && component_at + 5 < movies) {
+    return std::string(path.substr(0, component_at)) + "Layer0\\Movies\\BWLogo.bik";
+  }
+  return std::string(path.substr(0, name_at)) + "BWLogo.bik";
 }
 
 inline void NoteRead(uint64_t us, uint32_t bytes, const std::string_view path,
@@ -493,6 +578,31 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   const uint64_t io_us_end = NowUs();
   NoteOpening(io_us_end - io_us_start, XSUCCEEDED(result), target_path);
   MaybeSummaryIo(io_us_end);
+
+  // Disc swap: an other-disc placeholder movie (or a listed one) plays BWLogo.bik instead (docs/disc-swap.md).
+  // Read-only opens of existing files only; costs one 4-byte read per movie open.
+  if (XSUCCEEDED(result) && vfs_file && file_action == rex::filesystem::FileAction::kOpened &&
+      !(create_options & CreateOptions::FILE_DIRECTORY_FILE) && REXCVAR_GET(masseffect_skip_disc_swap)) {
+    const std::string replacement = DiscSwapMovieReplacement(target_path, vfs_file);
+    if (!replacement.empty()) {
+      rex::filesystem::File* replacement_file = nullptr;
+      rex::filesystem::FileAction replacement_action;
+      const X_STATUS replacement_result = REX_KERNEL_FS()->OpenFile(
+          root_entry, replacement, rex::filesystem::FileDisposition::kOpen, desired_access, false,
+          (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &replacement_file,
+          &replacement_action);
+      if (XSUCCEEDED(replacement_result) && replacement_file) {
+        REXKRNL_WARN("[disc] '{}' is an other-disc placeholder or a listed disc-swap movie: playing '{}'",
+                     target_path, replacement);
+        vfs_file->Destroy();
+        vfs_file = replacement_file;
+        file_action = replacement_action;
+      } else {
+        REXKRNL_WARN("[disc] '{}' should be replaced, but '{}' cannot be opened ({:#x}); kept as is",
+                     target_path, replacement, replacement_result);
+      }
+    }
+  }
   object_ref<XFile> file = nullptr;
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;

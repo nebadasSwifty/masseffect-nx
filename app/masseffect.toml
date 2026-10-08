@@ -4,8 +4,9 @@
 #  Copy this file to the Switch next to the NRO:
 #      sdmc:/switch/masseffect-nx/masseffect.toml
 #  It is read at startup. Every key is optional: a missing key keeps the built-in default
-#  of the code. The values below are the configuration that was measured best on a
-#  stock-clock Switch (handheld, no overclock).
+#  of the code. The values below are the configuration measured best on the Switch; the same file
+#  is shipped with the English and the Russian edition (list and sources: docs/best-config.md,
+#  "Shipped defaults 2026-10-08").
 # ============================================================================
 
 
@@ -22,6 +23,11 @@ video_mode_height = 540
 # The height is 544, not 540, so the render targets stay aligned to the Xbox 360's 32-pixel tiles.
 masseffect_scene_width = 960
 masseffect_scene_height = 544
+
+# How the smaller frame is scaled to the 1280x720 screen: "fsr" = AMD FSR 1 (edge-adaptive upscale + sharpening),
+# clearly sharper than plain "bilinear" at the same frame rate (Switch, Normandy cockpit, 2026-10-07). Needs the
+# NRO built with UPSCALE_SHADERS=ON (the default of tools/build_nro.sh); "cas" = sharpening only.
+present_effect = "fsr"
 
 # Full-screen quads whose vertex positions are packed (16_16, 8_8_8_8, ...) count as proven overwrites, so the
 # EDRAM content under them is not converted first (about 3 ms per frame less GPU time in cutscenes at 960x544,
@@ -62,10 +68,64 @@ masseffect_audio_dsp_native = 1
 # input_xbox_layout = false
 
 # Pass the game's rumble to the controllers. Off by default.
-# input_rumble = false
+input_rumble = true
+
+# Touch screen (experimental, handheld only: docked the panel reports no touches). Details and tuning:
+# docs/touchscreen.md. All keys below show the code defaults; input_touch = false switches everything off.
+#  - Camera: a one-finger drag turns the camera like the right stick. The finger speed sets the stick: full
+#    stick at 1000 / sensitivity pixels per second. The physical right stick wins.
+#  - Dialogue: a short, still tap on an option text in the bottom band (default y 580..700) picks the slot:
+#    side = left/right of the wheel center x, row = y against row1/row2. The left stick is pushed to that slot for
+#    input_touch_dialogue_stick_ms, then A is held as well for input_touch_dialogue_a_ms. A touch in the band that
+#    moves more than input_touch_tap_max_move becomes a camera drag. The code cannot tell
+#    whether a conversation is open: outside conversations the same tap is a short left-stick nudge plus A
+#    (A can "use" a nearby object). input_touch_dialogue_confirm = false sends only the stick push.
+#  - Coordinates are 1280x720 screen pixels (the touch panel's own space, whatever the render resolution).
+# input_touch = true
+# input_touch_camera = true
+# input_touch_camera_sensitivity = 2.5
+# input_touch_camera_deadzone = 20.0          # finger pixels per second ignored
+# input_touch_camera_min_stick = 8000         # first stick value past the deadzone (skips the game's deadzone)
+# input_touch_camera_smoothing_ms = 40.0      # 0 = raw finger speed
+# input_touch_camera_invert_y = false         # default: drag up = look up
+# input_touch_dialogue = true
+# input_touch_dialogue_confirm = true         # false = tap only aims the stick, press A yourself
+# input_touch_dialogue_left = 0               # tap band, from a console screenshot of the wheel
+# input_touch_dialogue_top = 580
+# input_touch_dialogue_right = 1280
+# input_touch_dialogue_bottom = 700
+# input_touch_dialogue_x = 650                # wheel center x: right of it = reply slots, left = investigate etc.
+# input_touch_dialogue_row1 = 618             # y < row1 = upper slot
+# input_touch_dialogue_row2 = 653             # y < row2 = middle slot, else lower
+# input_touch_dialogue_diagonal_deg = 50.0    # stick angle sent for the upper/lower slots (+-50 / +-130)
+# input_touch_tap_max_ms = 500
+# input_touch_tap_max_move = 70
+# input_touch_dialogue_stick_ms = 150
+# input_touch_dialogue_a_ms = 100
+# input_touch_debug = false                   # log every touch and dialogue tap
 
 # Mute audio output.
 # audio_mute = false
+
+# XMA loops with loop start = end = 0 play as "no loop" (fixes a constant 344.5 Hz buzz that replaced music,
+# Citadel 2026-10-08). On by default in the code.
+# audio_xma_loop_zero_end_off = true
+
+
+# ----------------------------------------------------------------------------
+#  Nintendo Switch presentation
+# ----------------------------------------------------------------------------
+# Texts say "Nintendo Switch" (storage, users, HOME button, L/R/ZL/ZR) instead of Xbox 360 wording.
+masseffect_switch_text = true
+# Decryption mini-game: the face-button diamond in the Nintendo Switch layout (X top, Y left, A right, B bottom).
+masseffect_switch_minigame_layout = true
+
+
+# ----------------------------------------------------------------------------
+#  Downloadable content (docs/dlc.md)
+# ----------------------------------------------------------------------------
+# Off here: the installer sets it to true when it packs DLC from your own files.
+dlc_enable = false
 
 
 # ----------------------------------------------------------------------------
@@ -76,6 +136,11 @@ masseffect_audio_dsp_native = 1
 
 # Keep the synchronous logger: on Horizon a starved async writer can fill its queue and block the ring thread.
 log_async = false
+# The log file from a dedicated writer thread through a lock-free in-memory ring, so no game, render or ring thread
+# touches the SD card; a full ring drops lines (counted in the log). Feros, 2026-10-08 (with heap_free_bitmap):
+# 289 -> 300 Swaps per 10 s, frames over 100 ms 39 -> 4. The writer runs at Horizon priority 0x2C
+# (log_nonblocking_priority, below the audio thread).
+log_nonblocking = true
 
 
 # ----------------------------------------------------------------------------
@@ -126,6 +191,21 @@ masseffect_hot_guest = true
 masseffect_hot_guard_calls = 256
 masseffect_hot_guard_period = 4096
 
+# --- Ring thread CPU per draw (exact, self-checking; docs/ring-cpu-per-draw.md rounds 1 and 2) ---
+# Heavy walk windows 14.1k -> 17.1k draws per second, no verification mismatch on the console.
+masseffect_native_fingerprints_skip_unused_sample = true
+masseffect_native_load_memo = true
+masseffect_native_load_memo_generation = true
+masseffect_native_edram4_pair_keys = true
+masseffect_native_texture_spread_phase = true
+masseffect_native_edram4_sync_lean = true
+# The periodic VS/PS identity mismatch lines at info instead of warn level (warn flushes the log on the ring thread).
+masseffect_native_mismatch_log_info = true
+
+# --- Guest memory ---
+# BaseHeap::AllocRange searches a free-page bitmap instead of the page table (Feros 2026-10-08, see log_nonblocking).
+heap_free_bitmap = true
+
 # --- EDRAM emulation and image correctness ---
 # Mode 4: depth and color share one emulated EDRAM ownership map.
 masseffect_native_edram_alias_mode = 4
@@ -137,6 +217,25 @@ masseffect_native_reuse_alloc_resolved = true
 masseffect_native_logical_resolved_size = true
 # EDRAM conversions between 32-bit color views as fragment passes instead of compute dispatches.
 masseffect_native_conversion_frag = true
+# The float constants a vertex shader compares (MaxBoneInfluences, ScreenAlignment) folded into the vertex shader per
+# pipeline (exact; cockpit GPU draws ~15.8 -> ~12 ms per frame; docs/vertex-shader-specialization.md).
+masseffect_native_fold_vs_constants = true
+# UE3's scene restore before each shadowed light renders straight into the 7e3 image (bit-exact), no f2 -> f3
+# conversion (GPU busy ~22 -> ~20 ms per frame in the cockpit; docs/vulkan-frame-time.md s.8).
+masseffect_native_restore_into_7e3 = true
+# A resolved texture whose guest bytes the CPU rewrote since the resolve (memory reused for a new Scaleform glyph page)
+# is taken from guest memory again: fixes missing letters in terminal text, dialogues and the autosave label
+# (Citadel 2026-10-08). On by default in the code.
+# masseffect_native_resolved_cpu_overwrite = true
+# UE3 motion blur on long frames (docs/image-defects-feros.md 3.7): 4 = a frame longer than
+# masseffect_native_motion_blur_cut_ms (60) is treated as a camera cut, as UE3 does on cuts, so a hitch no longer
+# smears the picture (characters "vanishing" on camera turns); normal frames are unchanged. 0 = the game's constants.
+masseffect_native_motion_blur_frame_fix = 4
+
+# --- Frame pacing ---
+# A frame that misses its VBlank is shown at once instead of at the next VBlank (the game's threshold is 10 % of a scan);
+# on-time frames still wait, the 30 fps cap stays. Heavy walk windows 25.8 -> 27.7 fps (docs/frame-handshake.md P1).
+masseffect_present_immediate_threshold = 100
 
 # --- Memory and caches ---
 # Texture cache budget in MB (older textures are released above it).
@@ -145,6 +244,18 @@ masseffect_native_textures_mb_max = 128
 masseffect_native_texture_interval_max = 4
 # Recreate the Vulkan pipelines of earlier sessions in the background at startup (list in cache/).
 masseffect_native_pipelines_prewarm = true
+# Prewarm list shipped with the build (pipeline keys, vertex formats and shader fingerprints of this edition's shader
+# package; no game data). Its records are added to the list above, so a first (cold) run compiles them in the
+# background too: Citadel plaza and spacewalk had no 0.5-1.1 s compile hitch left (docs/best-config.md). Relative to
+# the NRO folder; an installed NSP reads it from its RomFS (a copy in its SD folder wins). A missing file only logs a
+# warning. The installer puts the edition's file here under this name.
+masseffect_native_pipelines_shipped_list = "masseffect_prewarm_list.bin"
+# Two threads compile the prewarm list (the second one on a core other than the ring's): the shipped list is done in
+# about half the time.
+masseffect_native_pipelines_prewarm_threads = 2
+# Pipelines specialized by folded constants are compiled in the background; the draw uses the generic pipeline
+# (same image) until they are ready, so folding no longer adds compiles to the frame (docs/cold-start-hitches.md B).
+masseffect_native_pipelines_async_specialized = 2
 # Per-stage shader cache keys in NVK; needs the patched driver from mesa/.
 masseffect_nvk_cache_per_stage = true
 
@@ -157,9 +268,22 @@ masseffect_shadows_no_vegetation = false
 masseffect_native_pass_shadows_no_load = false
 masseffect_native_lazy_front = false
 masseffect_native_skip_invisibles = false
-masseffect_native_cache_textures_between_frames = false
-masseffect_native_invalidate_textures_each_copy = true
-masseffect_native_textures_binding_thread = false
+# Ring CPU (2026-10-08 Eden Prime cutscene, user run 2: about +10 % in the heaviest windows, image unchanged):
+masseffect_native_cache_textures_between_frames = true
+masseffect_native_texture_inval_by_address = true
+masseffect_native_constants_same_content = true
+masseffect_native_dedupe_hash_after_copy = true
+# Occlusion boxes are not recorded: query mode 0 answers "visible" without measuring them (175-319 per frame there).
+masseffect_native_query_skip_boxes = true
+# Texture recheck only on coherency events (stayed on there: 2.8 GB per 10 s not hashed).
+masseffect_native_texture_coherency = 1
+# Texture caches are dropped only when a resolved texture is created or changes, not on every copy (ring CPU round 2;
+# the first masseffect_native_texture_copy_verify = 4096 cache hits across a copy are still compared with the old path).
+masseffect_native_invalidate_textures_each_copy = false
+masseffect_native_textures_binding_thread = true
+# Indirect-call hot-miss cache in front of the dispatch table (2026-10-08: 67 M hits verified, 0 differences;
+# indirect::Find was ~1.4 % of the game thread in the location tour).
+indirect_dispatch_hot_cache = true
 masseffect_native_textures_pool = false
 
 
@@ -179,3 +303,24 @@ masseffect_native_textures_pool = false
 # Never time a run with the trace on.
 # masseffect_io_trace_record = true
 # masseffect_io_preload = true
+
+
+# ----------------------------------------------------------------------------
+#  Streaming read cache (optional, off by default; see docs/streaming-io.md)
+# ----------------------------------------------------------------------------
+# During play the game rereads the same 128 KB pieces of its texture packages from the SD card. The ghost only
+# measures (it stores no data) the hit rate caches of 32-512 MB would get; the cache keeps 32 KB blocks in RAM up to
+# its cap; the read-ahead turns several 128 KB SD reads into one. Under test, one step at a time.
+# masseffect_io_bcache_ghost = true
+# masseffect_io_bcache_mb = 128
+# masseffect_io_bcache_readahead_kb = 512
+# masseffect_io_bcache_async = true
+
+
+# ----------------------------------------------------------------------------
+#  Experimental: keep off (not proven on the console yet)
+# ----------------------------------------------------------------------------
+# Guest memory window mapped for 2 MB blocks (TLB benchmark faster; no frame-rate result yet).
+# guest_memory_large_pages = 0
+# Velocity buffer (k_16_16) emulation mode (docs/image-defects-feros.md section 3).
+# masseffect_native_velocity_16_16 = 0

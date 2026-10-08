@@ -35,8 +35,10 @@ This is the path the game follows, from the Xbox 360 disc to the Switch screen:
 | Port another Xbox 360 game | [porting-another-game.md](porting-another-game.md), then [native-renderer.md](native-renderer.md), [shaders.md](shaders.md) and [platform-notes.md](platform-notes.md) |
 | Make the port faster | [measuring.md](measuring.md) first, then [performance-history.md](performance-history.md), [optimization-paths.md](optimization-paths.md), [toolchain.md](toolchain.md) and [mesa.md](mesa.md) |
 | Shorten the start-up time | [startup.md](startup.md) (timeline, ranked options, the read trace and preload) |
+| Understand the SD reads during play | [streaming-io.md](streaming-io.md) (who reads, what is reread, the block cache) |
 | Know what is broken or unproven | [known-issues.md](known-issues.md) |
 | Support another edition of the game | [editions.md](editions.md) |
+| Install the game as one NSP (program + your data in RomFS) | [full-nsp.md](full-nsp.md) (experimental: packer, packaged mode, keys, sizes, browser plan) |
 | Understand a word | [glossary.md](glossary.md) |
 
 ## All documents
@@ -57,6 +59,7 @@ This is the path the game follows, from the Xbox 360 disc to the Switch screen:
 | [performance-history.md](performance-history.md) | How the frame rate went from a few fps to about 25, step by step |
 | [optimization-paths.md](optimization-paths.md) | Every optimization idea tried or considered, by area, with its result and setting |
 | [known-issues.md](known-issues.md) | What is not working, not finished or not proven, with the evidence |
+| [streaming-io.md](streaming-io.md) | The game's package reads during play, why they are reread, and the RAM block cache for them |
 
 Outside this folder: [../README.md](../README.md) (how to install and use the port), [../shaders/README.md](../shaders/README.md)
 (the shader pipeline and file formats), [../mesa/README.md](../mesa/README.md) (the driver patch table),

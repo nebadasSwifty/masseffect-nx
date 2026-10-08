@@ -16,5 +16,9 @@ if ! gh release view "$TAG" >/dev/null 2>&1; then
   gh release create "$TAG" --verify-tag --draft --title "Mass Effect NX $TAG" --notes-file docs/release-notes.md
 fi
 gh release upload "$TAG" "$NRO#masseffect-nx.nro" --clobber
+# The editions' shipped pipeline prewarm lists (installer/config.js editions[].prewarmList); optional.
+for list in app/prewarm/masseffect_prewarm_list-*.bin; do
+  [[ ! -f "$list" ]] || gh release upload "$TAG" "$list" --clobber
+done
 gh workflow run release.yml --ref main -f tag="$TAG" -f prerelease=false
 echo "Actions will build the NSP and publish: https://github.com/nebadasSwifty/masseffect-nx/actions"

@@ -14,10 +14,21 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 #include <rex/math.h>
 
 namespace rex::filesystem {
+
+namespace {
+// Every file of a container reads through the same FILE* with a seek + fread pair. Mounted DLC
+// packages are read by several guest threads at once (streaming, audio), so the pair must not
+// interleave. One lock for all containers: they are only used for DLC and installs.
+std::mutex& StfsReadLock() {
+  static std::mutex lock;
+  return lock;
+}
+}  // namespace
 
 StfsContainerFile::StfsContainerFile(uint32_t file_access, StfsContainerEntry* entry)
     : File(file_access, entry), entry_(entry) {}
@@ -38,6 +49,7 @@ X_STATUS StfsContainerFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offs
   uint8_t* p = buffer.data();
   size_t remaining_length = std::min(buffer.size(), entry_->size() - byte_offset);
 
+  std::lock_guard<std::mutex> guard(StfsReadLock());
   *out_bytes_read = 0;
   for (size_t i = 0; i < entry_->block_list().size(); i++) {
     auto& record = entry_->block_list()[i];

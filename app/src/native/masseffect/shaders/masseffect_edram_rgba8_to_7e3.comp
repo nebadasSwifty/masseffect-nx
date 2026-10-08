@@ -21,11 +21,20 @@ layout(push_constant) uniform Constants {
   uint target_msaa_x, target_msaa_y;
 } c;
 
-// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
-// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
-// floors to the exact integer one.
+// EDRAM address math without IMUL (docs/edram-shader-imul.md; exactness: tests/cpu/test_native_edram_imul_free.cpp).
+// NAK on SM50 emits the microcoded, variable-latency IMUL for every 32-bit multiply that is not by a power of two,
+// IMUL.HI for a division by a constant and a long IMUL sequence for a division by a register. Integers below 2^24
+// are exact in float, so these use FMUL/FFMA and conversions instead:
+// - DivPitch: tile < 2^16, 1 <= pitch <= 2048; the fraction of (tile + 0.5) / pitch is at least 0.5 / pitch away
+//   from an integer, far more than the error of the reciprocal, so the float quotient floors to the integer one;
+// - MulSmall: a * b < 2^24 (row * pitch, quotient * pitch);
+// - Div80 / Mod80: x < 2^20; Mul80 is two shifts and an add.
 uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
-uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+uint MulSmall(uint a, uint b) { return uint(float(a) * float(b)); }
+uint ModPitch(uint tile, uint pitch) { return tile - MulSmall(DivPitch(tile, pitch), pitch); }
+uint Div80(uint x) { return uint(fma(float(x), 0.0125, 0.00625)); }
+uint Mul80(uint x) { return (x << 6u) + (x << 4u); }
+uint Mod80(uint x) { return x - Mul80(Div80(x)); }
 
 float From7e3(uint f10) {
   f10 &= 0x3FFu;
@@ -51,7 +60,7 @@ vec4 Unpack32(uint word) {
 }
 
 uint ReadWord(uint tile, uint word_local) {
-  uvec2 p = uvec2(ModPitch(tile, c.pitch_tiles_source) * 80u + word_local,
+  uvec2 p = uvec2(Mul80(ModPitch(tile, c.pitch_tiles_source)) + word_local,
                   DivPitch(tile, c.pitch_tiles_source) * 16u + gl_GlobalInvocationID.y % 16u) >> uvec2(c.source_msaa_x, c.source_msaa_y);
   if (any(greaterThanEqual(p, c.source_size))) return 0u;
   uvec4 bytes = uvec4(round(imageLoad(source, ivec2(p)) * 255.0));
@@ -64,14 +73,13 @@ void main() {
   if ((q.x & ((1u << (c.target_64bpp + c.target_msaa_x)) - 1u)) != 0u ||
       (q.y & ((1u << c.target_msaa_y) - 1u)) != 0u) return;
   bool range = c.tiles_count != 0u;
-  if (range && (q.y >= 16u || q.x >= c.tiles_count * 80u)) return;
-  uint relative = q.x / 80u;
-  uint word_local = q.x % 80u;
+  if (range && (q.y >= 16u || q.x >= Mul80(c.tiles_count))) return;
+  uint relative = Div80(q.x);
+  uint word_local = Mod80(q.x);
   uint tile_target = range ? c.tile_target_start + relative
-                            : (q.y / 16u) * c.pitch_tiles_target + relative;
+                            : MulSmall(q.y >> 4u, c.pitch_tiles_target) + relative;
   uint tile_source = range ? c.tile_source_start + relative : tile_target;
-  uint tile_width_target = 80u >> c.target_64bpp;
-  uvec2 p = uvec2(ModPitch(tile_target, c.pitch_tiles_target) * tile_width_target +
+  uvec2 p = uvec2((Mul80(ModPitch(tile_target, c.pitch_tiles_target)) >> c.target_64bpp) +
                       (word_local >> c.target_64bpp),
                   DivPitch(tile_target, c.pitch_tiles_target) * 16u + q.y % 16u) >> uvec2(c.target_msaa_x, c.target_msaa_y);
   if (any(greaterThanEqual(p, c.target_size))) return;

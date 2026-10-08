@@ -25,11 +25,20 @@ layout(push_constant) uniform Constants {
   uint stencil_mask;
 } c;
 
-// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
-// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
-// floors to the exact integer one.
+// EDRAM address math without IMUL (docs/edram-shader-imul.md; exactness: tests/cpu/test_native_edram_imul_free.cpp).
+// NAK on SM50 emits the microcoded, variable-latency IMUL for every 32-bit multiply that is not by a power of two,
+// IMUL.HI for a division by a constant and a long IMUL sequence for a division by a register. Integers below 2^24
+// are exact in float, so these use FMUL/FFMA and conversions instead:
+// - DivPitch: tile < 2^16, 1 <= pitch <= 2048; the fraction of (tile + 0.5) / pitch is at least 0.5 / pitch away
+//   from an integer, far more than the error of the reciprocal, so the float quotient floors to the integer one;
+// - MulSmall: a * b < 2^24 (row * pitch, quotient * pitch);
+// - Div80 / Mod80: x < 2^20; Mul80 is two shifts and an add.
 uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
-uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+uint MulSmall(uint a, uint b) { return uint(float(a) * float(b)); }
+uint ModPitch(uint tile, uint pitch) { return tile - MulSmall(DivPitch(tile, pitch), pitch); }
+uint Div80(uint x) { return uint(fma(float(x), 0.0125, 0.00625)); }
+uint Mul80(uint x) { return (x << 6u) + (x << 4u); }
+uint Mod80(uint x) { return x - Mul80(Div80(x)); }
 
 void main() {
   // Only D24S8(0), D24FS8(1), or half-range D24FS8(257). Metadata cannot
@@ -54,10 +63,10 @@ void main() {
   // Destination rows are physical words. Vulkan2x top guest0=host1,
   // bottom guest1=host0. Preserve alternation instead of selecting one sample.
   uvec2 physical = pixel;
-  uint tile = (physical.y / 16u) * c.pitch_tiles_target + physical.x / 80u;
+  uint tile = MulSmall(physical.y >> 4u, c.pitch_tiles_target) + Div80(physical.x);
   if (tile < c.tile_target_start || tile - c.tile_target_start >= c.tiles_count) discard;
   uint source_tile = c.tile_source_start + tile - c.tile_target_start;
-  uvec2 source_physical = uvec2(ModPitch(source_tile, c.pitch_tiles_source) * 80u + physical.x % 80u,
+  uvec2 source_physical = uvec2(Mul80(ModPitch(source_tile, c.pitch_tiles_source)) + Mod80(physical.x),
                                DivPitch(source_tile, c.pitch_tiles_source) * 16u + physical.y % 16u);
   ivec2 source_pixel = ivec2(source_physical.x, source_physical.y / 2u);
   if (any(greaterThanEqual(uvec2(source_pixel), c.source_size))) discard;

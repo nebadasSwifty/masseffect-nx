@@ -42,6 +42,7 @@ set(REXSYSTEM_SOURCES
     map_parser.cpp
     module.cpp
     function_dispatcher.cpp
+    indirect_dispatch.cpp
     gpu_plugin_loader.cpp
     thread.cpp
     thread_state.cpp

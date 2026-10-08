@@ -4,8 +4,9 @@
 #   installer/tools/stage_site.sh <out dir> [--wasm <dir>] [--releases <dir>]
 #
 #   --wasm <dir>      the Emscripten outputs (scan/hlsl/pack/dxc_web .mjs + .wasm). Default: installer/wasm
-#   --releases <dir>  the release assets (*.nro) to publish next to the page; a manifest.json with their size and
-#                     SHA-256 is written. Default: none (the page then reports that no build is published).
+#   --releases <dir>  the release assets (*.nro, *.nsp, the editions' masseffect_prewarm_list-*.bin) to publish next
+#                     to the page; a manifest.json with their size and SHA-256 is written. Default: none (the page
+#                     then reports that no build is published).
 #
 # The page itself needs no build step: this only copies files and generates releases/manifest.json.
 set -eu
@@ -60,7 +61,7 @@ echo "staged $n wasm files from $wasm"
 [ "$n" -eq 8 ] || echo "WARNING: expected 8 wasm files (scan, hlsl, pack, dxc_web: .mjs + .wasm); the page will report the missing ones" >&2
 
 if [ -n "$releases" ]; then
-  for asset in "$releases"/*.nro "$releases"/*.nsp; do
+  for asset in "$releases"/*.nro "$releases"/*.nsp "$releases"/masseffect_prewarm_list-*.bin; do
     [ ! -f "$asset" ] || cp "$asset" "$out/releases/"
   done
   # Settings must belong to the same release as the executable.
@@ -76,6 +77,11 @@ if [ "$strict" -eq 1 ]; then
     [ -s "$out/releases/$asset" ] || { echo "error: missing release asset $asset" >&2; exit 1; }
   done
   [ -s "$releases/masseffect.toml" ] || { echo 'error: missing release settings' >&2; exit 1; }
+  # The editions' prewarm lists (prewarmList: '...') are optional: the page installs without a missing one.
+  edition_lists=$(sed -nE "s/^[[:space:]]*prewarmList: '(masseffect_prewarm_list-[^']+\.bin)',.*/\1/p" "$(dirname "$0")/../config.js" | sort -u)
+  for asset in $edition_lists; do
+    [ -s "$out/releases/$asset" ] || echo "WARNING: release asset $asset is missing: that edition installs without its prewarm list" >&2
+  done
 fi
 cp "$out/masseffect.toml" "$out/releases/.toml-for-manifest"
 python3 - "$out" "${RELEASE_TAG:-}" <<'PY'
@@ -89,7 +95,7 @@ for name in sorted(os.listdir(rel)):
         data = open(path, "rb").read()
         assets["masseffect.toml"] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         os.remove(path)
-    elif name.endswith((".nro", ".nsp")):
+    elif name.endswith((".nro", ".nsp")) or (name.startswith("masseffect_prewarm_list-") and name.endswith(".bin")):
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):

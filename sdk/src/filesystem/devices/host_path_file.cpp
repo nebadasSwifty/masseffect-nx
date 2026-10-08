@@ -12,6 +12,7 @@
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
+#include <rex/filesystem/block_cache.h>
 #include "startup_trace.h"
 
 #include <algorithm>
@@ -622,6 +623,11 @@ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
       (REXCVAR_GET(masseffect_io_cache_mb) > 0 || REXCVAR_GET(masseffect_io_ranges_mb) > 0)) {
     cache_id_ = IdOfPath(entry->path());
   }
+  // Block cache for streamed packages (block_cache.cpp, docs/streaming-io.md). Same read-only
+  // condition: saves and profiles never get an id. 0 when the cache and its ghost are off.
+  if (file_handle_ && entry && entry->is_read_only() && !wants_write) {
+    bcache_id_ = block_cache::Register(entry->path(), entry->host_path(), entry->size());
+  }
   // Startup trace / preload (startup_trace.cpp): same read-only condition, so saves and profiles
   // are never recorded or served from the preload store.
   if (file_handle_ && entry && entry->is_read_only() && !wants_write) {
@@ -800,6 +806,19 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                                       std::memcmp(check.data(), buffer.data(), n) == 0);
     }
     return X_STATUS_SUCCESS;
+  }
+  /*
+   * Block cache (masseffect_io_bcache_mb, off by default). Before the window and the range cache:
+   * it covers every request size up to masseffect_io_bcache_max_request_kb, and when it answers
+   * nothing else runs. When it does not answer (off, ghost only, too large, past the end of the
+   * file, SD error) the guest's buffer is filled by the usual path below as if it had not existed.
+   */
+  if (bcache_id_ && request) {
+    size_t served = 0;
+    if (block_cache::Read(bcache_id_, file_handle_.get(), buffer, byte_offset, &served)) {
+      *out_bytes_read = served;
+      return X_STATUS_SUCCESS;
+    }
   }
   if (active_window_ && request && request <= window_size_ / kSubmissionMaxFraction) {
     // The request falls entirely within what is already in RAM.

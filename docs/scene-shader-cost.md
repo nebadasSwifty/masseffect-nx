@@ -123,3 +123,133 @@ remap codes in the key (they are not part of `VerticesEntry::fingerprint`).
 * Per-PS ranking on the console (`masseffect_native_stats_per_draw_s`) to know which pixel shaders dominate
   the category 3 runs.
 * Folding the vertex input remap codes into the vertex shader (needs them in the key).
+
+## Per-draw ranking measured on the Switch (2026-10-07, RU, 960x544, cockpit, `masseffect_native_stats_per_draw_s = 5`)
+
+One serialized diagnostic frame every 5 s; the draws sum to 15-16 ms of a ~26 ms GPU frame (the rest is EDRAM
+conversions, copies, resolves, clears and the present). Typical cockpit frame (192 draws, 5.0 Mfrag):
+
+| PS | ms/frame | draws | Mfrag | ns/frag | vertices | VS |
+|---|---|---|---|---|---|---|
+| 14702 | 2.93 | 4 | 0.246 | 11.9 | 21640 | 2013 |
+| 2169 | 1.44 | 2 | 0.125 | 11.5 | 10820 | 22611 |
+| 24056 | 1.33 | 1 | 0.033 | 40.8 | 4 | 24994 (DoF gather) |
+| 26940 | 1.08 | 4 | 0.045 | 24.0 | 6800 | 2013 |
+| 12720 | 0.70 | 4 | 0.031 | 23.1 | 5704 | 2013 |
+| 7992 | 0.62 | 1 | 0.522 | 1.2 | 4 | 28697 (full screen) |
+| 15729 | 0.57 | 1 | 0.522 | 1.1 | 4 | 2293 (uber blend) |
+| 18008 | 0.52 | 2 | 0.025 | 21.0 | 3400 | 22611 |
+| 23886 | 0.51 | 2 | 0.226 | 2.3 | 2064 | 8275 |
+| 3474 | 0.48 | 1 | 0.522 | 0.9 | 4 | 9460 |
+
+The skinned per-light passes (VS2013, VS22611) cost 10-24 ns per fragment against ~1 ns for full-screen
+passes: they are vertex-bound (~6.5 ms per frame together). Next step: specialize those vertex shaders
+(docs/vertex-shader-specialization.md, in progress).
+
+## Descriptor and clamp rewrites (A, B, C), 2026-10-07
+
+Offline follow-up on the pixel shaders once their texture signs are folded: what is left per fetch is the
+descriptor handling (index load, `& 0xFFFFFF`, clamp, handle `ldc` for the texture AND for the sampler, combine)
+and, per clamp, the two 32-bit bounds of `clamp(x, FLT_MIN, FLT_MAX)` that SM50 FMNMX cannot encode (20-bit float
+immediates only), so NAK emits a `mov` for each. Three exact rewrites, each behind its own setting (default **off**),
+all requiring `masseffect_native_constants_ubo`. SPIR-V transforms: `app/src/native/masseffect/me_ps_descriptors_spirv.h`;
+renderer side: `masseffect_ps_descriptors_members.inc` (+ `masseffect_ps_descriptors_cvars.inc`). Nothing here was
+measured on the Switch yet.
+
+| | setting | what the shader does instead | why it is exact |
+|---|---|---|---|
+| A | `masseffect_native_ps_flt_bounds_ubo` | the FClamp/FMin/FMax/NClamp/NMin/NMax operands `0xFF7FFFFF` / `0x7F7FFFFF` become loads (once per function) of shared words 122 / 123 (bytes 488 / 492, the unused tail of the declared 31-float4 block) | the renderer always writes exactly those bits there (`kSharedWords` 122 -> 124) |
+| B | `masseffect_native_ps_combined_heap` (read at start-up for the layout) | every access of the 2D heap goes to a COMBINED_IMAGE_SAMPLER heap at **set 5**; `OpSampledImage(image of 2D word w, sampler of word 48 + w)` becomes the combined descriptor; other image uses get `OpImage` of it | the draw writes into 2D word w the combined index of (its 2D slot, its sampler slot); the combined descriptor is that slot's view + that slot's sampler, rewritten whenever the 2D slot is (`WriteImage` mirror) |
+| C | `masseffect_native_ps_no_index_mask` (needs `masseffect_native_fold_texture_signs`) | the `& 0xFFFFFF` of the descriptor words of the folded registers is removed | only when the signs of **every** sampled register are in the key; the draw then writes those words (2D, 3D, cube) with the sign byte cleared |
+
+Soundness checks (forward taint of the shared words, `TaintSharedWords`): for B every read of words 0-15 must end in
+`>> 24` (sign byte, kept) or, through `& 0xFFFFFF` / copies / phis, in a 2D heap index; for C every read of a cleared
+word must end in its mask (a `>> 24` left unfolded or any other use refuses). An access to the block without constant
+indices refuses both. A sampler that cannot be proven to be the one of the same register keeps its separate sampler
+(the image still comes from the combined heap: still exact). The vertex shader must not read descriptor words 0-47
+(checked per VS; 0 of the 275 library vertex shaders do). Decisions are made per draw from a per-PS plan computed once
+on the library module (`PsDescriptorsPlanFor`: the same transforms are run on the plain and on the signs-folded + C
+module); a transform that fails at pipeline creation for a key with B or C rejects the pipeline (logged as an error,
+not expected), a failed A is skipped.
+
+### Renderer changes
+
+* **Key**: bits 24-26 of `PipelineKey::signs_heaps` (`kKeyPsFltBounds`, `kKeyPsCombined`, `kKeyPsNoMask`); no new
+  fields. Prewarm list version 4 -> 5 (one "list from another version" at the first start). Prewarm records with a bit
+  whose setting is off (or B without set 5) are skipped. The async specialized pipelines keep A/B in the generic key;
+  keys with C are never deferred (the generic module would read the cleared sign bytes).
+* **Shared block**: the signs of the key are now taken from the block before `PlanPsDescriptors` rewrites it (B: 2D
+  words = sign byte | combined index; C: sign bytes cleared), and both happen before the upload.
+* **Layout (B only, start-up)**: `layout_pipeline_` gets a sixth set (`comb_set_layout_`, 16384 entries requested,
+  halved until `vkGetDescriptorSetLayoutSupport` accepts, UPDATE_AFTER_BIND + PARTIALLY_BOUND like the other heaps),
+  bound right after sets 0-3 (`BindCombinedSet`). With the setting off at start-up the layout is exactly the old one.
+  Pairs are allocated on first use and never freed (a pair follows its 2D slot through `WriteImage`); when the heap
+  is full the new pairs' draws simply keep the separate heaps (warning once).
+* **Modules**: `ModulePsDescriptors` after `ModuleTextureSigns` (ring and prewarm), order C, B, A; cached per (source
+  code, bits, cleared words) and registered in `codes_modules_depth_` for the later transforms.
+
+### Offline results (host NAK, same profile as above, SM53)
+
+Hot pixel shaders of the cockpit, NAK instructions with the signs folded to 0 (`s`); B measured with set 0 declared
+COMBINED_IMAGE_SAMPLER (`nak-cost-comb`, `NAK_COST_COMBINED=1`; the descriptor handle path is the same as set 5):
+
+| PS | s | s + C | s + B | s + C + B | s + C + B + A |
+|---|---|---|---|---|---|
+| 14702 | 298 | 292 | 256 | 250 | **240** |
+| 2169 | 260 | 255 | 225 | 220 | **212** |
+| 24056 | 673 | 669 | 659 | 655 | **591** |
+| 26940 | 457 | 447 | 387 | 377 | **364** |
+| 12720 | 542 | 531 | 465 | 454 | **430** |
+| 18008 | 390 | 381 | 327 | 318 | **313** |
+| 15729 | 153 | 150 | 132 | 129 | **120** |
+| 14489 | 194 | 191 | 173 | 170 | **160** |
+| 23886 | 240 | 238 | 226 | 224 | **218** |
+| 7992 | 120 | 119 | 113 | 112 | **108** |
+| 3474 | 66 | 65 | 59 | 58 | **58** |
+
+The C++ transforms reproduce the earlier prototype counts exactly (scratch prototype: 252 -> 202 instructions on
+average over a 300-shader sample with A+B+C, -20 %; estimated ~0.45 ms/frame at 1280x720 for B, ~0.16 ms for A,
+~0.07 ms for C; static estimates, not GPU time). On 723 library pixel shaders (two random samples plus the hot ones)
+the chain signs fold -> C -> B -> A succeeds on every module and every output passes `spirv-val --target-env
+vulkan1.2`; 2481 2D fetches combined, 0 kept separate; 2497 masks removed; 4728 clamp bounds moved.
+
+### Tests
+
+`tests/run_all.sh ps_descriptors`: a synthetic DXC-shaped module (validated with `spirv-val` when it is on the PATH):
+A's operands are the loads of v[30].z / v[30].w and the module constants are the bits the renderer writes; B keeps the
+same index id into the combined heap, combines the matching pair, keeps the mismatched sampler, refuses a 2D word with
+another use; C removes the mask only after the signs fold, refuses an unfolded `>> 24`, leaves other words alone; C,
+B, A chain. `ME_PS_LIBRARY_DIR=<folder of library PS .spv> out/tests/cpu/test_native_ps_descriptors_spirv` runs the
+whole chain on real modules and validates each output (no game data in the repository).
+
+### How to test on the console
+
+1. Build `ru_psdesc` (this change). Same build, cold, usual route; one run per toml (all on top of `s1280all.toml` /
+   `tex_base.toml`, which already fold the texture signs): `run/me1/psd1280_{a,b,c,abc}.toml`,
+   `run/me1/psd960_{a,b,c,abc}.toml`, against the base toml itself.
+2. Log lines: `[native] PS descriptors: clamp bounds ... (A) ON ...` once; with B
+   `combined image+sampler heap at set 5, N entries`; `PS n.. (k analyzed): A yes (n bounds), B yes (n 2D fetches), C
+   yes` for the first 48 PS; `PS n.. rewritten (...)` for the first 32 modules. Not expected: `rewrite .. failed`,
+   `combined heap full`, `VS n.. reads descriptor words`.
+3. Compare GPU per Swap, category 3/4 totals, fps, pipeline count and creation time (A, B, C do not add pipelines:
+   every key gets the same bits for a given PS; C only when the signs already are in the key).
+4. Screenshots must be identical (exact by construction; any difference is a bug).
+
+### Risks
+
+* B adds a descriptor write per new (texture slot, sampler) pair and per 2D slot rewrite of a slot that has pairs
+  (ring thread CPU), and one more `vkCmdBindDescriptorSets` per command buffer. Per draw: a short scan per sampled
+  register.
+* B's pipeline layout differs from the usual one: with B on, the NVK cache entries of the old layout do not match
+  (first run cold for all pipelines).
+* C gives up silently (bit clear) for pixel shaders with more than eight sampled registers or a register whose signs
+  are not folded.
+
+### D (not done): gamma decode constants
+
+With the signs folded the gamma decode (sign 3) is still ~25 NAK instructions per component, mostly the immediates
+of its three compares and of the scale/offset selects materialised with `mov`. Loading those ten constants up front
+(or from shared words, `gammaubo` in the prototype) gave 0-0.2 ms in the offline estimate. It needs either a
+`shader_common.h` change and a full library rebuild (risky: every shader changes) or a SPIR-V patch that also grows
+the declared shared block (31 -> 34 float4) of every module. Left for later; most hot scene shaders sample unsigned
+render targets and are unaffected.

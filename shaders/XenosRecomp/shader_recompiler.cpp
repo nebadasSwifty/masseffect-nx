@@ -1591,6 +1591,27 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             else
                 value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
 
+            // MASSEFFECT: the element table can name the same usage+index for two fetches (UE3 terrain
+            // shaders fetch BLENDWEIGHT0 twice, into different registers). D3D binds a declaration
+            // element by usage+index, so both fetches are patched to the same stream, offset and format,
+            // and the native renderer binds only the first such element at the usage's location
+            // (LocationOfUsage; the second one is skipped). Declare the input once and let every fetch
+            // of that usage+index read it; a second declaration is a DXC parameter redefinition.
+            bool alreadyDeclared = false;
+            for (auto& [declaredAddress, declared] : vertexElements)
+            {
+                if (declared.usage == vertexElement.usage && declared.usageIndex == vertexElement.usageIndex)
+                {
+                    alreadyDeclared = true;
+                    break;
+                }
+            }
+            if (alreadyDeclared)
+            {
+                vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
+                continue;
+            }
+
             const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
 
         #ifdef UNLEASHED_RECOMP

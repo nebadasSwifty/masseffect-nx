@@ -104,6 +104,9 @@ struct ImageNative {
   // references / INCR-DECR-INVERT write masks, clear values, bits imported from other images; color
   // sources count as all 8). Depth imports skip the bit passes of bits outside the source's mask.
   uint8_t edram4_bits_stencil = 0;
+  // Mass Effect mode 4: writing publishes into this view so far (restore into 7e3 consumer stamps: a stamp
+  // is stale once its owner was written again, even through the publish fast path that keeps tile versions).
+  uint64_t edram4_writes = 0;
 };
 
 // GPU time categories (ContextTargets::MarkGpu and the GPU-per-Swap report).
@@ -125,7 +128,10 @@ inline constexpr uint32_t kGpuEdramImport = 10;  // depth import (color/depth ->
 inline constexpr uint32_t kGpuEdramExport = 11;  // depth export (depth -> color)
 inline constexpr uint32_t kGpuEdramAlias = 12;   // color alias and the other conversions
 inline constexpr uint32_t kGpuEdramImport9 = 13;  // depth imports that still need the 8 stencil passes
-inline constexpr uint32_t kGpuCategories = 14;
+// masseffect_native_query_occlusion_depth: passes on the private occlusion depth (the dropped prepass drawn again
+// there, and the query boxes that test against it).
+inline constexpr uint32_t kGpuOcclusionDepth = 14;
+inline constexpr uint32_t kGpuCategories = 15;
 
 // Stages of the C6 report. The last four split the pass change, which on the console is the most
 // expensive and most variable stage.
@@ -144,8 +150,11 @@ class ContextTargets {
   // Render targets already in GENERAL. May record commands: call outside a pass.
   virtual ImageNative* TargetColor(uint32_t base, uint32_t format, uint32_t pitch) = 0;
   virtual ImageNative* TargetDepth(uint32_t base, uint32_t format, uint32_t pitch) = 0;
-  // Texture resolved by the render target code at that physical address, or nullptr.
-  virtual const ImageNative* ResolvedTexture(uint32_t address) = 0;
+  // Texture resolved by the render target code at that physical address, or nullptr. `fetch` (the 6 words of
+  // the texture fetch constant, optional) lets masseffect_native_resolved_cpu_overwrite check at once a fetch
+  // whose format or size differs from the resolve's: nullptr also when the guest bytes there were rewritten by
+  // the CPU after the last resolve (the fetch must then read guest memory, as on the 360).
+  virtual const ImageNative* ResolvedTexture(uint32_t address, const uint32_t* fetch = nullptr) = 0;
   // A known resolve may have a pitch-sized backing, unlike the fetch's logical size.
   // Called outside the current draw's pass, after ResolvedTexture accounted/materialized the read.
   // nullptr means an unsupported/failed resolved fetch, NOT permission to read stale guest RAM.
@@ -180,6 +189,45 @@ class ContextTargets {
   virtual uint32_t BeginStatsDraw(uint32_t label, uint32_t category,
                                              uint32_t vs_more_one = 0) = 0;  // ME: VS number + 1
   virtual void FinishStatsDraw(uint32_t index) = 0;
+
+  // Real occlusion queries (masseffect_native_query_mode 2 and 3): one Vulkan occlusion query around one draw of a
+  // guest query, inside the draw's render pass. `multiplier` converts host samples into guest samples (guest
+  // MSAA samples per host pixel). Returns UINT32_MAX if no guest query is open or there is no room left (the
+  // guest query then falls back to "visible").
+  virtual uint32_t BeginOcclusionDraw(float multiplier) { (void)multiplier; return UINT32_MAX; }
+  virtual void FinishOcclusionDraw(uint32_t index) { (void)index; }
+
+  // Restore into 7e3 (masseffect_native_restore_into_7e3): bit i set = for the draw being recorded, the targets
+  // code bound color slot i's k_2_10_10_10 view to the k_2_10_10_10_FLOAT image of the same tiles. The draw
+  // then binds that image and adds the UNORM10 -> 7e3 output epilogue (me_restore_7e3_spirv.h).
+  virtual uint32_t RestoreInto7e3Mask() const { return 0; }
+
+  // Interval between the last two guest Swaps, in ms, measured on the PM4 ring thread at Present (steady_clock);
+  // 0 before the second Swap. The draws read it for masseffect_native_motion_blur_frame_fix: the game's velocities
+  // are per frame, and while the ring is the bottleneck the game's DeltaTime for the frame being drawn is about
+  // this interval (the game thread waits for the ring).
+  virtual double SwapIntervalMs() const { return 0.0; }
+
+  // masseffect_diag_blur_source / masseffect_native_motion_blur_source_guard (docs/image-defects-feros.md 3.8).
+  // Whether the per-frame provenance journal of resolves and draws is kept (read once per frame by the targets).
+  virtual bool BlurSourceJournal() const { return false; }
+  // The image a fetch of `address` gets now (the current resolve there; VK_NULL_HANDLE when no resolved texture is
+  // served at that address). No side effects (ResolvedTexture counts reads and runs the CPU-overwrite check).
+  virtual VkImage ResolvedImageNow(uint32_t address) const {
+    (void)address;
+    return VK_NULL_HANDLE;
+  }
+  // One 2D texture of the UE3 motion blur draw being recorded. `stale_binding`: the descriptor slot the sampler loop
+  // chose is not a view of ResolvedImageNow(address). The targets compare the address with the frame's journal
+  // (which resolve wrote it, draws into its source view and into k_16_16 views since then) and log the frame at the
+  // Swap (masseffect_diag_blur_source).
+  virtual void NoteMotionBlurFetch(uint32_t ps_number, uint32_t sampler_register, const uint32_t* fetch,
+                                   bool stale_binding) {
+    (void)ps_number;
+    (void)sampler_register;
+    (void)fetch;
+    (void)stale_binding;
+  }
 };
 
 struct SubmissionDraw {
@@ -208,6 +256,9 @@ struct SubmissionDraw {
   // All proven rectangles of a multi-rectangle draw (edram_overwrite_rect is the largest of them).
   std::array<std::array<int32_t, 4>, 8> edram_overwrite_rects{};
   uint32_t edram_overwrite_rect_count = 0;
+  // Per-rectangle bounds of a proven multi-rectangle draw (every pixel rectangle k covers lies inside
+  // edram_bounds_rects[k]); masseffect_native_edram4_rect_list_tiles syncs and publishes only these.
+  std::array<std::array<int32_t, 4>, 8> edram_bounds_rects{};
   uint64_t generation_vs = 0;                // changes with every VS IM_LOAD
   uint64_t generation_constants_vs = 0;     // changes when 0x4000-0x43FF are written
   uint64_t generation_constants_ps = 0;     // changes when 0x4400-0x47FF are written
@@ -224,6 +275,9 @@ struct SubmissionDraw {
    */
   uint64_t generation_fetch = 0;             // changes when 0x4800-0x48BF are written (fetch constants)
   uint64_t generation_framing = 0;          // viewport, scissor, clip, rasterization mode
+  // Issued between the begin and the end of a guest occlusion query with real queries on
+  // (masseffect_native_query_mode 2 or 3): the draw is measured, and draw filters that would drop it are skipped.
+  bool occlusion_query = false;
 };
 
 struct StatsDraws {
@@ -336,6 +390,14 @@ class DrawsVulkan {
     (void)area;
     return false;
   }
+  // masseffect_native_query_occlusion_depth (docs/occlusion-queries.md section E). The render target code reports
+  // every whole-surface depth clear (a D3D Clear draw with a proven constant depth, or a resolve that clears depth)
+  // with the guest depth value, and every guest Swap. Both do nothing while the option is off.
+  virtual void NoteDepthClear(uint32_t base, uint32_t format, uint32_t pitch, float guest_depth,
+                              uint32_t stencil) {
+    (void)base; (void)format; (void)pitch; (void)guest_depth; (void)stencil;
+  }
+  virtual void NoteSwap() {}
   // Right before submitting: closes the pass and publishes the upload buffer.
   virtual void BeforeSend() = 0;
   // Starts work in that work slot. Its upload buffer starts over: the GPU has finished the last work
@@ -353,6 +415,30 @@ class DrawsVulkan {
   virtual bool DropTexturesPerMissingOfMemory() = 0;
   // Before every render target copy: a resolved texture may change image or channels.
   virtual void InvalidateTextures() = 0;
+  // The same global invalidation, for a change that only concerns the fetches of one physical address (a resolved
+  // texture created, rebuilt, prepared, re-swizzled or cropped there). address UINT32_MAX: not tied to one address.
+  // reason: TextureInvalidation (report). masseffect_native_texture_inval_by_address uses the address; otherwise this
+  // is InvalidateTextures().
+  virtual void InvalidateTexturesAt(uint32_t address, uint32_t reason) {
+    (void)address;
+    (void)reason;
+    InvalidateTextures();
+  }
+  // Only for masseffect_native_texture_inval_by_address: a change at that address that never invalidated the caches
+  // before (a render target swapped into a resolved texture). Does nothing to the old rule.
+  virtual void NoteResolvedAt(uint32_t address) { (void)address; }
+  enum TextureInvalidation : uint32_t {
+    kInvalidationFormat = 0,    // GetResolved: same image, another guest format or channel order
+    kInvalidationCreated = 1,   // GetResolved: a resolved texture created or rebuilt at that address
+    kInvalidationCrop = 2,      // ResolvedWritten: a resolved texture with logical crops rewritten
+    kInvalidationPrepared = 3,  // Prepare of a resolved texture's image
+    kInvalidationPreparedOther = 4,  // Prepare of an image no resolved texture holds
+    kInvalidationEachCopy = 5,  // masseffect_native_invalidate_textures_each_copy
+    kInvalidationKinds = 6,
+  };
+  // After every render target copy, whatever masseffect_native_invalidate_textures_each_copy says: counts copies for
+  // masseffect_native_texture_copy_verify (the texture caches' check of skipping the per-copy invalidation).
+  virtual void NoteCopyTextures() {}
 
   // Invalidates in the texture caches only what points to these two images. Used by the image swap of
   // masseffect_native_resolver_no_copy: dropping the whole cache twice per frame costs more than the copy it
@@ -365,6 +451,9 @@ class DrawsVulkan {
   virtual void WaitUploads() = 0;
   // Vertex copies queued and not done yet (only to measure the fences).
   virtual size_t PendingCopies() const { return 0; }
+  // Restore into 7e3: whether the pixel shader's output at Location `slot` can take the UNORM10 -> 7e3
+  // epilogue (TransformRestore7e3 succeeds on its SPIR-V). Cached per shader and slot.
+  virtual bool SupportsRestore7e3(const ShaderEntry& ps, uint32_t slot) { (void)ps; (void)slot; return false; }
 };
 
 /*

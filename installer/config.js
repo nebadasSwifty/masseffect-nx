@@ -18,12 +18,21 @@ export const CONFIG = {
     gameRootDir: 'game_root',
   },
 
+  // Installable NSP output (js/nsp.js, docs/full-nsp.md): file names the page suggests. {n} is the update number.
+  nsp: {
+    fullName: 'masseffect-nx.nsp',
+    updateName: 'masseffect-nx-update-v{n}.nsp',
+  },
+
   // File names inside <zip.root>/. The shader package names are fixed by the game (see shaders/README.md).
   files: {
     nro: 'masseffect-nx.nro',
     toml: 'masseffect.toml',
     shaders: 'masseffect_shaders.mesp',
     shadersIndex: 'masseffect_shaders.mesp.idx',
+    // The edition's shipped pipeline prewarm list (editions[].prewarmList in the release), installed under this name
+    // next to the NRO; masseffect.toml names it in masseffect_native_pipelines_shipped_list.
+    prewarmList: 'masseffect_prewarm_list.bin',
   },
 
   // Where the page gets the build. GitHub release assets cannot be fetched by a browser from another origin
@@ -41,6 +50,13 @@ export const CONFIG = {
   // Known game editions, recognised by the SHA-256 of default.xex. Only editions listed here can be installed:
   // the NRO is the recompiled program of one exact default.xex.
   //   nro: the asset name in the release (and in siteDir) of the build for this edition.
+  //   prewarmList: the asset name of this edition's shipped pipeline prewarm list (app/prewarm/, made by
+  //        tools/extract_prewarm_list.py; it holds fingerprints of this edition's own shaders, so each edition has
+  //        its own). Optional: a release without it installs without it (a warning in the log).
+  //   nsp: the installable NSP of this edition (docs/full-nsp.md): its application title ID (an update is title ID +
+  //        0x800) and the writable SD folder (saves, caches, logs). Each edition has its own, so they install side by
+  //        side; tools/build_full_nsp.py --edition uses the same values. Never change the title ID of a released
+  //        edition: updates must match the installed title.
   editions: [
     {
       id: 'usa-eur-en-es-pl-rev1',
@@ -54,6 +70,8 @@ export const CONFIG = {
         entryPoint: 0x828121D0,
       },
       nro: 'masseffect-nx.nro',
+      prewarmList: 'masseffect_prewarm_list-en.bin',
+      nsp: { titleId: '01a5eec700020000', dataDir: 'sdmc:/switch/masseffect-nx-en' },
     },
     {
       id: 'rus-rev0',
@@ -70,6 +88,8 @@ export const CONFIG = {
         entryPoint: 0x82812A00,
       },
       nro: 'masseffect-nx-rus.nro',
+      prewarmList: 'masseffect_prewarm_list-ru.bin',
+      nsp: { titleId: '01a5eec700010000', dataDir: 'sdmc:/switch/masseffect-nx' },
     },
   ],
 
@@ -84,6 +104,25 @@ export const CONFIG = {
     ],
     // Unreal packages searched for shaders (the scanner decides by content, this only picks candidates).
     scanExtensions: ['.xxx'],
+    // Structural check of the disc's UE3 packages when a source is loaded (js/pkgcheck.js, the port of
+    // tools/check_packages.py: summary, chunk table, every chunk's block table; and one package GUID under two names).
+    // scope 'all' reads a few KB of each of the ~2200 packages (seconds), 'maps' only Maps/*.xxx.
+    // block: false only warns; true also keeps the create step hidden while bad or duplicate packages are found.
+    packageCheck: { scope: 'all', block: false },
+  },
+
+  // Optional downloadable content (Xbox 360 Marketplace STFS packages the user supplies; see docs/dlc.md).
+  // The runtime ContentManager reads shared (xuid 0) content from the user folder next to the NRO:
+  //   <root>/<contentDir>/<package file name>/...  and  <root>/<headersDir>/<package file name>.header
+  dlc: {
+    titleId: 0x4D5307E8,
+    contentType: 0x00000002,
+    contentDir: 'masseffect/0000000000000000/4D5307E8/00000002',
+    headersDir: 'masseffect/0000000000000000/4D5307E8/Headers/00000002',
+    // License mask stored in each .header (every license bit granted; same default as tools/stfs_extract.py).
+    licenseMask: 0xFFFFFFFF,
+    // masseffect.toml key that makes the runtime report the packages to the game.
+    tomlKey: 'dlc_enable',
   },
 
   // The WebAssembly tools (built by shaders/wasm/*.sh and published by the workflow into installer/wasm/).
@@ -115,6 +154,10 @@ export const CONFIG = {
     // Rough sizes for the up-front estimate (a complete shader package is about 920 MB plus a 48 MB index).
     expectedShaderBytes: 970 * 1000 * 1000,
     expectedNroBytes: 70 * 1000 * 1000,
+    // Extra shader package bytes when both DLC packages are scanned (base 925 MB -> 951 MB combined).
+    expectedDlcShaderBytes: 26 * 1000 * 1000,
+    // The runtime and the packer refuse a shader package above 1 GiB (kMaxFile in masseffect_shader_library.cpp).
+    maxShaderPackageBytes: 1073741824,
     // Without a disk-backed save target the whole zip is built in memory: warn above this size.
     blobWarnBytes: 1.5 * 1024 * 1024 * 1024,
   },

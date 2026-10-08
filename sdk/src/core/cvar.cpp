@@ -6,6 +6,7 @@
  * @license     BSD 3-Clause License
  */
 
+#include <cstdio>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -652,8 +653,14 @@ void LoadConfig(const std::filesystem::path& config_path) {
     auto config = toml::parse_file(config_path.string());
     ApplyTomlTable(config, "");
     REXLOG_DEBUG("Loaded config from {}", config_path.string());
+    std::fprintf(stderr, "[config] loaded %s\n", config_path.string().c_str());
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    // The config is loaded before logging starts (rex_app.cpp SetupEnvironment), so the line above is usually
+    // lost and the whole file is silently ignored. stderr is rex_stderr.log on Switch.
+    std::fprintf(stderr, "[config] FAILED to parse %s, NOTHING from it is applied: %s (line %u)\n",
+                 config_path.string().c_str(), std::string(err.description()).c_str(),
+                 unsigned(err.source().begin.line));
   }
 }
 

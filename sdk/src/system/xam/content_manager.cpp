@@ -49,6 +49,28 @@ REXCVAR_DEFINE_STRING(content_backup_root, "", "Kernel",
                       "Folder where a copy of each save is left, with one subfolder per profile. "
                       "Empty = nothing is copied");
 
+/*
+ * Downloadable content (Xbox 360 Marketplace packages, content type 00000002).
+ *
+ * The game enumerates Marketplace content with XContentCreateEnumerator, opens each package with
+ * XContentCreate under a root such as "DLC0" and reads DLC0:\AutoLoad.ini, its packages and movies.
+ * Packages live in the shared (xuid 0) part of the content root:
+ *   <content_root>/0000000000000000/<title>/00000002/<package>/            extracted tree (preferred)
+ *   <content_root>/0000000000000000/<title>/00000002/<package>              raw STFS file (CON/LIVE/PIRS)
+ *   <content_root>/0000000000000000/<title>/Headers/00000002/<package>.header   optional metadata
+ * tools/stfs_extract.py and the installer write the extracted form; a raw package is mounted through
+ * the STFS container reader. See docs/dlc.md.
+ */
+REXCVAR_DEFINE_STRING(content_marketplace_root, "", "Kernel",
+                      "Read-only folder that replaces the user data folder for Marketplace content (DLC) only. "
+                      "Same layout (0000000000000000/<title>/...). The installed NSP sets romfs:/masseffect. "
+                      "Empty = the user data folder");
+REXCVAR_DEFINE_BOOL(dlc_enable, false, "Kernel",
+                    "List and mount downloadable content (Marketplace packages) from the content root. "
+                    "Off = the game sees no DLC, as before");
+REXCVAR_DEFINE_UINT32(dlc_license_mask, 0xFFFFFFFF, "Kernel",
+                      "License mask reported when a DLC package is opened and its .header stores none");
+
 namespace rex {
 namespace system {
 namespace xam {
@@ -194,6 +216,26 @@ void CopyForTheUser(const std::string_view name, const std::filesystem::path& so
   }
 }
 
+bool IsMarketplace(XContentType type) {
+  return type == XContentType::kMarketplaceContent;
+}
+
+// True when the file starts with an STFS package magic (CON / LIVE / PIRS).
+bool IsStfsPackageFile(const std::filesystem::path& path) {
+  FILE* f = rex::filesystem::OpenFile(path, "rb");
+  if (!f) {
+    return false;
+  }
+  uint8_t magic[4] = {};
+  const bool read = fread(magic, 1, sizeof(magic), f) == sizeof(magic);
+  fclose(f);
+  if (!read) {
+    return false;
+  }
+  return std::memcmp(magic, "CON ", 4) == 0 || std::memcmp(magic, "LIVE", 4) == 0 ||
+         std::memcmp(magic, "PIRS", 4) == 0;
+}
+
 }  // namespace
 
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
@@ -204,10 +246,21 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
-                                                                  /*allow_share_delete=*/true);
-  device->Initialize();
-  fs->RegisterDevice(std::move(device));
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(package_path, ec)) {
+    // A raw STFS package (only Marketplace content gets here, see ListContent): read-only mount.
+    auto device = std::make_unique<rex::filesystem::StfsContainerDevice>(device_path_, package_path);
+    if (!device->Initialize()) {
+      REXSYS_ERROR("[dlc] could not read the STFS package {}", rex::path_to_utf8(package_path));
+      return;
+    }
+    fs->RegisterDevice(std::move(device));
+  } else {
+    auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+        device_path_, package_path, false, /*allow_share_delete=*/true);
+    device->Initialize();
+    fs->RegisterDevice(std::move(device));
+  }
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
 }
 
@@ -243,6 +296,21 @@ ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem:
 
 ContentManager::~ContentManager() = default;
 
+namespace {
+// Marketplace content (DLC, normally under xuid 0000000000000000) may live in its own read-only folder
+// (content_marketplace_root); saves and everything else stay in the user data folder.
+const std::filesystem::path& ContentRoot(const std::filesystem::path& user_root, XContentType content_type) {
+  static const std::filesystem::path marketplace_root = [] {
+    const std::string configured = REXCVAR_GET(content_marketplace_root);
+    return configured.empty() ? std::filesystem::path() : rex::to_path(configured);
+  }();
+  if (content_type == XContentType::kMarketplaceContent && !marketplace_root.empty()) {
+    return marketplace_root;
+  }
+  return user_root;
+}
+}  // namespace
+
 std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                                          uint32_t title_id) {
   if (title_id == kCurrentlyRunningTitleId) {
@@ -254,7 +322,7 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
 
   // Package root path:
   // content_root/xuid/title_id/content_type/
-  return root_path_ / xuid_str / title_id_str / content_type_str;
+  return ContentRoot(root_path_, content_type) / xuid_str / title_id_str / content_type_str;
 }
 
 std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
@@ -290,8 +358,8 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
 
   // Header root path:
   // content_root/xuid/title_id/Headers/content_type/filename.header
-  return root_path_ / xuid_str / title_id_str / kGameContentHeaderDirName / content_type_str /
-         final_name;
+  return ContentRoot(root_path_, content_type) / xuid_str / title_id_str / kGameContentHeaderDirName /
+         content_type_str / final_name;
 }
 
 std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
@@ -303,13 +371,43 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     title_id = kernel_state_->title_id();
   }
 
+  const bool marketplace = IsMarketplace(content_type);
+  if (marketplace && !REXCVAR_GET(dlc_enable)) {
+    static bool said = false;
+    if (!said) {
+      said = true;
+      REXSYS_INFO("[dlc] the game asked for downloadable content; dlc_enable is off, reporting none");
+    }
+    return result;
+  }
+
   // Search path:
   // content_root/xuid/title_id/type_name/*
   auto package_root = ResolvePackageRoot(xuid, content_type, title_id);
   auto file_infos = rex::filesystem::ListFiles(package_root);
   for (const auto& file_info : file_infos) {
     if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
-      // Directories only.
+      // Saves are directories only. DLC may also be a raw STFS package file.
+      if (!marketplace || !IsStfsPackageFile(package_root / file_info.name)) {
+        continue;
+      }
+      XCONTENT_AGGREGATE_DATA content_data;
+      if (XFAILED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
+                                        content_type, content_data))) {
+        content_data.device_id = device_id;
+        content_data.content_type = content_type;
+        content_data.set_file_name(rex::path_to_utf8(file_info.name));
+        content_data.title_id = title_id;
+        content_data.xuid = xuid;
+        auto header =
+            rex::filesystem::StfsContainerDevice::ReadPackageHeader(package_root / file_info.name);
+        std::u16string name;
+        if (header) {
+          name = header->metadata.display_name(rex::system::XLanguage::kEnglish);
+        }
+        content_data.set_display_name(name.empty() ? rex::path_to_utf16(file_info.name) : name);
+      }
+      result.emplace_back(std::move(content_data));
       continue;
     }
 
@@ -331,10 +429,11 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
   // What the game sees when it asks for the list of saves. If a profile that exists on disk does not show
   // up here, the problem is the enumeration; if it shows up and is then reported as damaged, the problem
   // is its contents.
-  REXSYS_INFO("[save] list type {:08X} in {}: {} entry(ies)", uint32_t(content_type),
+  const char* tag = marketplace ? "[dlc]" : "[save]";
+  REXSYS_INFO("{} list type {:08X} in {}: {} entry(ies)", tag, uint32_t(content_type),
               rex::path_to_utf8(package_root), result.size());
   for (const auto& entry : result) {
-    REXSYS_INFO("[save]   '{}' (displayed as '{}')", entry.file_name(),
+    REXSYS_INFO("{}   '{}' (displayed as '{}')", tag, entry.file_name(),
                 rex::string::to_utf8(entry.display_name()));
   }
 
@@ -478,13 +577,29 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
   // What the game will find inside. If this says EMPTY and the profile is then reported as damaged, the
   // failure was in saving; if it lists the files with their sizes, the failure is in reading them or in
   // the contents themselves.
-  REXSYS_INFO("[save] open '{}' (root {}) in {} -> {}", data.file_name(), root_name,
-              rex::path_to_utf8(package_path), ThatHasInside(package_path));
+  const bool marketplace = IsMarketplace(data.content_type);
+  if (!marketplace) {
+    REXSYS_INFO("[save] open '{}' (root {}) in {} -> {}", data.file_name(), root_name,
+                rex::path_to_utf8(package_path), ThatHasInside(package_path));
+  }
   auto package = ResolvePackage(root_name, xuid, data);
   assert_not_null(package);
   package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
       data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
   content_license = package->GetPackageLicense();
+  if (marketplace) {
+    if (content_license == 0) {
+      content_license = REXCVAR_GET(dlc_license_mask);
+    }
+    std::error_code ec;
+    const bool raw = std::filesystem::is_regular_file(package_path, ec);
+    auto* autoload = kernel_state_->file_system()->ResolvePath(std::string(root_name) +
+                                                               ":\\AutoLoad.ini");
+    REXSYS_INFO("[dlc] mount '{}' ('{}') as {}: from {} ({}), AutoLoad.ini {}, license {:08X}",
+                data.file_name(), rex::string::to_utf8(data.display_name()), root_name,
+                rex::path_to_utf8(package_path), raw ? "STFS package" : "extracted folder",
+                autoload ? "found" : "MISSING", content_license);
+  }
 
   {
     auto global_lock = global_critical_region_.Acquire();
@@ -510,8 +625,14 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   // The path and name are recorded before destroying the package, which is what holds them.
   const std::filesystem::path path = package->package_path();
   const std::string name = package->GetPackageContentData().file_name();
+  const bool marketplace = IsMarketplace(package->GetPackageContentData().content_type);
   delete package;  // unmounts the guest drive: from here on the files are in place
 
+  if (marketplace) {
+    // DLC is read-only and hundreds of MB: never copied to content_backup_root.
+    REXSYS_INFO("[dlc] unmount '{}' (root {})", name, root_name);
+    return X_ERROR_SUCCESS;
+  }
   REXSYS_INFO("[save] close '{}' (root {}) in {} -> {}", name, root_name,
               rex::path_to_utf8(path), ThatHasInside(path));
   CopyForTheUser(name, path);

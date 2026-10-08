@@ -19,6 +19,7 @@
 #include <rex/perf/counter.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
+#include <rex/ppc/indirect_dispatch.h>
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
@@ -270,7 +271,52 @@ bool FunctionDispatcher::SetFunction(uint32_t guest_address, ::PPCFunc* func) {
   if (recording_) {
     recording_addresses_.push_back(guest_address);
   }
+  // Compact indirect-call table (only once built, i.e. REX_INDIRECT_DISPATCH != 0 code ran).
+  if (indirect::detail::Built() && !indirect::detail::Update(guest_address, func)) {
+    RebuildIndirectDispatchTableLocked();
+    indirect::detail::InvalidateInlineCaches();
+  }
   return true;
+}
+
+void FunctionDispatcher::BuildIndirectDispatchTable() {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  if (indirect::detail::Built()) {
+    return;
+  }
+  RebuildIndirectDispatchTableLocked();
+}
+
+void FunctionDispatcher::RebuildIndirectDispatchTableLocked() {
+  indirect::detail::BeginRebuild();
+  for (const auto& [guest, func] : function_table_) {
+    indirect::detail::Insert(guest, func);
+  }
+  // Self-check: every registered function must resolve to the same host function as the guest-memory table the
+  // legacy path reads (or be absent from the compact table, which then falls back to that path).
+  size_t mismatches = 0;
+  for (const auto& [guest, func] : function_table_) {
+    PPCFunc* compact = indirect::detail::Probe(guest);
+    PPCFunc* legacy = nullptr;
+    for (const auto& mod : module_tables_) {
+      if (guest >= mod.code_base && guest < mod.thunk_limit) {
+        uint32_t slot = mod.image_base + mod.image_size + (guest - mod.code_base) * 2;
+        legacy = *memory_->TranslateVirtual<PPCFunc**>(slot);
+        break;
+      }
+    }
+    if ((compact && compact != func) || legacy != func) {
+      if (++mismatches <= 16) {
+        REXLOG_ERROR("indirect_dispatch DIFFERENCE at build: guest {:08X} map {} compact {} guest table {}", guest,
+                     reinterpret_cast<void*>(func), reinterpret_cast<void*>(compact),
+                     reinterpret_cast<void*>(legacy));
+      }
+    }
+  }
+  if (mismatches) {
+    REXLOG_ERROR("indirect_dispatch: {} differences at build", mismatches);
+  }
+  indirect::detail::EndRebuild(function_table_.size());
 }
 
 ::PPCFunc* FunctionDispatcher::GetFunction(uint32_t guest_address) {
@@ -393,6 +439,11 @@ std::optional<std::pair<uint32_t, uint32_t>> FunctionDispatcher::UnregisterModul
   }
 
   module_addresses_.erase(it);
+
+  if (indirect::detail::Built()) {
+    RebuildIndirectDispatchTableLocked();
+    indirect::detail::InvalidateInlineCaches();
+  }
 
   return cleared_range;
 }

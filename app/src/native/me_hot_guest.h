@@ -35,8 +35,9 @@ struct Hook {
   std::atomic<uint64_t> checks{0};
 };
 
-// First call of a hook (any thread): read the cvars. Defined in me_hot_guest.cpp.
-void InitHook(Hook& h, bool own);
+// First call of a hook (any thread): read the cvars. Defined in me_hot_guest.cpp. umbrella = false: the hook is not
+// switched on by masseffect_hot_guest, only by its own cvar (hooks added after the production toml enabled the umbrella).
+void InitHook(Hook& h, bool own, bool umbrella = true);
 
 // One guarded call: native on a copy of the registers with the written ranges snapshotted, rollback, original,
 // compare. Leaves the state exactly as the original would. Defined in me_hot_guest.cpp.
@@ -74,7 +75,11 @@ inline void Dispatch(Hook& h, uint32_t& n, PPCContext& ctx, uint8_t* base) {
 #define ME_HOT_CVAR(CVAR, DESC) \
   REXCVAR_DEFINE_BOOL(CVAR, false, "Mass Effect", DESC).lifecycle(rex::cvar::Lifecycle::kInitOnly)
 
-#define ME_HOT_HOOK(ADDR, CVAR, NS)                                                                         \
+#define ME_HOT_HOOK(ADDR, CVAR, NS) ME_HOT_HOOK_IMPL(ADDR, CVAR, NS, true)
+// Same, but masseffect_hot_guest does not switch it on: only its own cvar does.
+#define ME_HOT_HOOK_OWN(ADDR, CVAR, NS) ME_HOT_HOOK_IMPL(ADDR, CVAR, NS, false)
+
+#define ME_HOT_HOOK_IMPL(ADDR, CVAR, NS, UMBRELLA)                                                          \
   REX_EXTERN(__imp__sub_##ADDR);                                                                            \
   REX_HOOK_RAW(sub_##ADDR) {                                                                                \
     static thread_local uint32_t n_calls;                                                                   \
@@ -86,7 +91,7 @@ inline void Dispatch(Hook& h, uint32_t& n, PPCContext& ctx, uint8_t* base) {
       return;                                                                                               \
     }                                                                                                       \
     if (st == me::hot::kUninit) [[unlikely]] {                                                              \
-      me::hot::InitHook(h, REXCVAR_GET(CVAR));                                                              \
+      me::hot::InitHook(h, REXCVAR_GET(CVAR), UMBRELLA);                                                    \
       if (h.state.load(std::memory_order_relaxed) == me::hot::kOn) {                                        \
         me::hot::Dispatch<&NS::Native>(h, n_calls, ctx, base);                                              \
         return;                                                                                             \

@@ -1,6 +1,7 @@
-// Native replacements disabled for Russian edition (recompiled XEX originals used)
-// Native replacements disabled for Russian edition (recompiled XEX originals used)
 // Mass Effect - hot guest function replacements (REX_HOOK_RAW hooks behind cvars, default off).
+// Russian edition copy: the hooks use the RU guest addresses (editions/ru/address_map.json); every RU function was
+// checked to be instruction-for-instruction the English one, and the native versions read the RU data addresses
+// (RU copies of src/native/hot/n_*.h and me_hot_call.h in this overlay). The n_<addr> namespaces keep the English names.
 //
 // Every hook replaces one recompiled function by an exact native version (src/native/hot/n_<addr>.h) and checks itself:
 // for the first masseffect_hot_guard_calls calls (and every masseffect_hot_guard_period-th call afterwards) the native
@@ -17,6 +18,8 @@
 #include <vector>
 
 #include "hot/hot_all.h"
+#include "hot/n_8245FF18.h"  // TFieldIterator<UProperty>::IterateToNext
+#include "hot/n_8264E178.h"  // UE3 sprite emitter Render with prefetch
 
 REXCVAR_DEFINE_BOOL(masseffect_hot_guest, false, "Mass Effect",
                     "Enable every hot guest function replacement (src/native/hot); each also has its own "
@@ -33,9 +36,9 @@ REXCVAR_DEFINE_INT32(masseffect_hot_guard_period, 4096, "Mass Effect",
 
 namespace me::hot {
 
-void InitHook(Hook& h, bool own) {
+void InitHook(Hook& h, bool own, bool umbrella) {
   // May run on several threads at once for the first call: every writer stores the same values.
-  const bool on = own || REXCVAR_GET(masseffect_hot_guest);
+  const bool on = own || (umbrella && REXCVAR_GET(masseffect_hot_guest));
   const uint32_t guard_calls = uint32_t(std::max(0, REXCVAR_GET(masseffect_hot_guard_calls)));
   const uint32_t period = uint32_t(std::max(1, REXCVAR_GET(masseffect_hot_guard_period)));
   uint32_t p2 = 1;
@@ -178,65 +181,75 @@ void Check(Hook& h, PPCContext& ctx, uint8_t* base) {
 // Hooks. Each hook: own cvar (default off), or masseffect_hot_guest = true for all of them.
 
 ME_HOT_CVAR(masseffect_hot_d3d_cbcopy,
-            "Native sub_82219258 (D3D: copy N vectors from an unaligned source into the constant block, dirty mask)");
-// // ME_HOT_HOOK(82219258, masseffect_hot_d3d_cbcopy, me::hot::n_82219258)
+            "Native sub_82219048 (D3D: copy N vectors from an unaligned source into the constant block, dirty mask)");
+ME_HOT_HOOK(82219048, masseffect_hot_d3d_cbcopy, me::hot::n_82219258)
 
 ME_HOT_CVAR(masseffect_hot_d3d_setconst4,
-            "Native sub_824F9D10 (D3D: write one float4 constant, dirty bit)");
-// // ME_HOT_HOOK(824F9D10, masseffect_hot_d3d_setconst4, me::hot::n_824F9D10)
+            "Native sub_824FA968 (D3D: write one float4 constant, dirty bit)");
+ME_HOT_HOOK(824FA968, masseffect_hot_d3d_setconst4, me::hot::n_824F9D10)
 
 ME_HOT_CVAR(masseffect_hot_d3d_cbcopy_ps,
-            "Native sub_82219360 (D3D: pixel-shader side of the constant block copy)");
-// // ME_HOT_HOOK(82219360, masseffect_hot_d3d_cbcopy_ps, me::hot::n_82219360)
+            "Native sub_82219150 (D3D: pixel-shader side of the constant block copy)");
+ME_HOT_HOOK(82219150, masseffect_hot_d3d_cbcopy_ps, me::hot::n_82219360)
 
 // Verified natives (differentially fuzzed on the host, tests/hot_fuzz).
-ME_HOT_CVAR(masseffect_hot_skel_bonemat, "Native sub_826545D0 (skeletal mesh bone matrices)");
-// // ME_HOT_HOOK(826545D0, masseffect_hot_skel_bonemat, me::hot::n_826545D0)
-ME_HOT_CVAR(masseffect_hot_sprite_sort, "Native sub_82654030 (UE3 particle sprite quicksort)");
-// // ME_HOT_HOOK(82654030, masseffect_hot_sprite_sort, me::hot::n_82654030)
-ME_HOT_CVAR(masseffect_hot_mat4_inverse, "Native sub_822631E8 (4x4 matrix inverse)");
-// // ME_HOT_HOOK(822631E8, masseffect_hot_mat4_inverse, me::hot::n_822631E8)
-ME_HOT_CVAR(masseffect_hot_ray_slab, "Native sub_8256A1A0 (ray vs projected-vertex slab clip)");
-// // ME_HOT_HOOK(8256A1A0, masseffect_hot_ray_slab, me::hot::n_8256A1A0)
-ME_HOT_CVAR(masseffect_hot_ray_sphere, "Native sub_8256AFD8 (ray clip with sqrt/divide)");
-// // ME_HOT_HOOK(8256AFD8, masseffect_hot_ray_sphere, me::hot::n_8256AFD8)
-ME_HOT_CVAR(masseffect_hot_cast_82270C78, "Native sub_82270C78 (Cast<T> class-chain check)");
-// // ME_HOT_HOOK(82270C78, masseffect_hot_cast_82270C78, me::hot::n_82270C78)
-ME_HOT_CVAR(masseffect_hot_cast_822E3158, "Native sub_822E3158 (Cast<T> class-chain check)");
-// // ME_HOT_HOOK(822E3158, masseffect_hot_cast_822E3158, me::hot::n_822E3158)
-ME_HOT_CVAR(masseffect_hot_cast_822B9200, "Native sub_822B9200 (Cast<T> class-chain check)");
-// // ME_HOT_HOOK(822B9200, masseffect_hot_cast_822B9200, me::hot::n_822B9200)
-ME_HOT_CVAR(masseffect_hot_hash_lookup, "Native sub_8230D5F0 (hash table lookup)");
-// // ME_HOT_HOOK(8230D5F0, masseffect_hot_hash_lookup, me::hot::n_8230D5F0)
-ME_HOT_CVAR(masseffect_hot_interval_test, "Native sub_8267C000 (swept interval test)");
-// // ME_HOT_HOOK(8267C000, masseffect_hot_interval_test, me::hot::n_8267C000)
-ME_HOT_CVAR(masseffect_hot_iter_advance, "Native sub_8225CA80 (iterator advance)");
-// // ME_HOT_HOOK(8225CA80, masseffect_hot_iter_advance, me::hot::n_8225CA80)
+ME_HOT_CVAR(masseffect_hot_skel_bonemat, "Native sub_82655008 (skeletal mesh bone matrices)");
+ME_HOT_HOOK(82655008, masseffect_hot_skel_bonemat, me::hot::n_826545D0)
+ME_HOT_CVAR(masseffect_hot_sprite_sort, "Native sub_82654A68 (UE3 particle sprite quicksort)");
+ME_HOT_HOOK(82654A68, masseffect_hot_sprite_sort, me::hot::n_82654030)
+ME_HOT_CVAR(masseffect_hot_mat4_inverse, "Native sub_82262EC0 (4x4 matrix inverse)");
+ME_HOT_HOOK(82262EC0, masseffect_hot_mat4_inverse, me::hot::n_822631E8)
+ME_HOT_CVAR(masseffect_hot_ray_slab, "Native sub_8256AB90 (ray vs projected-vertex slab clip)");
+ME_HOT_HOOK(8256AB90, masseffect_hot_ray_slab, me::hot::n_8256A1A0)
+ME_HOT_CVAR(masseffect_hot_ray_sphere, "Native sub_8256B9C8 (ray clip with sqrt/divide)");
+ME_HOT_HOOK(8256B9C8, masseffect_hot_ray_sphere, me::hot::n_8256AFD8)
+ME_HOT_CVAR(masseffect_hot_cast_82270C78, "Native sub_82270788 (Cast<T> class-chain check)");
+ME_HOT_HOOK(82270788, masseffect_hot_cast_82270C78, me::hot::n_82270C78)
+ME_HOT_CVAR(masseffect_hot_cast_822E3158, "Native sub_822E3058 (Cast<T> class-chain check)");
+ME_HOT_HOOK(822E3058, masseffect_hot_cast_822E3158, me::hot::n_822E3158)
+ME_HOT_CVAR(masseffect_hot_cast_822B9200, "Native sub_822B8F50 (Cast<T> class-chain check)");
+ME_HOT_HOOK(822B8F50, masseffect_hot_cast_822B9200, me::hot::n_822B9200)
+ME_HOT_CVAR(masseffect_hot_hash_lookup, "Native sub_8230D568 (hash table lookup)");
+ME_HOT_HOOK(8230D568, masseffect_hot_hash_lookup, me::hot::n_8230D5F0)
+ME_HOT_CVAR(masseffect_hot_interval_test, "Native sub_8267CBA8 (swept interval test)");
+ME_HOT_HOOK(8267CBA8, masseffect_hot_interval_test, me::hot::n_8267C000)
+ME_HOT_CVAR(masseffect_hot_iter_advance, "Native sub_8225C688 (iterator advance)");
+ME_HOT_HOOK(8225C688, masseffect_hot_iter_advance, me::hot::n_8225CA80)
 
 // Hooks added with the second round of natives (re-verified against the diet / nal generated code).
-ME_HOT_CVAR(masseffect_hot_distribution, "Native sub_824DD848 (particle distribution float table lookup + lerp / random)");
-// // ME_HOT_HOOK(824DD848, masseffect_hot_distribution, me::hot::n_824DD848)
-ME_HOT_CVAR(masseffect_hot_sprite_vertices, "Native sub_8264C7C0 (sprite emitter: dynamic vertex + index buffer fill)");
-// // ME_HOT_HOOK(8264C7C0, masseffect_hot_sprite_vertices, me::hot::n_8264C7C0)
-ME_HOT_CVAR(masseffect_hot_plane_reject, "Native sub_8262CFC0 (box vs plane groups reject test, VMX)");
-// // ME_HOT_HOOK(8262CFC0, masseffect_hot_plane_reject, me::hot::n_8262CFC0)
-ME_HOT_CVAR(masseffect_hot_hash_find, "Native sub_82BAFF58 (chained hash table index lookup)");
-// // ME_HOT_HOOK(82BAFF58, masseffect_hot_hash_find, me::hot::n_82BAFF58)
-ME_HOT_CVAR(masseffect_hot_hash_find_entry, "Native sub_82BB0748 (hash table find-entry wrapper)");
-// // ME_HOT_HOOK(82BB0748, masseffect_hot_hash_find_entry, me::hot::n_82BB0748)
-ME_HOT_CVAR(masseffect_hot_obj_iter_advance, "Native sub_82210970 (object array iterator advance with class filter)");
-// // ME_HOT_HOOK(82210970, masseffect_hot_obj_iter_advance, me::hot::n_82210970)
-ME_HOT_CVAR(masseffect_hot_object_lookup, "Native sub_8230F620 (object hash lookup by owner / key / class)");
-// // ME_HOT_HOOK(8230F620, masseffect_hot_object_lookup, me::hot::n_8230F620)
-ME_HOT_CVAR(masseffect_hot_volume_overlap, "Native sub_82B5F0E8 (bounding volume overlap test, two virtual getters)");
-// // ME_HOT_HOOK(82B5F0E8, masseffect_hot_volume_overlap, me::hot::n_82B5F0E8)
-ME_HOT_CVAR(masseffect_hot_crt_memcpy, "Native sub_82AC4AF0 (CRT memcpy)");
-// // ME_HOT_HOOK(82AC4AF0, masseffect_hot_crt_memcpy, me::hot::n_82AC4AF0)
-ME_HOT_CVAR(masseffect_hot_crt_wcscmp, "Native sub_82AC4520 (CRT wcscmp)");
-// // ME_HOT_HOOK(82AC4520, masseffect_hot_crt_wcscmp, me::hot::n_82AC4520)
-ME_HOT_CVAR(masseffect_hot_crt_wcsicmp, "Native sub_82AC3790 (CRT wcsicmp)");
-// // ME_HOT_HOOK(82AC3790, masseffect_hot_crt_wcsicmp, me::hot::n_82AC3790)
-ME_HOT_CVAR(masseffect_hot_object_hash, "Native sub_826EAF70 (object hash: CRC table + Jenkins mix)");
-// // ME_HOT_HOOK(826EAF70, masseffect_hot_object_hash, me::hot::n_826EAF70)
-ME_HOT_CVAR(masseffect_hot_skin_rebind, "Native sub_8264ADA0 (skin cache rebind: bone matrices 4x4 -> 3x4 copy)");
-// // ME_HOT_HOOK(8264ADA0, masseffect_hot_skin_rebind, me::hot::n_8264ADA0)
+ME_HOT_CVAR(masseffect_hot_distribution, "Native sub_824DE638 (particle distribution float table lookup + lerp / random)");
+ME_HOT_HOOK(824DE638, masseffect_hot_distribution, me::hot::n_824DD848)
+ME_HOT_CVAR(masseffect_hot_sprite_vertices, "Native sub_8264D1F8 (sprite emitter: dynamic vertex + index buffer fill)");
+ME_HOT_HOOK(8264D1F8, masseffect_hot_sprite_vertices, me::hot::n_8264C7C0)
+ME_HOT_CVAR(masseffect_hot_plane_reject, "Native sub_8262DBB0 (box vs plane groups reject test, VMX)");
+ME_HOT_HOOK(8262DBB0, masseffect_hot_plane_reject, me::hot::n_8262CFC0)
+ME_HOT_CVAR(masseffect_hot_hash_find, "Native sub_82B87B50 (chained hash table index lookup)");
+ME_HOT_HOOK(82B87B50, masseffect_hot_hash_find, me::hot::n_82BAFF58)
+ME_HOT_CVAR(masseffect_hot_hash_find_entry, "Native sub_82B89988 (hash table find-entry wrapper)");
+ME_HOT_HOOK(82B89988, masseffect_hot_hash_find_entry, me::hot::n_82BB0748)
+ME_HOT_CVAR(masseffect_hot_obj_iter_advance, "Native sub_822108B8 (object array iterator advance with class filter)");
+ME_HOT_HOOK(822108B8, masseffect_hot_obj_iter_advance, me::hot::n_82210970)
+ME_HOT_CVAR(masseffect_hot_object_lookup, "Native sub_8230F598 (object hash lookup by owner / key / class)");
+ME_HOT_HOOK(8230F598, masseffect_hot_object_lookup, me::hot::n_8230F620)
+ME_HOT_CVAR(masseffect_hot_volume_overlap, "Native sub_82B5A928 (bounding volume overlap test, two virtual getters)");
+ME_HOT_HOOK(82B5A928, masseffect_hot_volume_overlap, me::hot::n_82B5F0E8)
+ME_HOT_CVAR(masseffect_hot_crt_memcpy, "Native sub_82973160 (CRT memcpy)");
+ME_HOT_HOOK(82973160, masseffect_hot_crt_memcpy, me::hot::n_82AC4AF0)
+ME_HOT_CVAR(masseffect_hot_crt_wcscmp, "Native sub_82972B90 (CRT wcscmp)");
+ME_HOT_HOOK(82972B90, masseffect_hot_crt_wcscmp, me::hot::n_82AC4520)
+ME_HOT_CVAR(masseffect_hot_crt_wcsicmp, "Native sub_82971E00 (CRT wcsicmp)");
+ME_HOT_HOOK(82971E00, masseffect_hot_crt_wcsicmp, me::hot::n_82AC3790)
+ME_HOT_CVAR(masseffect_hot_object_hash, "Native sub_826EB9C8 (object hash: CRC table + Jenkins mix)");
+ME_HOT_HOOK(826EB9C8, masseffect_hot_object_hash, me::hot::n_826EAF70)
+ME_HOT_CVAR(masseffect_hot_skin_rebind, "Native sub_8264B7C8 (skin cache rebind: bone matrices 4x4 -> 3x4 copy)");
+ME_HOT_HOOK(8264B7C8, masseffect_hot_skin_rebind, me::hot::n_8264ADA0)
+ME_HOT_CVAR(masseffect_hot_field_iter, "Native sub_82460BD0 (TFieldIterator<UProperty>::IterateToNext)");
+ME_HOT_HOOK(82460BD0, masseffect_hot_field_iter, me::hot::n_8245FF18)
+ME_HOT_CVAR(masseffect_hot_sprite_render,
+            "Native sub_8264EBB0 (UE3 sprite emitter Render: particle sort keys with prefetch, sort, DrawRichMesh)");
+ME_HOT_HOOK(8264EBB0, masseffect_hot_sprite_render, me::hot::n_8264E178)
+
+// Not switched on by masseffect_hot_guest (own cvar only): added 2026-10-08, pending a console A/B.
+ME_HOT_CVAR(masseffect_hot_lzo,
+            "Native sub_827D3388 (LZO1X decompressor of the package streaming threads; not part of masseffect_hot_guest)");
+ME_HOT_HOOK_OWN(827D3388, masseffect_hot_lzo, me::hot::n_827D2A00)

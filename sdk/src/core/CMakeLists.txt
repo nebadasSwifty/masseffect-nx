@@ -12,6 +12,7 @@ add_library(rexcore OBJECT
     filesystem.cpp
     filesystem_wildcard.cpp
     hash.cpp
+    log_nonblocking.cpp
     logging.cpp
     memory.cpp
     mutex.cpp

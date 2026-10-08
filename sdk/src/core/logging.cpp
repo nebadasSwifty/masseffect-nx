@@ -28,6 +28,8 @@
 #include <rex/platform.h>
 #include <rex/platform/env.h>
 
+#include "log_nonblocking.h"
+
 #ifdef __SWITCH__
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -120,6 +122,46 @@ REXCVAR_DEFINE_BOOL(log_async, false, "Log",
 
 REXCVAR_DEFINE_INT32(log_async_queue, 8192, "Log", "Messages that fit in the async log queue")
     .range(256, 65536)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+/*
+ * log_nonblocking: the log file without any SD card access (or lock) on the threads that log.
+ *
+ * Measured with stack sampling in a Feros firefight: the "GPU ring native" thread spent ~14 % of
+ * its time in frames over 45 ms inside spdlog -> rotating_file_sink -> fwrite/fflush ->
+ * fsdev_write/fsdev_seek, at only ~27 lines/s (warn lines flush, flush_on(warn)).
+ *
+ * With it on, the file sink is replaced by log_nonblocking.cpp: the logging thread formats the
+ * line and copies it into a lock-free in-memory ring (log_nonblocking_buffer_kb); a writer thread
+ * created with threadCreate at an explicit priority (log_nonblocking_priority) and off core 2 writes
+ * it in large batches every log_nonblocking_interval_ms, with one fflush per batch. A full ring
+ * drops lines and the writer logs how many. FlushLogging() and the crash handler drain it
+ * synchronously. Unlike log_async it never blocks the caller. Replaces log_async when both are set.
+ */
+REXCVAR_DEFINE_BOOL(log_nonblocking, false, "Log",
+                    "Write the log file from a dedicated writer thread through a lock-free in-memory ring: "
+                    "threads that log never touch the SD card or wait; a full ring drops lines (counted in "
+                    "the log)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(log_nonblocking_buffer_kb, 2048, "Log",
+                     "Size of the non-blocking log ring in KB (rounded up to a power of two)")
+    .range(256, 16384)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(log_nonblocking_interval_ms, 250, "Log",
+                     "Non-blocking log: the writer thread writes a batch this often (earlier on a flush request "
+                     "such as a warn line, or when the ring is half full)")
+    .range(20, 2000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(log_nonblocking_priority, 0x2C, "Log",
+                     "Switch: Horizon priority of the non-blocking log writer thread (lower = more urgent). "
+                     "0x2C (default since 2026-10-08) is below the audio output and XMA threads (0x2B), so a "
+                     "log batch can never delay them, at the level of presentation and ring and above the game "
+                     "(0x3B). The writer never blocks a logging thread: if it is starved the ring fills and "
+                     "lines are dropped and counted. 0x2A was the first value (above audio)")
+    .range(0x1C, 0x3B)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -251,6 +293,9 @@ spdlog::level::level_enum ResolveCategoryLevel(const std::string& name) {
 // true once the spdlog thread pool is up (see log_async).
 bool g_async_ready = false;
 
+// true when g_file_sink is the non-blocking sink (log_nonblocking).
+bool g_file_sink_nonblocking = false;
+
 // Create a logger and register it
 std::shared_ptr<spdlog::logger> CreateCategoryLogger(const std::string& name) {
   auto sinks = BuildCategorySinks(name);
@@ -353,7 +398,24 @@ void InitLogging(const LogConfig& config) {
                                           : std::filesystem::path(config.log_dir);
     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
   }
-  if (!resolved_path.empty()) {
+  if (!resolved_path.empty() && REXCVAR_GET(log_nonblocking)) {
+    log_nb::NonblockingFileSinkOptions opts;
+    opts.path = resolved_path;
+    opts.max_file_bytes = static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024;
+    opts.max_files = static_cast<size_t>(REXCVAR_GET(log_max_files));
+    opts.ring_bytes = static_cast<size_t>(REXCVAR_GET(log_nonblocking_buffer_kb)) * 1024;
+    opts.interval_ms = static_cast<uint32_t>(REXCVAR_GET(log_nonblocking_interval_ms));
+    opts.writer_priority = REXCVAR_GET(log_nonblocking_priority);
+    // Cores 0-1: core 2 is the one masseffect_exclusive_core gives to the game's main thread.
+    opts.writer_core_mask = 0x3;
+    if (auto sink = log_nb::CreateNonblockingFileSink(opts)) {
+      sink->set_level(spdlog::level::trace);
+      sink->set_pattern(config.file_pattern);
+      g_file_sink = sink;
+      g_file_sink_nonblocking = true;
+    }
+  }
+  if (!resolved_path.empty() && !g_file_sink) {
     auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
         resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
@@ -378,7 +440,7 @@ void InitLogging(const LogConfig& config) {
 
   // The spdlog pool, before the loggers are rebuilt (see log_async). A single thread: log lines have to
   // keep their usual order.
-  if (REXCVAR_GET(log_async) && !g_async_ready) {
+  if (REXCVAR_GET(log_async) && !g_file_sink_nonblocking && !g_async_ready) {
     spdlog::init_thread_pool(static_cast<size_t>(REXCVAR_GET(log_async_queue)), 1);
     g_async_ready = true;
   }
@@ -407,6 +469,20 @@ void InitLogging(const LogConfig& config) {
   int flush_interval = REXCVAR_GET(log_flush_interval);
   if (flush_interval > 0)
     spdlog::flush_every(std::chrono::seconds(flush_interval));
+
+  // Straight to the default logger ("core"): the REXLOG macros could re-enter g_mutex, held here.
+  if (auto* core_logger = spdlog::default_logger_raw()) {
+    if (g_file_sink_nonblocking) {
+      core_logger->info("[log] non-blocking file log: ring {} KB, batch every {} ms, writer priority 0x{:X}, "
+                        "cores 0-1{}",
+                        REXCVAR_GET(log_nonblocking_buffer_kb), REXCVAR_GET(log_nonblocking_interval_ms),
+                        REXCVAR_GET(log_nonblocking_priority),
+                        REXCVAR_GET(log_async) ? " (log_async ignored)" : "");
+    } else if (REXCVAR_GET(log_nonblocking) && !resolved_path.empty()) {
+      core_logger->warn("[log] log_nonblocking: the non-blocking sink could not start; using the synchronous "
+                        "file sink");
+    }
+  }
 }
 
 void InitLogging(const char* log_file, spdlog::level::level_enum level) {
@@ -427,6 +503,7 @@ void ShutdownLogging() {
 
   spdlog::shutdown();  // also joins the async pool thread
   g_async_ready = false;
+  g_file_sink_nonblocking = false;
   g_registry.clear();
   g_console_sink.reset();
   g_file_sink.reset();
@@ -441,6 +518,10 @@ void FlushLogging() {
   for (auto& entry : g_registry)
     if (entry.logger)
       entry.logger->flush();
+  // The non-blocking sink's flush() only wakes its writer; an explicit flush (orderly exit) must leave
+  // everything in the file, so drain it from this thread.
+  if (g_file_sink_nonblocking)
+    log_nb::DrainNonblockingFileSink();
 }
 
 LogCategoryId RegisterLogCategory(const char* name) {

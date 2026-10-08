@@ -6,33 +6,48 @@
 <title>Mass Effect for Switch - Installer</title>
 <meta name="description" content="Builds the SD card package of the Mass Effect Nintendo Switch port from your own game, entirely in your browser.">
 <meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#04060c">
+<link rel="preload" href="assets/fonts/GolosText-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/RussoOne-Regular.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="icon" href="assets/icon.jpg">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=0.3.1">
 </head>
 <body>
+<a class="skip-link" href="#main" data-i18n="skip_link">Skip to content</a>
+
 <header class="hero">
-  <img class="cover" src="assets/icon.jpg" alt="Mass Effect cover" width="256" height="256">
-  <div class="hero-copy">
-    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
-      <p class="eyebrow" data-i18n="hero_eyebrow" style="margin: 0;">NEBADASSWIFTY / NINTENDO SWITCH</p>
+  <div class="banner-wrap">
+    <img class="banner" src="assets/banner.png" alt="Mass Effect, Nintendo Switch port" data-i18n-alt="banner_alt" width="1200" height="273">
+  </div>
+  <div class="hero-row">
+    <h1 class="sr-only" data-i18n="hero_title">Mass Effect</h1>
+    <p class="hero-description" data-i18n="hero_description">Prepare the port on your computer, directly in your browser.</p>
+    <div class="hero-tools">
+      <a class="hero-link" href="https://github.com/nebadasSwifty/masseffect-nx/releases" data-i18n="releases_link">Releases ↗</a>
       <div class="lang-switch" role="group" aria-label="Language">
-        <button class="lang-btn" id="lang-en" type="button">EN</button>
-        <button class="lang-btn" id="lang-ru" type="button">RU</button>
+        <button class="lang-btn" id="lang-en" type="button" lang="en">EN</button>
+        <button class="lang-btn" id="lang-ru" type="button" lang="ru">RU</button>
       </div>
     </div>
-    <h1 data-i18n="hero_title">Mass Effect</h1>
-    <p class="hero-subtitle" data-i18n="hero_subtitle">Your disc. Your galaxy.</p>
-    <p class="hero-description" data-i18n="hero_description">Prepare the port on your computer, directly in your browser.</p>
-    <a href="https://github.com/nebadasSwifty/masseffect-nx/releases" data-i18n="releases_link">Releases ↗</a>
   </div>
 </header>
 
-<main>
+<main id="main">
+  <!-- Step indicator: states (pending / active / done / error / optional) are set by updateWizard() in app.js -->
+  <nav class="wizard" aria-label="Installation steps" data-i18n-aria="wizard_label">
+    <ol class="wizard-steps" id="wizard">
+      <li class="wstep active" data-step="1"><span class="wlabel" data-i18n="wizard_1">Game discs</span><span class="sr-only wstate"></span></li>
+      <li class="wstep pending" data-step="2"><span class="wlabel" data-i18n="wizard_2">Edition check</span><span class="sr-only wstate"></span></li>
+      <li class="wstep pending" data-step="3"><span class="wlabel" data-i18n="wizard_3">DLC</span><span class="sr-only wstate"></span></li>
+      <li class="wstep pending" data-step="4"><span class="wlabel" data-i18n="wizard_4">Build package</span><span class="sr-only wstate"></span></li>
+    </ol>
+  </nav>
   <p class="lead" data-i18n="lead_text" data-i18n-html="true">
     Make the SD card package of the Mass Effect port from <strong>your own copy</strong> of the Xbox 360 game.
     Everything runs in this browser tab: <strong>your game files never leave your computer.</strong>
   </p>
   <div id="env-warning" class="notice warn" hidden></div>
+
 
   <!-- Step 1 -->
   <section class="card" id="step-source">
@@ -57,9 +72,26 @@
     <div id="edition-body"></div>
   </section>
 
-  <!-- Step 3 -->
+  <!-- Step 3 (optional) -->
+  <section class="card" id="step-dlc" hidden>
+    <h2><span class="num">3</span> <span data-i18n="step_dlc_title">DLC packages (optional)</span></h2>
+    <p class="hint" data-i18n="dlc_hint" data-i18n-html="true">
+      If you own the Xbox 360 downloadable content (<strong>Bring Down the Sky</strong>, <strong>Pinnacle Station</strong>), add the
+      package files here (the files with 42-character names from <code>Content/0000000000000000/4D5307E8/00000002/</code> of an Xbox 360 drive).
+      They are read in place, checked block by block and installed next to the game; their shaders go into the shader package.
+    </p>
+    <div class="drop" id="dlc-drop" tabindex="0">
+      <button class="btn" id="dlc-pick" type="button" data-i18n="dlc_pick">Add DLC package files</button>
+      <span class="or" data-i18n="drop_or">or drop it here</span>
+    </div>
+    <input id="file-dlc" type="file" multiple hidden>
+    <ul class="dlc-list" id="dlc-list"></ul>
+    <p class="status" id="dlc-status" role="status"></p>
+  </section>
+
+  <!-- Step 4 -->
   <section class="card" id="step-create" hidden>
-    <h2><span class="num">3</span> <span data-i18n="step_3_title">Create the package</span></h2>
+    <h2><span class="num">4</span> <span data-i18n="step_3_title">Create the package</span></h2>
     <div id="create-info" class="info"></div>
     <div class="actions" id="actions">
       <button class="btn primary" id="create-full" type="button" data-i18n="create_full_btn">Create masseffect-nx.zip</button>
@@ -71,7 +103,57 @@
       The update overwrites <code>masseffect.toml</code>: keep a copy if you changed it.
     </p>
 
-    <div id="progress" hidden>
+    <!-- Optional: installable NSP with the game inside (experimental, docs/full-nsp.md). js/nsp.js writes it; app.js wires it. -->
+    <details class="nsp-option" id="nsp-option">
+      <summary data-i18n="nsp_summary">Installable NSP (experimental)</summary>
+      <p class="hint" data-i18n="nsp_hint" data-i18n-html="true">
+        One application to install with DBI or Goldleaf, with the game files, shaders and settings inside. It is encrypted with <strong>your own</strong>
+        console keys: choose your <code>prod.keys</code>.
+      </p>
+      <div class="seg nsp-kind" role="radiogroup" aria-label="NSP type" data-i18n-aria="nsp_kind_label">
+        <label><input type="radio" name="nsp-kind" value="full" checked> <span data-i18n="nsp_kind_full">Full NSP</span></label>
+        <label><input type="radio" name="nsp-kind" value="update"> <span data-i18n="nsp_kind_update">Update for an installed NSP</span></label>
+      </div>
+
+      <div class="nsp-field">
+        <button class="btn" id="nsp-keys-pick" type="button" data-i18n="nsp_keys_pick">Choose prod.keys</button>
+        <p class="status" id="nsp-keys-status" role="status"></p>
+      </div>
+      <input id="file-keys" type="file" accept=".keys,.txt,.dat" hidden>
+
+      <div id="nsp-full-panel" class="nsp-panel">
+        <p class="hint" data-i18n="nsp_full_hint" data-i18n-html="true">The whole game in one package.</p>
+        <div class="seg nsp-out" role="radiogroup" aria-label="Output" data-i18n-aria="nsp_out_label">
+          <label><input type="radio" name="nsp-out" value="file" checked> <span data-i18n="nsp_out_file">One .nsp file</span></label>
+          <label><input type="radio" name="nsp-out" value="split"> <span data-i18n="nsp_out_split">FAT32 split folder</span></label>
+        </div>
+        <p class="status" id="nsp-full-info" role="status"></p>
+        <div class="actions">
+          <button class="btn primary" id="create-nsp" type="button" disabled data-i18n="create_nsp_btn">Create masseffect-nx.nsp</button>
+        </div>
+      </div>
+
+      <div id="nsp-update-panel" class="nsp-panel" hidden>
+        <p class="hint" data-i18n="nsp_update_hint" data-i18n-html="true">A small update for the NSP you installed.</p>
+        <div class="nsp-field">
+          <button class="btn" id="nsp-base-pick" type="button" data-i18n="nsp_base_pick">Choose the base</button>
+          <p class="status" id="nsp-base-status" role="status"></p>
+        </div>
+        <input id="file-base" type="file" accept=".json,.nsp,application/json" multiple hidden>
+        <label class="check"><input type="checkbox" id="nsp-update-data"> <span data-i18n="nsp_update_data" data-i18n-html="true">Also rebuild the shaders and settings from the disc</span></label>
+        <label class="number"><span data-i18n="nsp_update_version">Update number</span>
+          <input type="number" id="nsp-update-version" min="1" max="65535" step="1" value="1"></label>
+        <p class="status" id="nsp-update-info" role="status"></p>
+        <div class="actions">
+          <button class="btn primary" id="create-nsp-update" type="button" disabled data-i18n="create_nsp_update_btn">Create the update</button>
+        </div>
+      </div>
+
+      <p class="hint" data-i18n="nsp_install_hint" data-i18n-html="true">Install with DBI or Goldleaf.</p>
+      <p class="status" id="nsp-status" role="status"></p>
+    </details>
+
+    <div id="progress" class="progress-panel" hidden>
       <ol class="stages" id="stages"></ol>
       <div class="row">
         <span id="elapsed" class="muted"></span>
@@ -94,7 +176,8 @@
   masseffect.toml               (settings)
   masseffect_shaders.mesp       (the game's shaders, made from your disc)
   masseffect_shaders.mesp.idx   (index of the shader file)
-  game_root/                    (the files of your disc)</pre>
+  game_root/                    (the files of your disc)
+  masseffect/0000000000000000/  (DLC packages, only if you added any)</pre>
     <p><a class="btn" href="releases/masseffect-nx-forwarder.nsp" download data-i18n="download_nsp_btn">Download the NSP launcher</a></p>
     <p data-i18n="nsp_instruction">Install the NSP with your CFW title installer to launch Mass Effect from the HOME menu.
       It uses 39-bit application mode and needs the files above on the SD card.
@@ -129,6 +212,6 @@
   <a href="#credits" data-i18n="footer_credits">Credits</a> · <a href="THIRD_PARTY_NOTICES.md" data-i18n="footer_notices">Third-party notices</a> · <span data-i18n="footer_disclaimer">Not affiliated with BioWare, Electronic Arts or Nintendo.</span>
 </footer>
 
-<script type="module" src="js/app.js?v=0.1.4"></script>
+<script type="module" src="js/app.js?v=0.3.1"></script>
 </body>
 </html>

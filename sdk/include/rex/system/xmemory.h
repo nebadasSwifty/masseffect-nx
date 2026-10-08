@@ -270,6 +270,23 @@ class BaseHeap {
   rex::thread::global_critical_region global_critical_region_;
   std::recursive_mutex heap_mutex_;
   std::vector<PageEntry> page_table_;
+
+  // Free-page bitmap mirroring page_table_ (bit set = page state 0, i.e. free), guarded by heap_mutex_.
+  // AllocRange uses it (cvar heap_free_bitmap) to skip 64 used pages per load instead of reading one 16-byte
+  // PageEntry per page; the chosen address is exactly the one of the linear page-table scan.
+  std::vector<uint64_t> free_bits_;
+  // Recomputes the bitmap bits of pages [first_page, last_page] from page_table_ (clamped to the table).
+  void UpdateFreeBits(uint32_t first_page, uint32_t last_page);
+  bool IsPageFreeBit(uint32_t page) const { return (free_bits_[page >> 6] >> (page & 63)) & 1; }
+  // Highest free page <= page and >= low, or -1.
+  int64_t FindHighestFreePage(uint32_t page, uint32_t low) const;
+  // Lowest free page >= page and <= high, or UINT32_MAX.
+  uint32_t FindLowestFreePage(uint32_t page, uint32_t high) const;
+  // Lowest used page in [first_page, last_page], or UINT32_MAX.
+  uint32_t FindLowestUsedPage(uint32_t first_page, uint32_t last_page) const;
+  // The page-table scan of AllocRange done on free_bits_. Returns the base page or UINT32_MAX.
+  uint32_t FindFreeRangeBitmap(uint32_t low_page_number, uint32_t max_base_page_number,
+                               uint32_t page_count, uint32_t page_scan_stride, bool top_down) const;
 };
 
 // Normal heap allowing allocations from guest virtual address ranges.

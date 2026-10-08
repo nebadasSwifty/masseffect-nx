@@ -19,6 +19,8 @@ and hacBrewPack, and produces:
 - `masseffect-nx-forwarder.nsp`, title ID `01a5eec700000000`, 39-bit application mode.
 - `masseffect-nx-starter.zip`, extracted into the SD card root.
 - `masseffect.toml` and `SHA256SUMS`.
+- `masseffect_prewarm_list-<en|ru>.bin`: each edition's shipped pipeline prewarm list, from `app/prewarm/` (attached
+  with the NROs when present; optional; see `docs/cold-start-hitches.md` section C).
 
 The workflow publishes a normal release marked Latest by default (the manual
 `prerelease` option is available for preview builds). It publishes the draft only

@@ -37,6 +37,9 @@ jobs:
           # Every edition the installer offers (installer/config.js) needs its NRO in the release.
           test -f "$MASSEFFECT_XEX_RU" || { echo 'Set the MASSEFFECT_XEX_RU repository variable to a private Russian default.xex'; exit 1; }
           test -f "$MESA_SDK/opt/devkitpro/portlibs/switch/lib/libvulkan.a" || { echo 'Set MESA_SDK to the private NVK SDK'; exit 1; }
+          # The release driver is Mesa -Doptimization=2 (mesa/build_mesa_docker.sh default since 2026-10-07).
+          grep -q -- '-Doptimization=2' "$MESA_SDK/SOURCE.txt" 2>/dev/null \
+            || echo "::warning::MESA_SDK ($MESA_SDK) is not recorded as -Doptimization=2; rebuild it with mesa/build_mesa_docker.sh (MESA_OPT=2)"
           python3 - <<'PY'
           import hashlib, os
           with open(os.environ['MASSEFFECT_XEX'], 'rb') as f:
@@ -60,7 +63,9 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git tag "$RELEASE_TAG"
           git push origin "$RELEASE_TAG"
-          gh release create "$RELEASE_TAG" out/nx/masseffect-nx.nro out/nx-ru/masseffect-nx-rus.nro --verify-tag --draft --title "Mass Effect NX $RELEASE_TAG" --notes-file docs/release-notes.md
+          # The editions' shipped pipeline prewarm lists (app/prewarm/, docs/cold-start-hitches.md C); optional.
+          lists=$(ls app/prewarm/masseffect_prewarm_list-*.bin 2>/dev/null || true)
+          gh release create "$RELEASE_TAG" out/nx/masseffect-nx.nro out/nx-ru/masseffect-nx-rus.nro $lists --verify-tag --draft --title "Mass Effect NX $RELEASE_TAG" --notes-file docs/release-notes.md
           gh workflow run release.yml --ref main -f tag="$RELEASE_TAG" -f prerelease=false
       - name: Remove private input from the runner checkout
         if: always()

@@ -55,6 +55,12 @@ stage() {
       cmp -s "$f" "$W/$f" || { echo "error: overlay file $f was not applied to $W" >&2; exit 1; }
     done) || exit 1
   fi
+  # Hooks every edition's app header must keep (an overlay copy without them silently disables the feature:
+  # the RU full NSP failed with "--game_data_root was not provided" that way, docs/full-nsp.md).
+  for hook in 'me::packaged::ConfigurePaths(paths)' 'me::packaged::ReportPaths(paths)' 'me::packaged::LogStatus()'; do
+    grep -qF "$hook" "$W/app/src/masseffect_app.h" || {
+      echo "error: $W/app/src/masseffect_app.h lacks $hook (update the overlay copy)" >&2; exit 1; }
+  done
   cp "$ED/edition.env" "$W/edition.env"
   # Docker only mounts the tree itself: small inputs the build reads are copied, not linked (sdk is mounted by build_nro.sh).
   rsync -a "$ROOT/extras/" "$W/extras/"
@@ -70,6 +76,13 @@ case "$STEP" in
     check_xex; stage
     export XEX
     if [[ "$ID" != en && ! "$XEX" -ef "$W/assets/game_root/default.xex" ]]; then cp -f "$XEX" "$W/assets/game_root/default.xex"; fi
+    # Reading the virtual counter (mrs ..., cntvct_el0) traps on Horizon and kills the calling thread (2026-10-07: the
+    # ring thread died at start, black screen). Use cntpct_el0 / armGetSystemTick.
+    if grep -rnE 'mrs %[^,]*, *cntvct_el0' "$W/app/src" "$ROOT/sdk/src" >/dev/null 2>&1; then
+      echo "error: cntvct_el0 read in the sources (traps on Horizon):" >&2; grep -rnE 'mrs %[^,]*, *cntvct_el0' "$W/app/src" "$ROOT/sdk/src" >&2; exit 1; fi
+    # Two REX_HOOK_RAW definitions of one guest function link without an error and one of them is silently lost.
+    DUP_HOOKS="$(grep -rhoE 'REX_HOOK_RAW\(sub_[0-9A-Fa-f]+\)' "$W/app/src" | sort | uniq -d)"
+    if [[ -n "$DUP_HOOKS" ]]; then echo "error: guest functions hooked more than once: $DUP_HOOKS" >&2; exit 1; fi
     # The post-codegen direct-call patch bakes in the set of hooked guest functions (every 82xxxxxx address in the sources).
     # The generator keeps unchanged output, so after the hook set changes (new overlay file, new hook) the old direct calls
     # would bypass the new hooks. Regenerate from scratch when the set differs from the one of the last codegen.
@@ -81,7 +94,9 @@ case "$STEP" in
     fi
     if [[ "$STEP" != build ]]; then ( cd "$W" && XEX="$W/assets/game_root/default.xex" bash tools/codegen.sh ); echo "$HOOKS_NOW" > "$HOOKS_FILE"; fi
     if [[ "$STEP" != codegen ]]; then
-      ( cd "$W" && MESA_SDK="${MESA_SDK:-$( [[ -d "$ROOT/out/mesa-sdk" ]] && echo "$ROOT/out/mesa-sdk" || echo "$ROOT/../mesa-sdk" )}" bash tools/build_nro.sh )
+      # Default driver: out/mesa-sdk (-O2); MESA_OPT=O1 picks the -O1 fallback out/mesa-sdk-o1 (docs/mesa.md).
+      MESA_DIR_NAME=mesa-sdk; if [[ "${MESA_OPT:-}" =~ ^[Oo]?1$ ]]; then MESA_DIR_NAME=mesa-sdk-o1; fi
+      ( cd "$W" && MESA_SDK="${MESA_SDK:-$( [[ -d "$ROOT/out/$MESA_DIR_NAME" ]] && echo "$ROOT/out/$MESA_DIR_NAME" || echo "$ROOT/../$MESA_DIR_NAME" )}" bash tools/build_nro.sh )
       if [[ "$ID" != en ]]; then
         mkdir -p "$ROOT/out/nx-$ID"; cp -f "$W/out/nx/masseffect-nx.nro" "$ROOT/out/nx-$ID/$NRO_NAME.nro" 2>/dev/null \
           && echo "== NRO: $ROOT/out/nx-$ID/$NRO_NAME.nro"

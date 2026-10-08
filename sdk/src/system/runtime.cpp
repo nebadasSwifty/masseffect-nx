@@ -291,13 +291,29 @@ uint8_t* Runtime::virtual_membase() const {
   return memory_ ? memory_->virtual_membase() : nullptr;
 }
 
+namespace {
+// std::filesystem::absolute, except for Horizon device paths ("romfs:/game_root" in an installed NSP): libstdc++
+// sees no root directory in "device:/x", so absolute() would prepend the current directory and break the path.
+// Rooted SD paths ("/switch/...") and every other platform go through absolute() as before.
+std::filesystem::path AbsoluteHostRoot(const std::filesystem::path& path) {
+#if defined(__SWITCH__)
+  const std::string text = path.generic_string();
+  const size_t colon = text.find(':');
+  if (colon != std::string::npos && colon > 0 && colon < text.find('/')) {
+    return path;
+  }
+#endif
+  return std::filesystem::absolute(path);
+}
+}  // namespace
+
 bool Runtime::SetupVfs() {
   if (game_data_root_.empty()) {
     REXSYS_WARN("Runtime::SetupVfs: No game_data_root specified, skipping VFS setup");
     return true;
   }
 
-  auto abs_game_root = std::filesystem::absolute(game_data_root_);
+  auto abs_game_root = AbsoluteHostRoot(game_data_root_);
   if (!std::filesystem::exists(abs_game_root)) {
     REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
     return false;
@@ -324,7 +340,7 @@ bool Runtime::SetupVfs() {
 
   // Mount update_data_root as update:\ if provided
   if (!update_data_root_.empty()) {
-    auto abs_update_root = std::filesystem::absolute(update_data_root_);
+    auto abs_update_root = AbsoluteHostRoot(update_data_root_);
     if (std::filesystem::exists(abs_update_root)) {
       auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
       auto update_device =

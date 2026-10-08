@@ -6,6 +6,8 @@
 
 #include <malloc.h>
 #include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <switch.h>
 
 #include <algorithm>
@@ -26,6 +28,50 @@ constexpr size_t kBlockSize = 0x200000;
 
 constexpr size_t AlignDown(size_t v, size_t a) { return v & ~(a - 1); }
 constexpr size_t AlignUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
+
+/*
+ * Large pages (guest_memory_large_pages, see docs/platform-notes.md, "Guest memory page size")
+ *
+ * The kernel maps with a 2 MB block descriptor only where the virtual address and the physical
+ * address are congruent modulo 2 MB (KPageTable::MapContiguous walks up the block sizes while
+ * (virt & (size - 1)) == (phys & (size - 1))). The backing of a chunk is memalign'd to 2 MB from
+ * the heap, whose 2 MB-aligned virtual addresses sit on 2 MB-aligned physical blocks, so what decides
+ * the page size of the window is the window's own alignment. Before this, the window base came from
+ * virtmemFindAslr(size, kBlockSize), whose second argument is a guard size, not an alignment: the
+ * base was only 4 KB aligned (0x...238000 in a console log) and every view was mapped with 4 KB pages.
+ *
+ * Modes (init only, set with RexGmConfigure before RexGmInit):
+ *   0  as before: window and shadows at whatever address virtmem returns.
+ *   1  window base aligned to kWindowAlign and shadows aligned to their chunk alignment. Every view
+ *      except 0xE0000000 becomes 2 MB-congruent (that view mirrors mapping offset 0x100001000, so it
+ *      is 4 KB out of phase with the others).
+ *   2  as 1, and the chunk grid of the physical range (mapping offsets >= 0x100000000) is shifted by
+ *      4 KB so that 0xE0000000 is the congruent view, and 0xA0000000, 0xC0000000, 0x7F000000 and the
+ *      raw physical view are not. Which of the two pays off depends on which view the game touches.
+ */
+constexpr size_t kWindowAlign  = 0x2000000;  /* 32 MB: also allows the 32 MB contiguous hint */
+constexpr size_t kPhysStart    = 0x100000000ull;
+constexpr size_t kE0Phase      = 0x1000;
+int    g_large_pages_mode = 0;
+size_t g_phys_phase       = 0;
+
+/* Chunk grid: 2 MB granules, shifted by g_phys_phase in the physical range. */
+size_t GridDown(size_t off) {
+    if (g_phys_phase && off >= kPhysStart) {
+        if (off < kPhysStart + g_phys_phase) return kPhysStart;
+        return kPhysStart + g_phys_phase +
+               AlignDown(off - kPhysStart - g_phys_phase, kBlockSize);
+    }
+    return AlignDown(off, kBlockSize);
+}
+
+size_t GridUp(size_t off) {
+    if (g_phys_phase && off > kPhysStart) {
+        if (off <= kPhysStart + g_phys_phase) return kPhysStart + g_phys_phase;
+        return kPhysStart + g_phys_phase + AlignUp(off - kPhysStart - g_phys_phase, kBlockSize);
+    }
+    return AlignUp(off, kBlockSize);
+}
 
 /* A committed chunk: heap backing, its code alias (the shadow), and the span of the mapping it covers. */
 struct Chunk {
@@ -120,7 +166,64 @@ State& S() {
     return s;
 }
 
-Handle Proc() { return envGetOwnProcessHandle(); }
+/*
+ * Our own process handle for the svc*Process* calls. Under hbloader (NRO) libnx has the real one hbloader passes.
+ * Started as the NSO of an installed NSP (docs/full-nsp.md) libnx has none (INVALID_HANDLE), so a real handle is made
+ * the way nx-hbloader makes its own (getOwnProcessHandle): the current-process pseudo-handle is sent to ourselves as
+ * a copy handle over a private session, and the kernel hands the receiver a real handle to this process. If that
+ * fails, the pseudo-handle itself is used.
+ */
+struct OwnHandleExchange {
+    Handle server = INVALID_HANDLE;
+    Handle received = INVALID_HANDLE;
+};
+
+void ReceiveOwnProcessHandle(void* arg) {
+    auto* x = static_cast<OwnHandleExchange*>(arg);
+    void* base = armGetTls();
+    hipcMakeRequest(base, HipcMetadata{});
+    s32 index = 0;
+    if (R_SUCCEEDED(svcReplyAndReceive(&index, &x->server, 1, INVALID_HANDLE, UINT64_MAX))) {
+        const HipcParsedRequest r = hipcParseRequest(base);
+        if (r.meta.num_copy_handles == 1) x->received = r.data.copy_handles[0];
+    }
+    // Closing the session without a reply releases the sender (its request then fails, as in hbloader).
+    svcCloseHandle(x->server);
+}
+
+Handle AcquireOwnProcessHandle() {
+    OwnHandleExchange x;
+    Handle client = INVALID_HANDLE;
+    if (R_FAILED(svcCreateSession(&x.server, &client, 0, 0))) return CUR_PROCESS_HANDLE;
+    Thread t;
+    if (R_SUCCEEDED(threadCreate(&t, ReceiveOwnProcessHandle, &x, nullptr, 0x4000, 0x20, -2))) {
+        if (R_SUCCEEDED(threadStart(&t))) {
+            HipcMetadata meta{};
+            meta.num_copy_handles = 1;
+            hipcMakeRequest(armGetTls(), meta).copy_handles[0] = CUR_PROCESS_HANDLE;
+            svcSendSyncRequest(client);
+            threadWaitForExit(&t);
+        } else {
+            svcCloseHandle(x.server);
+        }
+        threadClose(&t);
+    } else {
+        svcCloseHandle(x.server);
+    }
+    svcCloseHandle(client);
+    return x.received != INVALID_HANDLE ? x.received : CUR_PROCESS_HANDLE;
+}
+
+Handle Proc() {
+    static const Handle own = [] {
+        const Handle hbl = envGetOwnProcessHandle();
+        return hbl != INVALID_HANDLE ? hbl : AcquireOwnProcessHandle();
+    }();
+    return own;
+}
+
+// Made at load time, in an ordinary context: the first Proc() call may otherwise come from the fault handler.
+[[maybe_unused]] const Handle g_own_process_at_startup = Proc();
 
 bool Intersect(size_t a, size_t al, size_t b, size_t bl, size_t* lo, size_t* hi) {
     const size_t l = a > b ? a : b;
@@ -357,7 +460,18 @@ uint8_t* RexGmInit(size_t size) {
     if (s.base) return s.base;
 
     virtmemLock();
-    s.base = static_cast<uint8_t*>(virtmemFindAslr(size, kBlockSize));
+    if (g_large_pages_mode != 0) {
+        /*
+         * virtmemFindAslr only page-aligns. Ask for a slice kWindowAlign larger and reserve the
+         * aligned part of it; the slack in front stays free address space.
+         */
+        uint8_t* slice = static_cast<uint8_t*>(virtmemFindAslr(size + kWindowAlign, kBlockSize));
+        s.base = slice ? reinterpret_cast<uint8_t*>(
+                             AlignUp(reinterpret_cast<size_t>(slice), kWindowAlign))
+                       : nullptr;
+    } else {
+        s.base = static_cast<uint8_t*>(virtmemFindAslr(size, kBlockSize));
+    }
     if (s.base) s.reservation = virtmemAddReservation(s.base, size);
     virtmemUnlock();
 
@@ -493,8 +607,8 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
      * 64 KB commit with only 329 MB of backing. The extra pages are backing only;
      * guest-level commit state is still kept by the heaps in xmemory.cpp.
      */
-    const size_t begin = AlignDown(offset, kBlockSize);
-    const size_t end   = std::min(AlignUp(offset + length, kBlockSize), s.size);
+    const size_t begin = GridDown(offset);
+    const size_t end   = std::min(GridUp(offset + length), s.size);
 
     size_t cur = begin;
     while (cur < end) {
@@ -510,8 +624,7 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
             gap_end = sig->second.offset;
 
         const size_t sz = gap_end - cur;
-        const size_t align = (sz >= kBlockSize && (cur & (kBlockSize - 1)) == 0)
-                                 ? kBlockSize : kPageSize;
+        const size_t align = (sz >= kBlockSize && GridDown(cur) == cur) ? kBlockSize : kPageSize;
 
         void* backing = memalign(align, sz);
         if (!backing) {
@@ -521,7 +634,14 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
         memset(backing, 0, sz);
 
         virtmemLock();
-        void* shadow = virtmemFindCodeMemory(sz, align);
+        /* The second argument is a guard size; with large pages the alias is aligned by hand. */
+        void* shadow = nullptr;
+        if (g_large_pages_mode != 0 && align > kPageSize) {
+            void* slice = virtmemFindCodeMemory(sz + align, align);
+            if (slice) shadow = reinterpret_cast<void*>(AlignUp(reinterpret_cast<size_t>(slice), align));
+        } else {
+            shadow = virtmemFindCodeMemory(sz, align);
+        }
         Result rc = shadow ? svcMapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow),
                                                      reinterpret_cast<u64>(backing), sz)
                            : 0;
@@ -754,6 +874,320 @@ void* RexGmShadowFor(uint64_t window_address) {
     if (!c) return nullptr;
 
     return static_cast<uint8_t*>(c->shadow) + (off_mapping - c->offset);
+}
+
+void RexGmConfigure(int large_pages_mode) {
+    State& s = S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.base) return;  /* init only: the window and its chunk grid are fixed once reserved */
+    if (large_pages_mode < 0 || large_pages_mode > 2) large_pages_mode = 0;
+    g_large_pages_mode = large_pages_mode;
+    g_phys_phase = large_pages_mode == 2 ? kE0Phase : 0;
+}
+
+int RexGmLargePagesMode(void) { return g_large_pages_mode; }
+
+/*
+ * One line describing how the window is mapped. Two independent sources:
+ *
+ * - svcQueryMemory over the window: the kernel's memory blocks (state/permission runs). It does not
+ *   show page-table block sizes, but it shows how many separate mapped runs there are and whether
+ *   they start 2 MB aligned.
+ * - per mapped 2 MB window granule: whether the window address is congruent modulo 2 MB with the
+ *   heap address of its backing ("va"), and, when svcQueryPhysicalAddress (0x54) is allowed, with
+ *   its physical address over a physically contiguous 2 MB ("pa"). A granule that passes "pa" and
+ *   holds no watched page is mapped with a 2 MB block by the kernel's mapping rule.
+ *
+ * The lock is held only to copy the bookkeeping; the system calls run without it.
+ */
+size_t RexGmLayoutSummary(char* buf, size_t cap) {
+    if (!buf || cap == 0) return 0;
+    buf[0] = '\0';
+    const u64 t0 = armGetSystemTick();
+
+    struct Granule {
+        uint64_t win;      /* window address, 2 MB aligned */
+        uint64_t backing;  /* heap address of its backing */
+        uint8_t  view;
+        bool     watched;  /* holds a page with logical protection */
+    };
+    struct ViewInfo {
+        uint64_t base;
+        size_t   mapped = 0;
+    };
+    std::vector<Granule> granules;
+    std::vector<ViewInfo> views;
+    uint64_t wbase = 0;
+    size_t wsize = 0, nchunks = 0, shadow_congruent = 0, big_chunks = 0, nprotected = 0;
+    {
+        State& s = S();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (!s.base) return 0;
+        wbase = reinterpret_cast<uint64_t>(s.base);
+        wsize = s.size;
+        nchunks = s.chunks.size();
+        nprotected = s.protection.size();
+        for (const View& v : s.views) views.push_back({reinterpret_cast<uint64_t>(v.base), 0});
+        for (const auto& kv : s.chunks) {
+            const Chunk& c = kv.second;
+            if (c.length >= kBlockSize) {
+                big_chunks++;
+                if (((reinterpret_cast<size_t>(c.shadow) - reinterpret_cast<size_t>(c.backing)) &
+                     (kBlockSize - 1)) == 0)
+                    shadow_congruent++;
+            }
+        }
+        for (const auto& vm : s.view_mapped) {
+            const size_t vi = vm.first;
+            const Chunk* c = ChunkAt(s, vm.second);
+            if (!c || vi >= s.views.size()) continue;
+            const View& v = s.views[vi];
+            size_t lo, hi;
+            if (!Intersect(c->offset, c->length, v.offset, v.length, &lo, &hi)) continue;
+            const uint64_t win_lo = reinterpret_cast<uint64_t>(v.base) + (lo - v.offset);
+            const uint64_t win_hi = win_lo + (hi - lo);
+            views[vi].mapped += hi - lo;
+            for (uint64_t g = AlignUp(win_lo, kBlockSize); g + kBlockSize <= win_hi; g += kBlockSize) {
+                const size_t goff = lo + static_cast<size_t>(g - win_lo);
+                Granule gr;
+                gr.win = g;
+                gr.backing = reinterpret_cast<uint64_t>(c->backing) + (goff - c->offset);
+                gr.view = static_cast<uint8_t>(vi);
+                auto it = s.protection.lower_bound(static_cast<size_t>(g - wbase));
+                gr.watched = it != s.protection.end() && it->first < static_cast<size_t>(g - wbase) + kBlockSize;
+                granules.push_back(gr);
+            }
+        }
+    }
+
+    /* Kernel memory blocks inside the window. */
+    size_t regions = 0, region_bytes = 0, aligned_starts = 0, r_small = 0, r_mid = 0, r_big = 0;
+    for (uint64_t a = wbase; a < wbase + wsize;) {
+        MemoryInfo mi{};
+        u32 pi = 0;
+        if (R_FAILED(svcQueryMemory(&mi, &pi, a)) || mi.size == 0) break;
+        const uint64_t lo = std::max<uint64_t>(mi.addr, wbase);
+        const uint64_t hi = std::min<uint64_t>(mi.addr + mi.size, wbase + wsize);
+        if ((mi.type & 0xFF) != MemType_Unmapped && hi > lo) {
+            regions++;
+            region_bytes += hi - lo;
+            if ((lo & (kBlockSize - 1)) == 0) aligned_starts++;
+            const uint64_t len = hi - lo;
+            if (len < 0x10000) r_small++;
+            else if (len < kBlockSize) r_mid++;
+            else r_big++;
+        }
+        a = mi.addr + mi.size;
+    }
+
+    /* Per view: granules, va-congruent, pa-eligible. */
+    const bool can_pa = envIsSyscallHinted(0x54);
+    Result pa_rc = 0;
+    std::vector<size_t> g_total(views.size()), g_va(views.size()), g_pa(views.size()),
+        g_watched(views.size());
+    size_t pa_tested = 0;
+    for (const Granule& g : granules) {
+        g_total[g.view]++;
+        if (g.watched) g_watched[g.view]++;
+        if (((g.win - g.backing) & (kBlockSize - 1)) == 0) g_va[g.view]++;
+        if (!can_pa || g.watched) continue;
+        PhysicalMemoryInfo pmi{};
+        const Result rc = svcQueryPhysicalAddress(&pmi, g.win);
+        if (R_FAILED(rc)) {
+            if (!pa_rc) pa_rc = rc;
+            continue;
+        }
+        pa_tested++;
+        const uint64_t phys = pmi.physical_address + (g.win - pmi.virtual_address);
+        const bool covers = pmi.virtual_address <= g.win &&
+                            pmi.virtual_address + pmi.size >= g.win + kBlockSize;
+        if (covers && ((phys - g.win) & (kBlockSize - 1)) == 0) g_pa[g.view]++;
+    }
+
+    size_t n = static_cast<size_t>(std::snprintf(
+        buf, cap,
+        "mode %d, window base mod 2MB 0x%llx | kernel blocks in window: %zu (%zu MB), "
+        "<64K %zu, 64K-2M %zu, >=2M %zu, 2MB-aligned starts %zu | chunks %zu, shadows 2MB-congruent "
+        "%zu/%zu, watched pages %zu | per view MB, 2MB granules va-congruent/pa-eligible/total "
+        "(watched):",
+        g_large_pages_mode, (unsigned long long)(wbase & (kBlockSize - 1)), regions,
+        region_bytes >> 20, r_small, r_mid, r_big, aligned_starts, nchunks, shadow_congruent,
+        big_chunks, nprotected));
+    for (size_t i = 0; i < views.size() && n < cap; i++) {
+        if (views[i].mapped == 0) continue;
+        n += static_cast<size_t>(std::snprintf(
+            buf + n, cap - n, " %08llx %zu MB %zu/%s%zu/%zu (%zu)",
+            (unsigned long long)(views[i].base - wbase), views[i].mapped >> 20, g_va[i],
+            can_pa ? "" : "-", can_pa ? g_pa[i] : 0, g_total[i], g_watched[i]));
+    }
+    if (n < cap) {
+        const u64 us = armTicksToNs(armGetSystemTick() - t0) / 1000;
+        if (can_pa) {
+            n += static_cast<size_t>(std::snprintf(buf + n, cap - n,
+                                                   " | svcQueryPhysicalAddress: %zu granules, first "
+                                                   "failure 0x%x | %llu us",
+                                                   pa_tested, pa_rc, (unsigned long long)us));
+        } else {
+            n += static_cast<size_t>(std::snprintf(
+                buf + n, cap - n, " | svcQueryPhysicalAddress not allowed (pa column is '-') | %llu us",
+                (unsigned long long)us));
+        }
+    }
+    return n < cap ? n : cap - 1;
+}
+
+/*
+ * TLB micro-benchmark (guest_memory_tlb_benchmark)
+ *
+ * A random cyclic chain over the 64-byte lines of a buffer: each load gives the offset of the next,
+ * so loads are dependent and almost every one misses the caches. The same physical memory is read
+ * through mappings that differ only in how the kernel can map them:
+ *
+ *   heap          the newlib heap itself (mapped by svcSetHeapSize)
+ *   shadow        a code alias of it (svcMapProcessCodeMemory), 2 MB aligned
+ *   pm+0          svcMapProcessMemory at a 2 MB-congruent address: 2 MB blocks if the physical
+ *                 memory allows them (the window with large pages)
+ *   pm+64K        congruent only modulo 64 KB: 64 KB contiguous-hint pages at best
+ *   pm+4K         congruent only modulo 4 KB: 4 KB pages (the window without large pages)
+ *
+ * The difference between pm+0 and pm+4K is the TLB cost per cold load. Run twice, over the whole
+ * buffer and over its first 8 MB (a working set that fits the A57 L2 TLB reach only with large pages).
+ */
+namespace {
+
+uint32_t ChaseLoads(const uint8_t* base, uint32_t start, size_t loads) {
+    uint32_t off = start;
+    for (size_t i = 0; i < loads; i++) off = *reinterpret_cast<const volatile uint32_t*>(base + off);
+    return off;
+}
+
+void BuildChain(uint8_t* buf, size_t bytes, uint64_t seed) {
+    const size_t lines = bytes / 64;
+    std::vector<uint32_t> order(lines);
+    for (size_t i = 0; i < lines; i++) order[i] = static_cast<uint32_t>(i);
+    uint64_t x = seed | 1;
+    for (size_t i = lines - 1; i > 0; i--) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        const size_t j = static_cast<size_t>(x % (i + 1));
+        std::swap(order[i], order[j]);
+    }
+    for (size_t i = 0; i < lines; i++) {
+        const uint32_t next = order[(i + 1) % lines];
+        *reinterpret_cast<uint32_t*>(buf + size_t(order[i]) * 64) = next * 64u;
+    }
+}
+
+double MeasureNsPerLoad(const uint8_t* base, size_t loads, uint32_t* sink) {
+    *sink += ChaseLoads(base, 0, loads / 4);  /* warm the caches that can be warmed */
+    const u64 t0 = armGetSystemTick();
+    *sink += ChaseLoads(base, 0, loads);
+    const u64 t1 = armGetSystemTick();
+    return double(armTicksToNs(t1 - t0)) / double(loads);
+}
+
+}  // namespace
+
+void RexGmTlbBenchmark(size_t bytes, size_t loads, RexGmEmitFn emit) {
+    if (!emit) return;
+    char line[512];
+    bytes = AlignUp(std::max<size_t>(bytes, 16 * kBlockSize), kBlockSize);
+    if (bytes > 0x40000000) bytes = 0x40000000;
+    if (loads < 100000) loads = 100000;
+
+    uint8_t* backing = static_cast<uint8_t*>(memalign(kBlockSize, bytes));
+    if (!backing) {
+        emit("TLB benchmark: memalign failed");
+        return;
+    }
+    std::memset(backing, 0, bytes);
+
+    const size_t small = std::min<size_t>(bytes, 4 * kBlockSize);
+    const size_t sizes[2] = {bytes, small};
+    double ns[2][5] = {};
+    uint32_t sink = 0;
+
+    /* heap: measured before the alias, which takes the heap pages away. */
+    for (int k = 0; k < 2; k++) {
+        BuildChain(backing, sizes[k], 0x9E3779B97F4A7C15ull + k);
+        ns[k][0] = MeasureNsPerLoad(backing, loads, &sink);
+    }
+
+    PhysicalMemoryInfo pmi{};
+    Result pa_rc = 0xFFFFFFFF;
+    if (envIsSyscallHinted(0x54)) pa_rc = svcQueryPhysicalAddress(&pmi, reinterpret_cast<u64>(backing));
+
+    virtmemLock();
+    uint8_t* shadow = nullptr;
+    if (void* slice = virtmemFindCodeMemory(bytes + kBlockSize, kBlockSize))
+        shadow = reinterpret_cast<uint8_t*>(AlignUp(reinterpret_cast<size_t>(slice), kBlockSize));
+    Result rc = shadow ? svcMapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow),
+                                                 reinterpret_cast<u64>(backing), bytes)
+                       : MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    virtmemUnlock();
+    if (R_FAILED(rc)) {
+        std::snprintf(line, sizeof(line), "TLB benchmark: code alias failed 0x%x", rc);
+        emit(line);
+        free(backing);
+        return;
+    }
+    rc = svcSetProcessMemoryPermission(Proc(), reinterpret_cast<u64>(shadow), bytes, Perm_Rw);
+
+    /* Address space for the process-memory mappings: 2 MB aligned plus room for the offsets. */
+    virtmemLock();
+    uint8_t* dst = nullptr;
+    VirtmemReservation* resv = nullptr;
+    const size_t span = bytes + 2 * kBlockSize;
+    if (void* slice = virtmemFindAslr(span + kBlockSize, kBlockSize)) {
+        dst = reinterpret_cast<uint8_t*>(AlignUp(reinterpret_cast<size_t>(slice), kBlockSize));
+        resv = virtmemAddReservation(dst, span);
+    }
+    virtmemUnlock();
+
+    Result map_rc = 0;
+    if (R_SUCCEEDED(rc)) {
+        const size_t deltas[3] = {0, 0x10000, 0x1000};
+        for (int k = 0; k < 2; k++) {
+            BuildChain(shadow, sizes[k], 0x9E3779B97F4A7C15ull + k);
+            ns[k][1] = MeasureNsPerLoad(shadow, loads, &sink);
+            for (int d = 0; d < 3 && resv; d++) {
+                uint8_t* at = dst + deltas[d];
+                const Result r = svcMapProcessMemory(at, Proc(), reinterpret_cast<u64>(shadow), bytes);
+                if (R_FAILED(r)) {
+                    if (!map_rc) map_rc = r;
+                    continue;
+                }
+                ns[k][2 + d] = MeasureNsPerLoad(at, loads, &sink);
+                svcUnmapProcessMemory(at, Proc(), reinterpret_cast<u64>(shadow), bytes);
+            }
+        }
+    }
+
+    if (resv) {
+        virtmemLock();
+        virtmemRemoveReservation(resv);
+        virtmemUnlock();
+    }
+    svcUnmapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow), reinterpret_cast<u64>(backing),
+                              bytes);
+    free(backing);
+
+    std::snprintf(line, sizeof(line),
+                  "TLB benchmark: %zu loads per run, random 64-byte lines; heap buffer 0x%llx, "
+                  "physical 0x%llx (contiguous %llu KB from 0x%llx, query 0x%x), alias permission 0x%x, "
+                  "map 0x%x, sink %u",
+                  loads, (unsigned long long)reinterpret_cast<uintptr_t>(backing),
+                  (unsigned long long)pmi.physical_address, (unsigned long long)(pmi.size >> 10),
+                  (unsigned long long)pmi.virtual_address, pa_rc, rc, map_rc, sink);
+    emit(line);
+    for (int k = 0; k < 2; k++) {
+        std::snprintf(line, sizeof(line),
+                      "TLB benchmark over %zu MB: ns/load heap %.1f | shadow %.1f | pm+0 (2MB blocks) %.1f "
+                      "| pm+64K %.1f | pm+4K (4KB pages) %.1f",
+                      sizes[k] >> 20, ns[k][0], ns[k][1], ns[k][2], ns[k][3], ns[k][4]);
+        emit(line);
+    }
 }
 
 }  // extern "C"

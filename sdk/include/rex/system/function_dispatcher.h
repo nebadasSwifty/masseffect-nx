@@ -112,8 +112,16 @@ class FunctionDispatcher : public IModuleRegistrar {
    */
   std::optional<std::pair<uint32_t, uint32_t>> UnregisterModule(const std::string& module_id);
 
+  /**
+   * Builds the compact indirect-call table (rex/ppc/indirect_dispatch.h) from the registered functions, once.
+   * Called lazily by the first miss of code generated with REX_INDIRECT_DISPATCH != 0; afterwards SetFunction and
+   * UnregisterModule keep it in step. Checks every entry against the guest-memory table and logs the result.
+   */
+  void BuildIndirectDispatchTable();
+
  private:
   bool Execute(ThreadState* thread_state, uint32_t address);
+  void RebuildIndirectDispatchTableLocked();
 
   struct ModuleTableInfo {
     uint32_t code_base;

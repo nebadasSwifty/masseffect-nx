@@ -104,6 +104,7 @@ This clones [mesa-switch](https://github.com/danfromtico/mesa-switch) at a pinne
 (`../mesa-sdk`), which is where the next step looks for it. After editing the driver source, use
 `SRC=<tree> mesa/build_mesa_docker.sh --incremental`. Details, the patch contents and the reference toolchain versions
 are in [mesa.md](mesa.md) and [../mesa/README.md](../mesa/README.md). `APPLY_ONLY=1` only clones and applies the patch.
+The driver is built at `-O2` (`MESA_OPT=2`, the default; `MESA_OPT=1` builds the old `-O1` driver, see mesa.md).
 
 ## 6. Build the NRO
 
@@ -122,7 +123,8 @@ Environment variables (all optional, described at the top of the script):
 | Variable | Default | Meaning |
 |---|---|---|
 | `JOBS` | 6 | Parallel compile jobs inside the container (1-2 GB each) |
-| `MESA_SDK` | `out/mesa-sdk` or `../mesa-sdk` | Folder produced by the driver build |
+| `MESA_SDK` | `out/mesa-sdk` or `../mesa-sdk` | Folder produced by the driver build (-O2) |
+| `MESA_OPT` | empty (O2) | `O1`: link the -O1 fallback driver from `out/mesa-sdk-o1` or `../mesa-sdk-o1` instead (ignored when `MESA_SDK` is set) |
 | `NRO_OUT` | `out/nx` | Build folder |
 | `MASSEFFECT_LTO` | OFF | Link-time optimization of the game and app code. Measured as no gain, needs about 16 GB |
 | `MASSEFFECT_PGO` | empty | `generate` or `use`: profile-guided optimization (see [toolchain.md](toolchain.md)) |

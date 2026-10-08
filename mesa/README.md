@@ -88,8 +88,27 @@ Needs `git` and `docker`; the first build takes an hour or more and about 15 GB.
    result at `<OUT>/opt/devkitpro/portlibs/switch/lib/libvulkan.a` (about 122 MB).
 
 Then build the NRO with `MESA_SDK=<OUT> tools/build_nro.sh` (it passes
-`-DREXGLUE_SWITCH_NVK_SDK=<OUT>/opt/devkitpro/portlibs/switch`). Ninja does not track the driver archive, so delete the
-NRO build directory after a driver change, otherwise the old driver stays linked.
+`-DREXGLUE_SWITCH_NVK_SDK=<OUT>/opt/devkitpro/portlibs/switch`). The NRO link depends on that archive (`LINK_DEPENDS`
+in `sdk/cmake/rexglue_switch.cmake`), so a rebuilt driver is relinked; delete NRO build directories configured before
+2026-10-07 once.
+
+### Optimization level (-O2 by default, -O1 fallback)
+
+Upstream `build-switch.sh` configures `-Doptimization=1`. `build_mesa_docker.sh` rewrites that line to `MESA_OPT`
+(default `2`; `1`, `2`, `3` or `O1`, `O2`, `O3`) before building, and records the level in `<OUT>/SOURCE.txt`. -O2
+was measured on the Switch on 2026-10-07: +5 % draw throughput in heavy scenes (15.7k -> 16.6k draws/s, 25.8 -> 26.4 fps,
+frames over 60 ms 160 -> 108 per route), same image.
+
+```sh
+mesa/build_mesa_docker.sh                         # -O2, the default driver
+OPT=1 mesa/build_mesa_opt.sh                      # -O1 fallback from an existing tree: out/mesa-sdk-o1, ~1 minute
+MESA_OPT=O1 tools/build_nro.sh                    # link the -O1 fallback (out/mesa-sdk-o1 or ../mesa-sdk-o1)
+OPT=3 mesa/build_mesa_opt.sh                      # experiments: out/mesa-sdk-o3, link with MESA_SDK=out/mesa-sdk-o3
+```
+
+`build_mesa_opt.sh` configures its own build directory (`builddir-switch-o<N>`) in an already built tree (it reuses
+`builddir-native` and the Docker image). `--incremental` picks the build directory of the requested level and refuses
+to merge an archive of another level.
 
 After editing the driver source: `SRC=<tree> mesa/build_mesa_docker.sh --incremental` (needs the Docker image and a
 previous full build in the same tree). If you change NAK, raise the revision number in `nvk_shader.c`.

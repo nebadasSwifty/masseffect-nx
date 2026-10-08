@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "hot/hot_all.h"
+#include "hot/n_8245FF18.h"  // TFieldIterator<UProperty>::IterateToNext
+#include "hot/n_8264E178.h"  // UE3 sprite emitter Render with prefetch
 
 REXCVAR_DEFINE_BOOL(masseffect_hot_guest, false, "Mass Effect",
                     "Enable every hot guest function replacement (src/native/hot); each also has its own "
@@ -31,9 +33,9 @@ REXCVAR_DEFINE_INT32(masseffect_hot_guard_period, 4096, "Mass Effect",
 
 namespace me::hot {
 
-void InitHook(Hook& h, bool own) {
+void InitHook(Hook& h, bool own, bool umbrella) {
   // May run on several threads at once for the first call: every writer stores the same values.
-  const bool on = own || REXCVAR_GET(masseffect_hot_guest);
+  const bool on = own || (umbrella && REXCVAR_GET(masseffect_hot_guest));
   const uint32_t guard_calls = uint32_t(std::max(0, REXCVAR_GET(masseffect_hot_guard_calls)));
   const uint32_t period = uint32_t(std::max(1, REXCVAR_GET(masseffect_hot_guard_period)));
   uint32_t p2 = 1;
@@ -238,3 +240,14 @@ ME_HOT_CVAR(masseffect_hot_object_hash, "Native sub_826EAF70 (object hash: CRC t
 ME_HOT_HOOK(826EAF70, masseffect_hot_object_hash, me::hot::n_826EAF70)
 ME_HOT_CVAR(masseffect_hot_skin_rebind, "Native sub_8264ADA0 (skin cache rebind: bone matrices 4x4 -> 3x4 copy)");
 ME_HOT_HOOK(8264ADA0, masseffect_hot_skin_rebind, me::hot::n_8264ADA0)
+// Fuzzed against the English generated code on 2026-10-08 (tests/hot_fuzz/cases/case_8245FF18.inc, case_8264E178.inc).
+ME_HOT_CVAR(masseffect_hot_field_iter, "Native sub_8245FF18 (TFieldIterator<UProperty>::IterateToNext)");
+ME_HOT_HOOK(8245FF18, masseffect_hot_field_iter, me::hot::n_8245FF18)
+ME_HOT_CVAR(masseffect_hot_sprite_render,
+            "Native sub_8264E178 (UE3 sprite emitter Render: particle sort keys with prefetch, sort, DrawRichMesh)");
+ME_HOT_HOOK(8264E178, masseffect_hot_sprite_render, me::hot::n_8264E178)
+
+// Not switched on by masseffect_hot_guest (own cvar only): added 2026-10-08, pending a console A/B.
+ME_HOT_CVAR(masseffect_hot_lzo,
+            "Native sub_827D2A00 (LZO1X decompressor of the package streaming threads; not part of masseffect_hot_guest)");
+ME_HOT_HOOK_OWN(827D2A00, masseffect_hot_lzo, me::hot::n_827D2A00)

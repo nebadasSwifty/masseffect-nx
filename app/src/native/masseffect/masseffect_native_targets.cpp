@@ -34,11 +34,18 @@
 #include "me_resolved_allocation.h"
 #include "me_resolved_sampling.h"
 #include "me_msaa_depth_resolve.h"
+#include "me_stencil_copy_regions.h"
+#include "me_resolve_repeat.h"
+#include "me_bias_life.h"
+#include "me_half_rop_test.h"
 #include "../me_shader_identity.h"
+#include "../me_ring_partition.h"
+#include "../me_texture_coherency.h"  // masseffect_native_texture_coherency
 
 #include <rex/cvar.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
+#include <rex/graphics/pipeline/texture/info.h>  // FormatInfo: masseffect_native_resolved_cpu_overwrite
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
 #include <rex/system/xmemory.h>
@@ -80,6 +87,31 @@ REXCVAR_DEFINE_BOOL(masseffect_native_reuse_alloc_resolved, true, "Mass Effect",
 REXCVAR_DEFINE_BOOL(masseffect_native_logical_resolved_size, true, "Mass Effect",
                    "Experimental MODE4: sample resolved textures at the proven logical fetch extent, "
                    "not their padded row pitch. false = existing direct resolved image");
+/*
+ * masseffect_native_resolved_cpu_overwrite (docs/image-defects-feros.md, section 7: missing letters).
+ *
+ * A resolve here writes only a GPU image (resolved_[base]); guest memory at the destination keeps whatever the CPU
+ * last wrote there. Fetches at that base were served from the GPU image for the rest of the session, even after the
+ * game freed the render-target texture and reused its memory for a CPU-filled texture at the same address (UI
+ * glyph-cache pages: Scaleform re-creates a page with CreateTexture + D3DXLoadSurfaceFromMemory, XPhysicalAlloc
+ * hands out the freed block again). That page then showed the old render target instead of its glyphs. On the 360
+ * the later CPU write replaces the resolved texels, so the fetch reads the CPU's bytes.
+ *
+ * With the switch: once an entry has not been resolved into for a whole frame, a fingerprint of its guest bytes is
+ * taken (full XXH3 up to 256 KB, above that 256 bytes of every 4 KB plus the first and last 4 KB). Fetches recheck it
+ * (every 1, 2, 4, 8 presents while unchanged; at once when the fetch's format or size differs from the resolve's).
+ * If the bytes changed, the CPU wrote there after the resolve: ResolvedTexture returns nullptr and the fetch takes
+ * the ordinary guest-memory path. The next resolve into that base serves the GPU image again. Read-backs into guest
+ * memory take a new fingerprint. A change between the last resolve and the fingerprint (under one frame) is not
+ * seen (old behavior). Exact in what it changes: only memory the CPU demonstrably rewrote is read from memory.
+ */
+REXCVAR_DEFINE_BOOL(masseffect_native_resolved_cpu_overwrite, true, "Mass Effect",
+                    "A resolved texture whose guest bytes the CPU rewrote after the last resolve (memory reused for "
+                    "another texture, e.g. a UI glyph page) is no longer served from the GPU copy: the fetch reads "
+                    "guest memory, as on the 360. false = old behavior (resolved copy forever)");
+REXCVAR_DEFINE_BOOL(masseffect_native_resolved_cpu_overwrite_log, true, "Mass Effect",
+                    "Log the first 64 resolved textures found rewritten by the CPU "
+                    "(masseffect_native_resolved_cpu_overwrite)");
 REXCVAR_DEFINE_INT32(masseffect_native_edram_alias_mode, 4, "Mass Effect",
                      "EDRAM diagnostic: 0 no transfers, 1 exact base, 2 physical tiles, 3 scissor tiles, "
                      "4 experimental shared depth/color ownership (not a complete bit-exact emulation)")
@@ -102,6 +134,12 @@ REXCVAR_DEFINE_BOOL(masseffect_native_resolver_no_copy, false, "MASSEFFECT",
 REXCVAR_DEFINE_BOOL(masseffect_native_edram4_cache_sync, true, "Mass Effect",
                     "EDRAM mode 4: do not transfer a physical tile again to a view that already received its "
                     "current version (read-only rebinds). false = transfer on every bind, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_edram4_sync_lean, false, "Mass Effect",
+                    "EDRAM mode 4 (ring CPU): the sync walk skips the per-tile area test (two integer divisions per "
+                    "tile owned by another view) inside the tile range already clipped to the area, where it is "
+                    "always true; only without a clear cutout or overwrite (they need the whole-tile flag). Exact; "
+                    "the first 4096 skips are checked")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(masseffect_native_edram4_area_rect, true, "Mass Effect",
                     "EDRAM mode 4: a draw with a proven rectangle synchronizes and publishes only the tiles of "
                     "that rectangle, not of its whole scissor. false = whole scissor, as before");
@@ -132,9 +170,28 @@ REXCVAR_DEFINE_BOOL(masseffect_native_edram4_import_area_tiles, true, "Mass Effe
 REXCVAR_DEFINE_BOOL(masseffect_native_edram4_clear_alias, true, "Mass Effect",
                     "EDRAM mode 4: a redirected depth clear over tiles the 4x view owns itself goes to that view's "
                     "known 1x alias (same base and tile pitch), which becomes the owner. false = draw, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_edram4_clear_alias_raw64, false, "Mass Effect",
+                    "EDRAM mode 4 (with edram4_clear_alias and edram4_stencil_lazy): a depth-only clear drawn "
+                    "through a 4x alias is also redirected into the 1x alias when a 64bpp color view owns some of "
+                    "its whole tiles (Eden Prime: the quarter-res DOF buffer C5A0 over the shadow map D5A0). Those "
+                    "tiles' stencil stays in the 4x view, exactly where the drawn clear leaves it, so the result is "
+                    "the same; the shadow draws then no longer pull the slot 4x -> 1x. docs/gpu-cost-analysis.md "
+                    "section 5. false = draw the clear on the 4x view, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_restore_into_7e3, false, "Mass Effect",
+                    "EDRAM mode 4: a proven full-overwrite opaque draw into a k_2_10_10_10 (UNORM10) view whose tiles "
+                    "the k_2_10_10_10_FLOAT (7e3) view of the same base reads next (UE3's scene restore before each "
+                    "shadowed light) renders straight into the 7e3 image with a bit-exact UNORM10 -> 7e3 output "
+                    "epilogue, so the f2 -> f3 conversion of the region disappears. false = draw into the UNORM10 "
+                    "view and convert, as before. docs/vulkan-frame-time.md section 8");
 REXCVAR_DEFINE_BOOL(masseffect_native_edram4_fast, true, "Mass Effect",
                     "EDRAM mode 4: O(1) sync/publish when a view already owns every tile of the draw area (ownership "
                     "epoch). false = always scan the tiles, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_edram4_pair_keys, false, "Mass Effect",
+                    "EDRAM mode 4 report: the per-transfer pair and draw statistics are kept under integer keys and "
+                    "turned into text only at the 10 s report (same report lines), instead of two to four "
+                    "fmt::format strings and std::map<std::string> lookups on the ring thread per transfer span. "
+                    "Diagnostics only: the image does not depend on it")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(masseffect_native_edram4_stencil_lazy, true, "Mass Effect",
                     "EDRAM mode 4: depth imports into a view that never used stencil skip the 8 stencil passes and "
                     "remember where the stencil stayed; importing back there keeps it. false = always 9 passes");
@@ -182,6 +239,58 @@ REXCVAR_DEFINE_BOOL(masseffect_native_resolve_7e3_direct, false, "MASSEFFECT",
                     "EDRAM mode 4: a resolve of the k_2_10_10_10 (UNORM10) scene view whose tiles all belong to the "
                     "k_2_10_10_10_FLOAT (7e3) image reads that image directly (same 32-bit words) instead of "
                     "converting the tiles to the UNORM10 view and back. false = convert, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_edram4_rect_list_tiles, false, "Mass Effect",
+                    "EDRAM mode 4: a proven rectangle-list draw (2..8 rectangles, e.g. the 2-pixel border clears of "
+                    "the shadow attenuation slot C5A0) transfers and claims only the tiles its rectangles touch, not "
+                    "every tile of their bounding box. Tiles it does not touch keep their owner (the draw writes none "
+                    "of their pixels). false = the bounding box, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_resolved_wake_no_clear, false, "Mass Effect",
+                    "A resolved texture taken back from the allocation pool is not cleared to zero (with its two "
+                    "barriers) when the resolve about to write it covers every texel. If that write does not happen, "
+                    "the zero clear is recorded after all. false = always clear, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_resolve_7e3_frag, false, "Mass Effect",
+                    "With masseffect_native_resolve_7e3_direct: the 7e3 -> k_2_10_10_10 resolve as a fragment pass "
+                    "writing the A2B10G10R10 texture as a color attachment (same word math as the compute shader), "
+                    "instead of a compute dispatch on storage images. false = compute, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_resolve_bias_probe, false, "Mass Effect",
+                    "Diagnostic only (no rendering change): counts exponent-bias resolves whose source tiles and "
+                    "destination are unchanged since an identical earlier resolve, and bias + 7e3 resolve pairs "
+                    "that read the same unchanged source (logged every 10 s). false = no counting");
+REXCVAR_DEFINE_BOOL(masseffect_native_bias_life_probe, false, "Mass Effect",
+                    "Diagnostic only (no rendering change, docs/vulkan-frame-time.md section 12): for every "
+                    "exponent-bias resolve, which draws produced its source (could a second output of them replace "
+                    "it exactly?) and what happens until the texture is written again (unread, readers that write "
+                    "the source, source content dead after the resolve). Logged every 10 s. false = off");
+REXCVAR_DEFINE_INT32(masseffect_native_bias_life_dump_s, 0, "Mass Effect",
+                     "With masseffect_native_bias_life_probe: this many seconds after start, log every bias resolve, "
+                     "every draw that writes a bias source or reads a resolved bias texture, and every clear of "
+                     "their tiles, in order, for 2 frames (up to 600 lines). 0 = no dump");
+REXCVAR_DEFINE_INT32(masseffect_native_resolve_7e3_pack, 0, "Mass Effect",
+                     "With masseffect_native_resolve_7e3_frag (docs/vulkan-frame-time.md section 11): 1 = the 7e3 -> "
+                     "UNORM10 resolve packs with a cheaper form of the same math (equal for every RGBA16F texel), "
+                     "2 = also writes the 32-bit word through an R32_UINT view of the texture instead of code / 1023 "
+                     "through the UNORM conversion (A2B10G10R10 textures created from then on are MUTABLE_FORMAT; "
+                     "older ones use 1). 0 = as before");
+REXCVAR_DEFINE_INT32(masseffect_native_resolve_repeat, 0, "Mass Effect",
+                     "EDRAM mode 4 (docs/vulkan-frame-time.md section 11): exponent-bias, 7e3 -> UNORM10 and depth "
+                     "resolves that would write exactly what their texture already holds (same request, source tiles "
+                     "with the same owner, version and write count, texture not written since; stencil-only writes "
+                     "do not count for depth). 0 = off, 1 = count them only (logged every 10 s), 2 = skip them");
+// docs/vulkan-frame-time.md section 10: the 1280x720 late stencil fetches (edram_import9).
+REXCVAR_DEFINE_BOOL(masseffect_native_edram4_stencil_copy_rows, false, "Mass Effect",
+                    "EDRAM mode 4: a copy-engine stencil import that covers whole tile rows writes them with one "
+                    "buffer-to-image region instead of one region per tile row (on NVK every region of a D32S8 "
+                    "stencil copy is two copy-engine launches, the second one non-pipelined). The same bytes land in "
+                    "the same texels. false = one region per tile row, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_edram4_stencil_known, false, "Mass Effect",
+                    "EDRAM mode 4: a late stencil fetch whose source tiles all hold one stencil value set by a "
+                    "whole-tile stencil clear (redirected or canonical), with nothing written into the source image "
+                    "since, becomes a stencil clear of the destination tiles to that value instead of an import "
+                    "(copy engine or 8 bit passes). false = always import, as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_edram4_stencil_fetch_area, false, "Mass Effect",
+                    "EDRAM mode 4: a stencil-using draw fetches the deferred stencil only for the tile rows and "
+                    "columns of its area (scissor and proven rectangle), not for every tile of its bound range; "
+                    "tiles outside keep their deferred record for a later user. false = the whole range, as before");
 REXCVAR_DEFINE_BOOL(masseffect_native_depth_samples_x, true, "MASSEFFECT",
                     "Experimental MODE4: preserve horizontal samples in depth-only 4x MSAA draws. "
                     "Y samples remain collapsed; expanded-depth direct resolves and FragCoord shaders "
@@ -255,6 +364,10 @@ REXCVAR_DEFINE_BOOL(masseffect_native_skip_cleared_repeated, true, "MASSEFFECT",
 // Defined in masseffect_native_draws.cpp; here it is only read so as not to open two queries of the same type
 // at once.
 REXCVAR_DECLARE(int32_t, masseffect_native_stats_per_draw_s);
+REXCVAR_DECLARE(int32_t, masseffect_native_query_mode);  // me_native_system.cpp
+REXCVAR_DECLARE(int32_t, masseffect_diag_velocity);  // masseffect_native_draws.cpp (docs/image-defects-feros.md)
+REXCVAR_DECLARE(int32_t, masseffect_diag_blur_source);  // masseffect_native_draws.cpp (docs/image-defects-feros.md 3.8)
+REXCVAR_DECLARE(int32_t, masseffect_native_velocity_16_16);  // masseffect_native_draws.cpp (me_fixed16_spirv.h)
 REXCVAR_DECLARE(bool, masseffect_native_pass_narrow_dependency);
 REXCVAR_DEFINE_BOOL(masseffect_native_stats_pipeline, false, "MASSEFFECT",
                     "Native renderer: counts shaded fragments, vertex invocations and clipped "
@@ -352,6 +465,15 @@ const uint32_t me_resolve_7e3_to_unorm10_cs[] = {
 };
 const uint32_t me_resolve_exp_bias_fs[] = {
 #include "me_resolve_exp_bias_frag.inc"
+};
+const uint32_t me_resolve_7e3_to_unorm10_fs[] = {
+#include "me_resolve_7e3_to_unorm10_frag.inc"
+};
+const uint32_t me_resolve_7e3_word_fs[] = {
+#include "me_resolve_7e3_word_frag.inc"
+};
+const uint32_t me_resolve_fixed16_fs[] = {
+#include "me_resolve_fixed16_frag.inc"
 };
 const uint32_t me_edram_depth_to_rgba8_cs[] = {
 #include "me_edram_depth_to_rgba8.inc"
@@ -528,6 +650,18 @@ struct Resolved {
   // lookup of the resolved texture is done anyway.
   uint64_t reads = 0;
   uint64_t revision = 0;
+  // masseffect_native_resolved_cpu_overwrite: our resolves never write guest memory, so the bytes at a
+  // resolve destination only change when the CPU (or a DMA) writes them. After the last resolve, a fingerprint of
+  // the destination's guest bytes is taken; if they change later, the game has reused that memory (on the 360
+  // the CPU write replaced the resolved texels) and fetches must read guest memory again.
+  uint64_t footprint = 0;          // bytes of the destination in guest memory (tiled, 32x32 aligned)
+  uint64_t resolve_present = 0;    // presented_ when it was last written by a resolve (or a read-back)
+  uint64_t guest_fingerprint = 0;  // of the destination's guest bytes, taken after the last resolve
+  uint64_t next_check = 0;         // presented_ of the next recheck
+  uint64_t shape_checked = UINT64_MAX;  // presented_ of the last recheck asked by a fetch of another shape
+  uint32_t check_interval = 1;     // presents between rechecks: 1, 2, 4, 8
+  bool baseline = false;           // guest_fingerprint is valid for the current resolved content
+  bool cpu_overwritten = false;    // the guest bytes changed after the last resolve: not served any more
 };
 
 struct ResolvedClip {
@@ -612,6 +746,9 @@ constexpr uint32_t kCountersStat = 3;  // vertices, clipped primitives and fragm
 // Draws measured in a diagnostic frame (the scene has ~1200).
 constexpr uint32_t kStatsDrawPerSlot = 8192;  // ME frames exceed 2048 draws
 constexpr uint32_t kLabelsShader = 512;
+// Real occlusion queries (masseffect_native_query_mode 2): Vulkan queries per work slot, one per draw inside a
+// guest query (the query boxes; a frame has a few hundred).
+constexpr uint32_t kOcclusionPerSlot = 4096;
 // Buckets of the copy breakdown by size (pixels of the copy).
 
 // One of the work slots: while a frame is being recorded, the previous ones can still be
@@ -654,6 +791,26 @@ struct SlotWork {
   // uint16 label above folds ME's ~30000 pixel shaders into 512).
   std::vector<uint32_t> draw_ps;
   std::vector<uint32_t> draw_vs;
+  // Real occlusion queries (masseffect_native_query_mode 2): the guest queries whose draws were recorded in
+  // this slot, the host-to-guest sample multiplier of each Vulkan query, how many of the slot's Vulkan
+  // queries were used and whether the slot's range was ever reset.
+  struct OcclusionGuest {
+    uint32_t address = 0;   // the guest end structure
+    uint32_t first = 0;     // first Vulkan query (index inside the slot's range)
+    uint32_t count = 0;     // Vulkan queries (= draws measured)
+    uint32_t visible = 0;   // the fallback count
+    uint64_t serial = 0;    // still wanted while occlusion_pending_[address] == serial
+    uint64_t frame = 0;     // Swaps seen when the guest query ended
+    double scale = 1.0;     // internal resolution to 1280x720
+    std::chrono::steady_clock::time_point ended{};
+    // Mode 3: the result only feeds the history table under `key`; nothing is written to the guest.
+    uint64_t key = 0;
+    bool latent = false;
+  };
+  std::vector<OcclusionGuest> occlusion;
+  std::vector<float> occlusion_multipliers;
+  uint32_t occlusion_used = 0;
+  bool occlusion_reset = false;
 };
 
 class TargetsVulkan final : public TargetsNative, public ContextTargets {
@@ -684,6 +841,9 @@ class TargetsVulkan final : public TargetsNative, public ContextTargets {
     views_raw64_rt_edram_.clear();
     if (fs_conv_r64_frag_) dfn_.vkDestroyShaderModule(device_, fs_conv_r64_frag_, nullptr);
     if (fs_bias_frag_) dfn_.vkDestroyShaderModule(device_, fs_bias_frag_, nullptr);
+    if (fs_7e3_frag_) dfn_.vkDestroyShaderModule(device_, fs_7e3_frag_, nullptr);
+    if (fs_7e3_word_frag_) dfn_.vkDestroyShaderModule(device_, fs_7e3_word_frag_, nullptr);
+    if (fs_fixed16_frag_) dfn_.vkDestroyShaderModule(device_, fs_fixed16_frag_, nullptr);
     for (const auto& [format, pass] : passes_conv_color_frag_) {
       if (pass.pipeline) dfn_.vkDestroyPipeline(device_, pass.pipeline, nullptr);
       if (pass.render_pass) dfn_.vkDestroyRenderPass(device_, pass.render_pass, nullptr);
@@ -812,6 +972,7 @@ class TargetsVulkan final : public TargetsNative, public ContextTargets {
     }
     if (queries_ != VK_NULL_HANDLE) dfn_.vkDestroyQueryPool(device_, queries_, nullptr);
     if (marks_draw_ != VK_NULL_HANDLE) dfn_.vkDestroyQueryPool(device_, marks_draw_, nullptr);
+    if (occlusion_ != VK_NULL_HANDLE) dfn_.vkDestroyQueryPool(device_, occlusion_, nullptr);
     for (uint32_t i = 0; i < kSlotsOutput; ++i) {
       if (fences_output_[i] != VK_NULL_HANDLE) dfn_.vkDestroyFence(device_, fences_output_[i], nullptr);
       if (pools_output_[i] != VK_NULL_HANDLE) dfn_.vkDestroyCommandPool(device_, pools_output_[i], nullptr);
@@ -1130,6 +1291,21 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       REXLOG_INFO("[native] targets: pipeline statistics per pass {}",
                   stats_ != VK_NULL_HANDLE ? "available (masseffect_native_stats_pipeline)"
                                                   : "not available");
+      // Real occlusion queries (masseffect_native_query_mode 2 and 3). Without the pool every guest query falls
+      // back to "visible", as with mode 0.
+      if (REXCVAR_GET(masseffect_native_query_mode) >= 2 && read_queries_) {
+        VkQueryPoolCreateInfo info_occlusion{};
+        info_occlusion.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        info_occlusion.queryType = VK_QUERY_TYPE_OCCLUSION;
+        info_occlusion.queryCount = uint32_t(slots_.size() * kOcclusionPerSlot);
+        if (dfn_.vkCreateQueryPool(device_, &info_occlusion, nullptr, &occlusion_) != VK_SUCCESS) {
+          occlusion_ = VK_NULL_HANDLE;
+        }
+        occlusion_precise_ = vulkan_device_->properties().occlusionQueryPrecise;
+        REXLOG_INFO("[native] targets: real occlusion queries {} ({} per slot, precise {})",
+                    occlusion_ != VK_NULL_HANDLE ? "ready" : "NOT available (pool creation failed)",
+                    kOcclusionPerSlot, occlusion_precise_ ? "yes" : "no");
+      }
     }
 
     VkSamplerCreateInfo info_sampler{};
@@ -1399,6 +1575,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
 
   bool CopyInternal(const RegistersCopy& reg) {
     edram4_operation_failed_ = false;
+    // masseffect_native_bias_life_probe (diagnostic only).
+    const bool bias_life_on = REXCVAR_GET(masseffect_native_edram_alias_mode) == 4 &&
+                              REXCVAR_GET(masseffect_native_bias_life_probe);
     // Preflight SDK clear ranges and backing padding before resolve/clear mutations.
     if (REXCVAR_GET(masseffect_native_edram_alias_mode) == 4 &&
         !ValidateSimultaneousClearEDRAM4(reg)) return false;
@@ -1410,8 +1589,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       draws_->FinishPass();  // copying and clearing are not allowed inside a pass
       // No longer on every copy; see GetResolved and Prepare.
       if (invalidate_each_copy_) {
-        draws_->InvalidateTextures();
+        draws_->InvalidateTexturesAt(UINT32_MAX, DrawsVulkan::kInvalidationEachCopy);
       }
+      draws_->NoteCopyTextures();  // masseffect_native_texture_copy_verify
     }
     if (Record()) {
       MarkGpu(kGpuCopies);  // GPU time of copies and clears (report)
@@ -1441,6 +1621,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       }
       if (will_clear) {
         ClearDepth(reg, pitch);
+        if (bias_life_on) BiasLifeClearDepth(reg);
       }
       return !edram4_operation_failed_;
     }
@@ -1459,6 +1640,12 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     if (!target_render) {
       return false;
     }
+    // masseffect_diag_blur_source: the EDRAM view this color resolve reads (ResolvedWritten records it).
+    struct BlurCopySource {
+      TargetsVulkan* d;
+      ~BlurCopySource() { d->blur_copy_source_ = nullptr; }
+    } blur_copy_source{this};
+    blur_copy_source_ = target_render;
     // The game has just said which area of this render target matters to it. It is the data RestoreContent
     // uses to stop copying the bottom rows that nobody draws or reads (the scene render target is created
     // 1280x1280 to draw 1280x720).
@@ -1497,8 +1684,14 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                                          target_format, (info_target >> 24) & 0x1,
                                          host_format_target, log2_texel, base_resolved, dx, dy);
         if (!resolved) {
+          // masseffect_native_resolved_wake_no_clear: the write below covers every texel of the texture.
+          resolved_wake_full_cover_ =
+              dx == 0 && dy == 0 && uint32_t(x0) < target_render->width && uint32_t(y0) < target_render->height &&
+              std::min(uint32_t(x1 - x0), target_render->width - uint32_t(x0)) >= pitch_target &&
+              std::min(uint32_t(y1 - y0), target_render->height - uint32_t(y0)) >= target_height;
           resolved = GetResolved(base_resolved, pitch_target, target_height, target_format,
                                      (info_target >> 24) & 0x1, host_format_target);
+          resolved_wake_full_cover_ = false;
         }
         if (resolved) {
           NoteCopy(base_resolved, resolved->image.width, resolved->image.height, draws_before);
@@ -1506,6 +1699,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       }
     }
 
+    // A woken pool texture whose zero clear was skipped must be written below; otherwise (a rejected or
+    // failed write, any early return) the clear is recorded on the way out.
+    struct OwedClear {
+      TargetsVulkan* d;
+      uint64_t copies_before;
+      ~OwedClear() { d->SettleWokenClearResolved(copies_before); }
+    } owed_clear{this, copies_};
     if (!Record()) {
       return false;
     }
@@ -1525,6 +1725,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         if (owner->prepared) direct_7e3 = owner;
       }
     }
+    // masseffect_native_bias_life_probe: the sync below imports into a bias source that does not own the area.
+    if (bias_life_on && do_copy && !direct_7e3 && BiasLifeSource(target_render) &&
+        SingleOwnerEDRAM4(*target_render, area_edram_) != target_render)
+      bias_life_.Imported(BiasLifeId(target_render));
     if (REXCVAR_GET(masseffect_native_edram_alias_mode) == 4 && do_copy && !direct_7e3 &&
         !(edram4_reason_ = 2, SynchronizeEDRAM4(*target_render, area_edram_))) return false;
     ActivateTargetColor(info_color & 0xFFF, pitch, *target_render);
@@ -1549,6 +1753,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                            target_render->format == kColorFormat &&
                            resolved->image.format == kColorFormat &&
                            (request_width * 4 >= fits_width * 5 || request_height * 4 >= fits_height * 5);
+      if (bias_life_on && !(width && height && uint32_t(x0) < target_render->width &&
+                            uint32_t(y0) < target_render->height && dx < resolved->image.width &&
+                            dy < resolved->image.height && !shrink))
+        BiasLifeResolve(*target_render, base_resolved, 0, false, x0, y0, x1, y1, format_resolved_target);
       if (shrink && uint32_t(x0) < target_render->width && uint32_t(y0) < target_render->height) {
         // masseffect_native_lazy_front. If this texture had a deferred copy, it is dropped if this resolve
         // covers it entirely, and recorded first otherwise.
@@ -1580,10 +1788,63 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                  dy < resolved->image.height) {
         const int32_t exp_bias =
             me::native::ColorResolveExponentBias(command, reg.rb_copy_dest_info);
-        if (exp_bias) {
+        if (bias_life_on)
+          BiasLifeResolve(*target_render, base_resolved, exp_bias,
+                          dx == 0 && dy == 0 && width == resolved->image.width && height == resolved->image.height,
+                          x0, y0, x0 + int32_t(width), y0 + int32_t(height), format_resolved_target);
+        if (exp_bias && REXCVAR_GET(masseffect_native_resolve_bias_probe))
+          ProbeResolveEDRAM4(1, base_resolved, *target_render, dx, dy, width, height, exp_bias,
+                             uint32_t(resolved->image.format));
+        // masseffect_native_resolve_repeat: what decides the written texels besides the source content.
+        const me::native::ResolveRepeatKey repeat_key{
+            exp_bias ? 1u : 2u, uint64_t(reinterpret_cast<uintptr_t>(direct_7e3 ? direct_7e3 : target_render)),
+            uint64_t(direct_7e3 ? direct_7e3->image : target_render->image),
+            uint64_t(uint32_t(x0)) | (uint64_t(uint32_t(y0)) << 32), uint64_t(width) | (uint64_t(height) << 32),
+            uint64_t(dx) | (uint64_t(dy) << 32), uint64_t(uint32_t(exp_bias)),
+            uint64_t(resolved->image.format) | (uint64_t(target_render->format) << 32),
+            uint64_t(format_resolved_target) | (uint64_t(color_format) << 32),
+            uint64_t(reinterpret_cast<uintptr_t>(target_render)), uint64_t(target_render->edram_format), 0};
+        // masseffect_native_velocity_16_16: the k_16_16 image holds the EDRAM word; the Xenos resolve converts it
+        // (fixed point -32...32 -> value * 2^exp_bias -> destination format by copy_dest_number), so neither the
+        // raw copy nor the numeric blit below is right for it.
+        // Mode 2 keeps the raw copy on purpose (the word itself reaches the texture).
+        const bool fixed16 = REXCVAR_GET(masseffect_native_velocity_16_16) == 1 && !direct_7e3 &&
+                             color_format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16) &&
+                             target_render->format == VK_FORMAT_R16G16_UNORM;
+        const uint32_t fixed16_number = (reg.rb_copy_dest_info >> 13) & 0x7;
+        bool fixed16_done = false;
+        if (fixed16) {
+          ResolverPreviousFront(base_resolved, dx == 0 && dy == 0 && width == resolved->image.width &&
+                                                   height == resolved->image.height);
+          fixed16_done = ResolverFixed16Frag(*target_render, resolved->image, x0, y0, dx, dy, width, height,
+                                             exp_bias, fixed16_number);
+        }
+        // masseffect_diag_velocity bit 1 (any mode), or a resolve the mode above could not decode: what the game
+        // asks the resolve of a k_16_16 render target to do. No image change.
+        if (color_format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16) &&
+            ((fixed16 && !fixed16_done) || (REXCVAR_GET(masseffect_diag_velocity) & 1))) {
+          const uint64_t key = (uint64_t(reg.rb_copy_dest_info) << 32) | (uint64_t(resolved->image.format) << 2) |
+                               (fixed16 ? 2u : 0u) | (fixed16_done ? 1u : 0u);
+          if (fixed16_resolve_logged_.size() < 64 && fixed16_resolve_logged_.insert(key).second) {
+            REXLOG_INFO("[native] velocity diag: k_16_16 resolve {:03X} -> {:08X} {}x{}: copy dest info {:08X} (format "
+                        "{}, number {}, exp bias {}), command {}, target host format {}: {}",
+                        info_color & 0xFFF, base_resolved, width, height, reg.rb_copy_dest_info,
+                        format_resolved_target, fixed16_number, exp_bias, command, uint32_t(resolved->image.format),
+                        fixed16_done ? "decoded (masseffect_native_velocity_16_16 = 1)"
+                                     : fixed16 ? "NOT decoded (raw path kept)" : "raw path");
+          }
+        }
+        if (fixed16_done) {
+          ++copies_;
+          ++converted_copies_;
+          ResolvedWritten(base_resolved, uint64_t(width) * height);
+        } else if (exp_bias) {
           // The HDR loop requests -3 (1/8) on each convert resolve. A numeric
           // vkCmdCopyImage / blit ignores this and amplifies repeated feedback.
           ResolverPreviousFront(base_resolved, false);
+          if (RepeatResolveEDRAM4(1, base_resolved, *resolved, *target_render, area_edram_, repeat_key)) {
+            // The texture already holds exactly this result: nothing is recorded.
+          } else {
           if (!ResolverWithBias(*target_render, resolved->image, x0, y0, dx, dy,
                                 width, height, exp_bias)) {
             return Reject(14, "resolve exponent bias / format not supported");
@@ -1591,6 +1852,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
           ++copies_;
           ++converted_copies_;
           ResolvedWritten(base_resolved, uint64_t(width) * height);
+          RepeatWrittenEDRAM4(base_resolved, dx, dy, width, height);
+          }
         } else if (target_render->format != resolved->image.format) {
           // Mass Effect: resolve with a format conversion (HDR render target to another texture format),
           // a 1 to 1 blit.
@@ -1606,14 +1869,22 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                 format_resolved_target, uint32_t(resolved->image.format), base_resolved,
                 resolved->image.width, resolved->image.height, width, height, x0, y0, dx, dy);
           }
+          if (direct_7e3 && REXCVAR_GET(masseffect_native_resolve_bias_probe))
+            ProbeResolveEDRAM4(2, base_resolved, *target_render, dx, dy, width, height, 0,
+                               uint32_t(resolved->image.format));
           if (direct_7e3) {
             ResolverPreviousFront(base_resolved, dx == 0 && dy == 0 && width == resolved->image.width &&
                                                      height == resolved->image.height);
+            if (RepeatResolveEDRAM4(2, base_resolved, *resolved, *target_render, area_edram_, repeat_key)) {
+              // Identical earlier resolve, texture unchanged since: nothing is recorded.
+            } else {
             if (!ResolverDirect7e3(*direct_7e3, resolved->image, x0, y0, dx, dy, width, height))
               return Reject(14, "resolve from the 7e3 owner failed");
             ++copies_;
             ++converted_copies_;
             ResolvedWritten(base_resolved, uint64_t(width) * height);
+            RepeatWrittenEDRAM4(base_resolved, dx, dy, width, height);
+            }
           } else if (!blit_) {
             Reject(4, "copy with format conversion without vkCmdBlitImage");
           } else {
@@ -1692,6 +1963,14 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
             ++cleared_;
           }
           PublishRangeClearEDRAM4(*target_render, plan.color);
+          if (bias_life_on) {
+            const me::native::BiasLifeRect rect{clear_rect.x, clear_rect.y,
+                                                int32_t(clear_rect.x + clear_rect.width),
+                                                int32_t(clear_rect.y + clear_rect.height)};
+            BiasLifeClear(target_render, {(target_render->edram_base + plan.color.start) & 2047u,
+                                          std::min<uint32_t>(plan.color.length, 2048u)},
+                          target_render->edram_base, &rect);
+          }
         }
       } else {
       /*
@@ -1735,8 +2014,19 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     }
     if (((control >> 9) & 0x1) && clear_depth_) {
       ClearDepth(reg, pitch);
+      if (bias_life_on) BiasLifeClearDepth(reg);
     }
     return !edram4_operation_failed_;
+  }
+
+  // masseffect_native_bias_life_probe: a depth clear writes its EDRAM range (stencil and depth share the tiles).
+  void BiasLifeClearDepth(const RegistersCopy& reg) {
+    me::native::EdramClearPlan plan;
+    VkRect2D area{};
+    if (!GetPlanClearedEDRAM4(reg, plan, area) || !plan.depth.length) return;
+    const uint32_t base = reg.rb_depth_info & 0xFFFu;
+    BiasLifeClear(nullptr, {(base + plan.depth.start) & 2047u, std::min<uint32_t>(plan.depth.length, 2048u)},
+                  base, nullptr);
   }
 
   void ClearDepth(const RegistersCopy& reg, uint32_t pitch) {
@@ -1751,8 +2041,17 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       return;
     }
     Prepare(*depth);
+    WrittenStencilEDRAM4(*depth);  // masseffect_native_edram4_stencil_known
     int32_t x0, y0, x1, y1;
     if (!Rectangle(reg, pitch, x0, y0, x1, y1)) return;
+    // masseffect_native_query_occlusion_depth: a resolve that clears the whole depth surface clears its twin too.
+    // (Pitch and rectangle in samples along X, as in NoteDepthClearDraw.)
+    const uint32_t shift_clear = ((reg.rb_surface_info >> 16) & 3) >= 2 ? 1 : 0;
+    if (draws_ && x0 == 0 && y0 == 0 && uint32_t(std::max(0, x1)) >= pitch) {
+      draws_->NoteDepthClear(info & 0xFFF, (info >> 16) & 1, pitch << shift_clear,
+                             me::native::NativeDepthClearValue(info, reg.rb_depth_clear, false),
+                             reg.rb_depth_clear & 0xFF);
+    }
     x0 *= 1u << depth->raster_grid_x;
     x1 *= 1u << depth->raster_grid_x;
     if (depth->guest_width && depth->guest_height) {
@@ -2009,13 +2308,24 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         ++resolver_old_content_;  // previous behavior: the old image is resolved
       }
     }
+    // masseffect_native_resolve_repeat: the request of this depth resolve (the source content is the signature).
+    const me::native::ResolveRepeatKey repeat_key{
+        depth->depth_float24_half ? 3u : 4u, uint64_t(reinterpret_cast<uintptr_t>(depth)), uint64_t(depth->image),
+        uint64_t(uint32_t(x0)) | (uint64_t(uint32_t(y0)) << 32), uint64_t(width) | (uint64_t(height) << 32),
+        uint64_t(dx) | (uint64_t(dy) << 32), uint64_t((reg.rb_copy_control >> 4) & 7u),
+        uint64_t(resolved->image.format) | (uint64_t(depth->format) << 32), uint64_t(texture_format),
+        uint64_t(guest_width) | (uint64_t(guest_height) << 32), uint64_t(depth->depth_float24_half),
+        uint64_t(resolved->image.resolved_depth_guestspace)};
+    const VkRect2D repeat_area{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
     if (depth->depth_float24_half) {
       // Eager MODE4 compute resolve: never routed through deferred VkImageCopy/swaps.
+      if (mode4 && RepeatResolveEDRAM4(3, base_resolved, *resolved, *depth, repeat_area, repeat_key)) return;
       if (!ResolverDepthGuestspaceEDRAM4(*depth, resolved->image,
           uint32_t(x0), uint32_t(y0), dx, dy, width, height,
           (reg.rb_copy_control >> 4) & 7u)) return;
       ++copies_;
       ResolvedWritten(base_resolved, uint64_t(width) * height);
+      if (mode4) RepeatWrittenEDRAM4(base_resolved, dx, dy, width, height);
       return;
     }
     if (scaled) {
@@ -2081,6 +2391,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         }
       }
     }
+    if (mode4 && RepeatResolveEDRAM4(4, base_resolved, *resolved, *depth, repeat_area, repeat_key)) return;
     VkImageCopy copy{};
     copy.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
     copy.srcOffset = {x0, y0, 0};
@@ -2093,6 +2404,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     BarrierAfterCopyResolve();
     ++copies_;
     ResolvedWritten(base_resolved, uint64_t(width) * height);
+    if (mode4) RepeatWrittenEDRAM4(base_resolved, dx, dy, width, height);
   }
 
   void RampGamma(const std::array<std::array<uint16_t, 3>, 256>& ramp) override {
@@ -2124,6 +2436,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   bool Present(rex::ui::Presenter* presenter, const TextureSwap& swap, uint32_t width,
                  uint32_t height) override {
     edram4_cleared_in_frame_.clear();  // redirected clear ordinals restart every frame
+    BlurJournalSwap();  // masseffect_diag_blur_source: log the finished frame, read the cvar for the next
+    if (draws_) draws_->NoteSwap();  // masseffect_native_query_occlusion_depth
     // The per-draw diagnostic window opens here, on the PM4 ring thread, which is the one that records the
     // draws. Inside the paint call it would be another thread and the window would catch an arbitrary piece
     // of the frame (33 of 500 shadow draws were measured).
@@ -2134,6 +2448,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       const auto now = std::chrono::steady_clock::now();
       if (last_swap_ != std::chrono::steady_clock::time_point{}) {
         const double ms = std::chrono::duration<double, std::milli>(now - last_swap_).count();
+        swap_interval_ms_ = ms;  // masseffect_native_motion_blur_frame_fix (SwapIntervalMs)
         // Frames over 45 ms go to stack sampling. The window starts one normal frame (33 ms) earlier, because
         // the game thread prepares the frame ahead of the ring. Ticks at 19.2 MHz.
         if (ms > 45.0) {
@@ -2249,6 +2564,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     }
     const uint32_t base = (swap.dword[1] & 0xFFFFF000) & 0x1FFFFFFF;
     ++trace_frame_;
+    ++occlusion_frames_;
     // masseffect_native_lazy_front. Before submitting the work: either it is drawn from the image that
     // holds the content (no copy) or the deferred copy is recorded now, ahead of the output.
     Image* const source_front = FrontOnPresent(base, width, height);
@@ -2284,6 +2600,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         });
     if (painted) {
       ++presented_;
+      CaptureResolvedFingerprints();  // masseffect_native_resolved_cpu_overwrite
     }
     return painted;
   }
@@ -2338,13 +2655,26 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
 
   bool Draw(const SubmissionDraw& submission) override {
     depth_raster_grid_eligible_ = false;
+    // Restore into 7e3: per-draw state, valid from PrepareDrawEDRAM4 to the end of this call only.
+    edram4_restore_mask_ = 0;
+    edram4_restore_site_.fill(0);
+    struct CleanRestore {
+      TargetsVulkan* d;
+      ~CleanRestore() { d->edram4_restore_mask_ = 0; d->edram4_restore_site_.fill(0); }
+    } clean_restore{this};
     if (submission.registers) {
       msaa_edram_actual_ = (submission.registers[gr::XE_GPU_REG_RB_SURFACE_INFO] >> 16) & 3;
     }
     const bool mode4 = REXCVAR_GET(masseffect_native_edram_alias_mode) == 4;
-    if (mode4 && RedirectClearDepthEDRAM4(submission)) return true;
-    if (mode4 && RedirectClearStencilEDRAM4(submission)) return true;
-    if (mode4 && !PrepareDrawEDRAM4(submission)) return false;
+    const bool bias_life = mode4 && REXCVAR_GET(masseffect_native_bias_life_probe);
+    NoteDepthClearDraw(submission);  // masseffect_native_query_occlusion_depth; before a redirect can return
+    {
+      me::native::ring_partition::Scope phase(me::native::ring_partition::kEdramPrepare);
+      if (mode4 && RedirectClearDepthEDRAM4(submission)) return true;
+      if (mode4 && RedirectClearStencilEDRAM4(submission)) return true;
+      if (bias_life) BiasLifeBeforeDraw();  // masseffect_native_bias_life_probe
+      if (mode4 && !PrepareDrawEDRAM4(submission)) return false;
+    }
     if (REXCVAR_GET(masseffect_native_edram_alias_mode) == 3 && submission.registers && submission.ps) {
       const uint32_t* r = submission.registers;
       const uint32_t tl = r[gr::XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
@@ -2374,7 +2704,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       }
     }
     const uint64_t draw_count_before = draws_ ? draws_->Drawn() : 0;
-    const bool result = draws_ && draws_->Draw(submission);
+    if (blur_journal_ > 0) ++blur_frame_calls_;  // masseffect_diag_blur_source
+    bool result = false;
+    {
+      me::native::ring_partition::Scope phase(me::native::ring_partition::kDrawVulkan);
+      result = draws_ && draws_->Draw(submission);
+    }
+    me::native::ring_partition::Scope phase_publish(me::native::ring_partition::kEdramPublish);
     if (mode4 && draws_ && draws_->Drawn() == draw_count_before &&
         DrawTouchesTraceTileEDRAM4() && TraceEventEDRAM4(TraceTileEDRAM4()))
       REXLOG_INFO("[native] EDRAM TILE TRACE draw-result frame={} physical={} before={} after={} success={}",
@@ -2383,6 +2719,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     // A successful no-op (empty/skipped primitive, scissor or disabled pass)
     // must not claim pixels the current draw never wrote. Accepted deferred
     // sky draws also increment this counter and are flushed by FinishPass.
+    if (blur_journal_ > 0 && result && draws_ && draws_->Drawn() > draw_count_before) ++blur_frame_recorded_;
     if (mode4 && result && draws_->Drawn() > draw_count_before) {
       for (uint32_t slot = 0; slot < 5; ++slot) {
         if (slot == 0 && edram4_draw_images_[0] && edram4_draw_writes_[0] &&
@@ -2392,12 +2729,17 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                                           edram4_draw_plan_.length_tiles[0])) return false;
         } else if (edram4_draw_images_[slot] && edram4_draw_writes_[slot]) {
           edram4_published_no_stencil_ = slot == 0 && !edram4_draw_writes_stencil_;
-          PublishEDRAM4(*edram4_draw_images_[slot],
-                         RasterArea(*edram4_draw_images_[slot], edram4_draw_area_),
-                         edram4_draw_plan_.length_tiles[slot]);
+          edram4_publish_stencil_only_ = slot == 0 && edram4_draw_writes_stencil_ && !edram4_draw_writes_depth_ &&
+                                         edram4_draw_images_[slot]->edram_depth &&
+                                         REXCVAR_GET(masseffect_native_resolve_repeat) != 0;
+          PublishDrawEDRAM4(*edram4_draw_images_[slot], edram4_draw_plan_.length_tiles[slot]);
           edram4_published_no_stencil_ = false;
+          edram4_publish_stencil_only_ = false;
+          if (edram4_restore_site_[slot]) StampRestoreEDRAM4(*edram4_draw_images_[slot], slot);
         }
       }
+      if (bias_life) BiasLifeAfterDraw(submission);  // masseffect_native_bias_life_probe
+      if (blur_journal_ > 0) BlurNoteDraw();  // masseffect_diag_blur_source
     }
     return result;
   }
@@ -2449,6 +2791,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
 
   uint64_t GenerationCommands() const override { return generation_commands_; }
 
+  uint32_t RestoreInto7e3Mask() const override { return edram4_restore_mask_; }
+
+  double SwapIntervalMs() const override { return swap_interval_ms_; }
+
   ImageNative* TargetColor(uint32_t base, uint32_t format, uint32_t pitch) override {
     Image* image = GetTarget(base, format, pitch);
     if (!image || !Record()) {
@@ -2482,9 +2828,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     return image;
   }
 
-  const ImageNative* ResolvedTexture(uint32_t address) override {
+  const ImageNative* ResolvedTexture(uint32_t address, const uint32_t* fetch = nullptr) override {
     const auto it = resolved_.find(address);
     if (it == resolved_.end()) {
+      return nullptr;
+    }
+    // masseffect_native_resolved_cpu_overwrite: rewritten by the CPU after the last resolve -> guest memory.
+    if (it->second.cpu_overwritten || (it->second.baseline && CpuOverwroteResolved(address, it->second, fetch))) {
       return nullptr;
     }
     // And how many times each address is requested, for the per-render-target copy report. A resolved
@@ -2850,6 +3200,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     pending_fronts_[base].retained = free;  // source_vk is still the content image, now retained
     if (draws_) {
       draws_->InvalidateImages(target.image, replenished.image);
+      draws_->NoteResolvedAt(base);  // masseffect_native_texture_inval_by_address
     }
     ++front_rotations_;
   }
@@ -3041,6 +3392,309 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     }
   }
 
+  // --- Real occlusion queries (masseffect_native_query_mode 2; mode 3 below) ---------------------------------------
+  //
+  // Each draw issued between a guest query's begin and end gets its own Vulkan occlusion query, right around
+  // its vkCmdDraw* inside its render pass, so a guest query never has to stay open across a render pass change.
+  // The guest count is the sum of those queries (each times its sample multiplier), times the internal
+  // resolution scale. The end structure keeps the D3D sentinel until the slot's fence has signaled; then
+  // ReadOcclusion writes the count from the ring thread (Complete). A guest query some of whose draws were not
+  // measured, or that spans a submission, is answered "visible" right away (the caller writes it).
+
+  uint32_t BeginOcclusionDraw(float multiplier) override {
+    if (!occlusion_open_ || occlusion_ == VK_NULL_HANDLE || !recording_) return UINT32_MAX;
+    SlotWork& slot = slots_[slot_];
+    if (!slot.occlusion_reset) return UINT32_MAX;
+    if (occlusion_open_generation_ == UINT64_MAX) {
+      occlusion_open_generation_ = generation_commands_;
+      occlusion_open_slot_ = slot_;
+      occlusion_open_first_ = slot.occlusion_used;
+    } else if (occlusion_open_generation_ != generation_commands_) {
+      occlusion_open_split_ = true;  // the guest query spans a submission: answered "visible"
+      return UINT32_MAX;
+    }
+    if (slot.occlusion_used >= kOcclusionPerSlot) {
+      if (occlusion_no_room_++ % 1000 == 0)
+        REXLOG_WARN("[native] targets: no room for occlusion queries ({} times): more than {} measured draws in "
+                    "one submission", occlusion_no_room_, kOcclusionPerSlot);
+      return UINT32_MAX;
+    }
+    const uint32_t index = slot_ * kOcclusionPerSlot + slot.occlusion_used;
+    dfn_.vkCmdBeginQuery(commands_work_, occlusion_, index,
+                         occlusion_precise_ ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    ++slot.occlusion_used;
+    slot.occlusion_multipliers.push_back(multiplier);
+    ++occlusion_open_measured_;
+    ++occlusion_stats_.vulkan_queries;
+    return index;
+  }
+
+  void FinishOcclusionDraw(uint32_t index) override {
+    if (occlusion_ != VK_NULL_HANDLE && index != UINT32_MAX && recording_) {
+      dfn_.vkCmdEndQuery(commands_work_, occlusion_, index);
+    }
+  }
+
+  void QueryBegin() override {
+    // A begin without an end only restarts the count: nothing of it was pending.
+    occlusion_open_ = true;
+    occlusion_open_split_ = false;
+    occlusion_open_generation_ = UINT64_MAX;
+    occlusion_open_measured_ = 0;
+  }
+
+  bool QueryEnd(uint32_t address, uint32_t draws, double scale, uint32_t visible) override {
+    const bool open = occlusion_open_;
+    occlusion_open_ = false;
+    if (!open || occlusion_ == VK_NULL_HANDLE || !memory_) return false;
+    ++occlusion_stats_.ended;
+    if (!draws) {
+      // Nothing drawn inside the query: the console's count is 0 too.
+      ++occlusion_stats_.empty;
+      WriteOcclusionCounts(memory_->TranslatePhysical(address), 0);
+      return true;
+    }
+    if (occlusion_open_split_ ||
+        (occlusion_open_generation_ != UINT64_MAX && occlusion_open_generation_ != generation_commands_) ||
+        (occlusion_open_generation_ != UINT64_MAX && !recording_)) {
+      ++occlusion_stats_.fallback_split;
+      return false;
+    }
+    if (occlusion_open_measured_ < draws || occlusion_open_generation_ == UINT64_MAX) {
+      ++occlusion_stats_.fallback_unmeasured;
+      return false;
+    }
+    SlotWork& slot = slots_[occlusion_open_slot_];
+    SlotWork::OcclusionGuest guest;
+    guest.address = address;
+    guest.first = occlusion_open_first_;
+    guest.count = occlusion_open_measured_;
+    guest.visible = visible;
+    guest.serial = ++occlusion_serial_;
+    guest.frame = occlusion_frames_;
+    guest.scale = scale;
+    guest.ended = std::chrono::steady_clock::now();
+    slot.occlusion.push_back(guest);
+    occlusion_pending_[address] = guest.serial;
+    return true;
+  }
+
+  void QueryForget(uint32_t address) override {
+    if (occlusion_pending_.erase(address)) ++occlusion_stats_.superseded;
+  }
+
+  // --- Latency-1 queries (masseffect_native_query_mode 3) ----------------------------------------------------------
+  //
+  // The guest gets its answer at the end packet, from the history table; this issue's draws are measured with
+  // the mode 2 machinery (BeginOcclusionDraw) and ReadOcclusion folds the result into the table once the slot's
+  // fence has signaled. Nothing is ever written to guest memory later: the end structure may already belong to
+  // another primitive (UE3 pools its query objects).
+  uint32_t QueryEndLatent(uint32_t address, uint64_t key, uint64_t content, uint32_t draws, double scale,
+                          uint32_t visible, uint32_t max_age_frames, uint32_t hidden_after) override {
+    const bool open = occlusion_open_;
+    occlusion_open_ = false;
+    ++occlusion_stats_.ended;
+    if (!draws) {
+      ++occlusion_stats_.empty;  // nothing drawn inside the query: the console's count is 0 too
+      return 0;
+    }
+    // 1. Measure this issue for the next ones, under the same conditions as mode 2 (one submission, every draw
+    // measured). Never waited for.
+    if (open && key && occlusion_ != VK_NULL_HANDLE && !occlusion_open_split_ &&
+        occlusion_open_generation_ != UINT64_MAX && occlusion_open_generation_ == generation_commands_ &&
+        recording_ && occlusion_open_measured_ >= draws) {
+      SlotWork& slot = slots_[occlusion_open_slot_];
+      SlotWork::OcclusionGuest guest;
+      guest.address = address;
+      guest.first = occlusion_open_first_;
+      guest.count = occlusion_open_measured_;
+      guest.visible = visible;
+      guest.frame = occlusion_frames_;
+      guest.scale = scale;
+      guest.ended = std::chrono::steady_clock::now();
+      guest.key = key;
+      guest.latent = true;
+      slot.occlusion.push_back(guest);
+      ++occlusion_latent_outstanding_;
+      ++occlusion_stats_.latent_measured;
+    } else {
+      ++occlusion_stats_.latent_unmeasured;
+    }
+    // 2. Pooling diagnostic: the same box content issued with another end structure than last time.
+    if (content) {
+      const auto [it, inserted] = occlusion_content_address_.try_emplace(content, address);
+      if (!inserted && it->second != address) {
+        ++occlusion_stats_.content_moved;
+        it->second = address;
+      }
+    }
+    PruneOcclusionHistory(max_age_frames);
+    // 3. The answer.
+    if (!key) {
+      ++occlusion_stats_.answered_unknown;
+      return visible;
+    }
+    const auto it = occlusion_history_.find(key);
+    if (it == occlusion_history_.end()) {
+      ++occlusion_stats_.answered_unknown;
+      return visible;
+    }
+    const HistoryOcclusion& h = it->second;
+    if (occlusion_frames_ - h.frame > max_age_frames) {
+      ++occlusion_stats_.answered_stale;
+      return visible;
+    }
+    ++occlusion_stats_.answered_history;
+    if (h.zero_streak >= std::max<uint32_t>(1, hidden_after)) {
+      ++occlusion_stats_.answered_hidden;
+      return 0;
+    }
+    // Visible in at least one of the last hidden_after results: its last real count (lens flares read the
+    // magnitude), or the SDK's "visible" if it never had one.
+    return h.last_nonzero ? h.last_nonzero : visible;
+  }
+
+  // Entries no answer can use any more (older than max_age and than 64 Swaps), checked every 64 Swaps; the
+  // tables are bounded whatever the scene does (moving primitives make a new identity per frame).
+  void PruneOcclusionHistory(uint32_t max_age_frames) {
+    if (occlusion_frames_ - occlusion_history_pruned_ < 64) return;
+    occlusion_history_pruned_ = occlusion_frames_;
+    const uint64_t keep = std::max<uint64_t>(64, max_age_frames);
+    for (auto it = occlusion_history_.begin(); it != occlusion_history_.end();) {
+      if (occlusion_frames_ - it->second.frame > keep) {
+        it = occlusion_history_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (occlusion_history_.size() > 65536) occlusion_history_.clear();
+    if (occlusion_content_address_.size() > 16384) occlusion_content_address_.clear();
+  }
+
+  // A measured issue of a latency-1 query: folded into the table (in submission order, so per key in frame order).
+  void FoldOcclusionHistory(const SlotWork::OcclusionGuest& guest, uint32_t samples) {
+    HistoryOcclusion& h = occlusion_history_[guest.key];
+    if (h.frame > guest.frame) return;  // a newer issue was folded already
+    h.frame = guest.frame;
+    if (samples) {
+      h.last_nonzero = samples;
+      h.zero_streak = 0;
+    } else if (h.zero_streak < UINT32_MAX) {
+      ++h.zero_streak;
+    }
+  }
+
+  bool QueriesPending() const override { return !occlusion_pending_.empty() || occlusion_latent_outstanding_; }
+
+  StatsQueries StatsOfQueries() const override {
+    StatsQueries stats = occlusion_stats_;
+    stats.history_size = occlusion_history_.size();
+    return stats;
+  }
+
+  void QueryService(bool idle, uint32_t flush_us, uint32_t timeout_us) override {
+    if (occlusion_pending_.empty() && !occlusion_latent_outstanding_) return;
+    // 1. Submissions that have finished, oldest first (the order Complete keeps), without waiting.
+    for (;;) {
+      SlotWork* oldest = nullptr;
+      for (SlotWork& other : slots_)
+        if (other.pending && (!oldest || other.order < oldest->order)) oldest = &other;
+      if (!oldest || dfn_.vkGetFenceStatus(device_, oldest->fence) != VK_SUCCESS) break;
+      CompleteA(*oldest);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    // 2. The ring has nothing left to parse while finished queries wait in the work being recorded: the game is
+    // probably polling one of them. Submit now instead of at the Swap (an extra submission: the pass is closed
+    // and reopened by the next draw with its contents loaded).
+    if (idle && recording_ && !occlusion_open_) {
+      const SlotWork& slot = slots_[slot_];
+      for (const auto& guest : slot.occlusion) {
+        const auto it = occlusion_pending_.find(guest.address);
+        if (it == occlusion_pending_.end() || it->second != guest.serial) continue;
+        if (now - guest.ended >= std::chrono::microseconds(flush_us)) {
+          ++occlusion_stats_.flushes;
+          SendWork(false);
+        }
+        break;  // the oldest wanted one decides
+      }
+    }
+    // 3. Results the GPU has not delivered in time: "visible", so a game that waits for them cannot hang.
+    if (timeout_us) {
+      const auto limit = std::chrono::microseconds(timeout_us);
+      for (SlotWork& slot : slots_) {
+        for (const auto& guest : slot.occlusion) {
+          if (now - guest.ended < limit) break;  // in end order: the rest are younger
+          const auto it = occlusion_pending_.find(guest.address);
+          if (it == occlusion_pending_.end() || it->second != guest.serial) continue;
+          occlusion_pending_.erase(it);
+          ++occlusion_stats_.fallback_timeout;
+          WriteOcclusionCounts(memory_->TranslatePhysical(guest.address), guest.visible);
+        }
+      }
+    }
+  }
+
+  // The guest queries of a finished submission (its fence has signaled): the real counts.
+  void ReadOcclusion(SlotWork& slot) {
+    if (slot.occlusion.empty()) return;
+    const uint32_t used = slot.occlusion_used;
+    const uint32_t index = uint32_t(&slot - slots_.data());
+    static std::vector<uint64_t> values;  // ring thread only
+    values.assign(used, 0);
+    const bool read = used && occlusion_ != VK_NULL_HANDLE &&
+                      read_queries_(device_, occlusion_, index * kOcclusionPerSlot, used,
+                                    sizeof(uint64_t) * used, values.data(), sizeof(uint64_t),
+                                    VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& guest : slot.occlusion) {
+      if (guest.latent) {
+        // Mode 3: into the history table only; the guest got its answer at the end packet.
+        if (occlusion_latent_outstanding_) --occlusion_latent_outstanding_;
+        if (!read || guest.first + guest.count > used ||
+            guest.first + guest.count > slot.occlusion_multipliers.size()) {
+          ++occlusion_stats_.fallback_read;
+          continue;
+        }
+        double sum = 0.0;
+        for (uint32_t i = guest.first; i < guest.first + guest.count; ++i)
+          sum += double(values[i]) * double(slot.occlusion_multipliers[i]);
+        const double scaled = sum * guest.scale;
+        const uint32_t samples = scaled <= 0.0 ? 0u : uint32_t(std::min(std::ceil(scaled), double(UINT32_MAX)));
+        ++occlusion_stats_.resolved;
+        if (!samples) ++occlusion_stats_.resolved_zero;
+        occlusion_stats_.samples += samples;
+        occlusion_stats_.latency_frames += occlusion_frames_ - guest.frame;
+        occlusion_stats_.latency_us +=
+            uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - guest.ended).count());
+        FoldOcclusionHistory(guest, samples);
+        continue;
+      }
+      const auto it = occlusion_pending_.find(guest.address);
+      if (it == occlusion_pending_.end() || it->second != guest.serial) continue;  // reissued or timed out
+      occlusion_pending_.erase(it);
+      uint32_t samples = guest.visible;
+      if (!read || guest.first + guest.count > used || guest.first + guest.count > slot.occlusion_multipliers.size()) {
+        ++occlusion_stats_.fallback_read;
+      } else {
+        double sum = 0.0;
+        for (uint32_t i = guest.first; i < guest.first + guest.count; ++i)
+          sum += double(values[i]) * double(slot.occlusion_multipliers[i]);
+        const double scaled = sum * guest.scale;
+        // Rounded up: a primitive with any visible sample stays visible whatever the scale.
+        samples = scaled <= 0.0 ? 0u : uint32_t(std::min(std::ceil(scaled), double(UINT32_MAX)));
+        ++occlusion_stats_.resolved;
+        if (!samples) ++occlusion_stats_.resolved_zero;
+        occlusion_stats_.samples += samples;
+        occlusion_stats_.latency_frames += occlusion_frames_ - guest.frame;
+        occlusion_stats_.latency_us +=
+            uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - guest.ended).count());
+      }
+      WriteOcclusionCounts(memory_->TranslatePhysical(guest.address), samples);
+    }
+    slot.occlusion.clear();
+  }
+
+
  private:
   bool Reject(uint32_t cause, const char* text) {
     ++rejections_;
@@ -3115,6 +3769,12 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     return true;
   }
 
+  uint64_t KeyTarget(uint32_t base, uint32_t format, uint32_t pitch) const {
+    return (uint64_t(msaa_edram_actual_) << 44) | (uint64_t(base) << 32) |
+           (uint64_t(ClassEdramFORMAT(format)) << 24) |
+           (uint64_t(uint32_t(HostFormatTargetColor(format)) & 0xFF) << 16) | pitch;
+  }
+
   Image* GetTarget(uint32_t base, uint32_t format, uint32_t pitch) {
     if (!pitch) {
       Reject(7, "render target with pitch 0");
@@ -3133,9 +3793,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     const uint8_t class_edram = ClassEdramFORMAT(format);
     const bool edram_64bpp = xenos::IsColorRenderTargetFormat64bpp(
         xenos::ColorRenderTargetFormat(format));
-    const uint64_t key = (uint64_t(msaa_edram_actual_) << 44) |
-                           (uint64_t(base) << 32) | (uint64_t(class_edram) << 24) |
-                           (uint64_t(uint32_t(host_format) & 0xFF) << 16) | pitch;
+    const uint64_t key = KeyTarget(base, format, pitch);
     auto it = targets_.find(key);
     if (it != targets_.end()) {
       return &it->second;
@@ -3187,9 +3845,31 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   // 3 depth->color, 4 color->color. Full = the run covers the whole target.
   uint32_t edram4_reason_ = 0;
   uint64_t edram4_overwrites_ = 0;  // draw binds that used a proven full overwrite
+  // Restore into 7e3 (masseffect_native_restore_into_7e3, docs/vulkan-frame-time.md section 8).
+  // Color slots (bit i = RT i) of the draw being recorded whose UNORM10 view was replaced by the 7e3 image.
+  uint32_t edram4_restore_mask_ = 0;
+  // Per binding slot (1..4) of the draw being recorded: the restore site when the draw qualified apart from
+  // learning (0 = not a candidate). Published tiles get stamped with it.
+  std::array<uint64_t, 5> edram4_restore_site_{};
+  // What the site's restored tiles were read by next. A site starts with the conversion; each import of its
+  // unchanged tiles into the 7e3 view of the same base raises confidence. Once redirected, an import of them
+  // into a UNORM10 view (which would read code / 1023 instead of the raw f16 value) disables the site.
+  struct RestoreSite { uint32_t confidence = 0; bool disabled = false; };
+  std::unordered_map<uint64_t, RestoreSite> edram4_restore_sites_;
+  // Per physical tile: the site that last restored it, its owner then, the owner's tile version and write count.
+  struct RestoreStamp { uint64_t site = 0; const Image* owner = nullptr; uint32_t version = 0; uint64_t writes = 0; };
+  std::array<RestoreStamp, 2048> edram4_restore_stamps_{};
+  uint64_t edram4_restore_live_ = 0;  // stamps written since start-up (0 = skip the per-span check)
+  static constexpr uint32_t kRestoreConfidence = 2;
+  uint64_t edram4_restore_draws_ = 0, edram4_restore_tiles_ = 0, edram4_restore_logged_ = 0;
+  uint64_t edram4_restore_good_ = 0, edram4_restore_disabled_ = 0;
+  std::map<std::string, uint64_t> edram4_restore_no_;
   uint64_t edram4_redirected_ = 0, edram4_redirected_tiles_ = 0, edram4_redirected_no_ = 0;
   std::map<std::string, uint64_t> edram4_stencil_no_reasons_, edram4_depth_no_reasons_;
   uint64_t edram4_redirected_color_tiles_ = 0;
+  // masseffect_native_edram4_clear_alias_raw64 (10 s report): whole tiles taken from a 64bpp color owner, and the
+  // redirected clears that took at least one of them.
+  uint64_t edram4_raw64_tiles_ = 0, edram4_raw64_clears_ = 0;
   // Tiles a redirected clear wrote (by the view the game drew it on) and the view that next pulled them.
   // A redirected clear is identified by its view and its ordinal among that view's clears in the frame (the
   // same view is cleared several times per frame, each time read next by a different view).
@@ -3231,6 +3911,74 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     std::map<std::string, std::pair<uint64_t, uint64_t>> draws;  // short draw key -> ops, tiles
   };
   std::map<std::string, ParEDRAM4> edram4_transfer_pairs_;  // "src->dst" -> ops, tiles, first draw
+  // masseffect_native_edram4_pair_keys: the same statistics under integer keys; FlushPairKeysEDRAM4 turns them into
+  // edram4_transfer_pairs_ (the same strings the per-span path builds) right before the report.
+  struct PairImageKeyEDRAM4 {
+    uint32_t depth, base, format, width, height, msaa_x, msaa_y, grid, half;
+    auto operator<=>(const PairImageKeyEDRAM4&) const = default;
+  };
+  struct PairDrawKeyEDRAM4 {
+    int32_t vs, ps;
+    uint32_t prim, mode, dc;
+    bool ow;
+    std::array<int32_t, 4> rect;
+    auto operator<=>(const PairDrawKeyEDRAM4&) const = default;
+  };
+  struct ParKeysEDRAM4 {
+    uint64_t ops = 0, tiles = 0;
+    std::string example;
+    std::map<PairDrawKeyEDRAM4, std::pair<uint64_t, uint64_t>> draws;
+  };
+  std::map<std::pair<PairImageKeyEDRAM4, PairImageKeyEDRAM4>, ParKeysEDRAM4> edram4_pair_keys_;
+  int edram4_pair_keys_on_ = -1;  // -1 = cvar not read yet
+  // masseffect_native_edram4_sync_lean: -1 = cvar not read yet; checks left (TileUsedEDRAM4 must be true).
+  int edram4_sync_lean_on_ = -1;
+  uint32_t edram4_sync_lean_checks_ = 4096;
+  // Inside RangeTilesEDRAM4's range (clipped to the area and the image) every tile intersects the area, so the
+  // walk's TileUsedEDRAM4 test is always true; its whole-tile flag is only read with a clear overwrite or cutout.
+  bool SyncLeanEDRAM4(bool clear_overwrite, const VkRect2D* clear_cutout) {
+    if (edram4_sync_lean_on_ < 0) edram4_sync_lean_on_ = REXCVAR_GET(masseffect_native_edram4_sync_lean) ? 1 : 0;
+    return edram4_sync_lean_on_ && !clear_overwrite && !clear_cutout;
+  }
+  // The first skips compute the test anyway; a false one turns the switch off (the walk then tests every tile).
+  bool SyncLeanUsedEDRAM4(const Image& target, uint32_t tile, const VkRect2D& area) {
+    if (!edram4_sync_lean_checks_) return true;
+    --edram4_sync_lean_checks_;
+    if (TileUsedEDRAM4(target, tile, area)) return true;
+    REXLOG_ERROR("[native] DIFFERENCE: EDRAM mode-4 lean sync walk: tile {} of {:03X} {}x{} outside the area "
+                 "{},{}+{}x{} inside its range; masseffect_native_edram4_sync_lean off", tile, target.edram_base,
+                 target.width, target.height, area.offset.x, area.offset.y, area.extent.width, area.extent.height);
+    edram4_sync_lean_on_ = 0;
+    edram4_sync_lean_checks_ = 0;
+    return false;
+  }
+  static PairImageKeyEDRAM4 PairImageEDRAM4(const Image& im) {
+    return {uint32_t(im.edram_depth), uint32_t(im.edram_base), uint32_t(im.edram_format), uint32_t(im.width),
+            uint32_t(im.height), uint32_t(im.edram_msaa_x), uint32_t(im.edram_msaa_y), uint32_t(im.raster_grid_x),
+            uint32_t(im.depth_float24_half)};
+  }
+  static std::string DescribePairImageEDRAM4(const PairImageKeyEDRAM4& k) {
+    return fmt::format("{}{:03X}/f{}:{}x{}:mx{}my{}g{}{}", k.depth ? "D" : "C", k.base, k.format, k.width, k.height,
+                       k.msaa_x, k.msaa_y, k.grid, k.half ? "h" : "");
+  }
+  void FlushPairKeysEDRAM4() {
+    for (auto& [key, kp] : edram4_pair_keys_) {
+      auto& par = edram4_transfer_pairs_[DescribePairImageEDRAM4(key.first) + "->" +
+                                         DescribePairImageEDRAM4(key.second)];
+      if (!par.ops) par.example = kp.example;
+      par.ops += kp.ops;
+      par.tiles += kp.tiles;
+      for (const auto& [dk, v] : kp.draws) {
+        auto& d = par.draws[fmt::format("VS{}/PS{}/p{}/m{}/dc{:X}/ow{}", dk.vs, dk.ps, dk.prim, dk.mode, dk.dc,
+                                        dk.ow ? fmt::format("{},{}-{},{}", dk.rect[0], dk.rect[1], dk.rect[2],
+                                                            dk.rect[3])
+                                              : std::string("-"))];
+        d.first += v.first;
+        d.second += v.second;
+      }
+    }
+    edram4_pair_keys_.clear();
+  }
   const SubmissionDraw* edram4_submission_ = nullptr;  // the draw being synchronized (nullptr: not a draw)
   uint32_t edram4_slot_ = 0;
   std::string DescribeDrawEDRAM4() const {
@@ -3266,6 +4014,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     for (auto it = edram4_consumer_.begin(); it != edram4_consumer_.end();)
       it = it->second.view == &view ? edram4_consumer_.erase(it) : std::next(it);
     edram4_stencil_source_.erase(&view);
+    WrittenStencilEDRAM4(view);  // masseffect_native_edram4_stencil_known: its content is replaced
     for (auto& [v, sources] : edram4_stencil_source_)
       for (auto& f : sources) if (f.image == &view) f = {};
     for (auto it = edram4_alias_1x_.begin(); it != edram4_alias_1x_.end();)
@@ -3312,6 +4061,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   std::optional<VkRect2D> edram4_stencil_replacement_;  // raster rect whose stencil the current draw replaces
   uint64_t edram4_stencil_replaced_ = 0;
   std::map<std::string, std::pair<uint64_t, uint64_t>> edram4_import9_pairs_;  // 9-pass imports: ops, tiles
+  bool edram4_draw_writes_depth_ = false;  // the draw being prepared writes depth (slot 0)
+  // masseffect_native_resolve_repeat: the publish in progress changes only the stencil plane of a depth image.
+  bool edram4_publish_stencil_only_ = false;
   bool edram4_draw_writes_stencil_ = false;  // the draw being prepared writes stencil (slot 0)  // the depth publish in progress leaves the stencil bits alone
   uint64_t edram4_stencil_inherited_ = 0;
   uint64_t edram4_stencil_skipped_ = 0, edram4_stencil_returned_ = 0, edram4_stencil_inexact_ = 0,
@@ -3326,6 +4078,163 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     const auto it = edram4_stencil_source_.find(&view);
     if (it == edram4_stencil_source_.end()) return;
     for (uint32_t i = 0; i < count; ++i) it->second[(start + i) & 2047u] = {};
+  }
+
+  /*
+   * masseffect_native_edram4_stencil_known (docs/vulkan-frame-time.md section 10).
+   *
+   * Per depth image and own tile: the stencil value every sample of the tile's host content holds, when it is
+   * known. Only three places record a value, each right after recording a whole-tile stencil clear into that
+   * image (RedirectClearStencilEDRAM4, PublishStencilClearEDRAM4, RedirectClearDepthEDRAM4 with a stencil
+   * value). Every other operation that can write the image forgets all of its values (WrittenStencilEDRAM4):
+   * the draws that bind it as depth (PrepareDrawEDRAM4), imports, tile copies, stencil copies, SDK depth clears,
+   * content restores (ForgetSynchronizedEDRAM4) and the copies of the alias paths. A value that is present is
+   * therefore exactly the host stencil of that tile at that moment, which is what the import of a late stencil
+   * fetch would copy.
+   */
+  std::unordered_map<const Image*, std::vector<int16_t>> edram4_stencil_known_;
+  uint64_t edram4_known_fetches_ = 0, edram4_known_tiles_ = 0, edram4_known_logged_ = 0;
+  uint64_t edram4_fetch_area_draws_ = 0, edram4_fetch_area_tiles_skipped_ = 0;
+  uint64_t edram4_stencil_rows_merged_ = 0;
+  // Late fetch report (any of the three section-10 cvars on): "source -> view kind" -> ops, tiles.
+  std::map<std::string, std::pair<uint64_t, uint64_t>> edram4_fetch_pairs_;
+  void WrittenStencilEDRAM4(const Image& image) {
+    if (!edram4_stencil_known_.empty()) edram4_stencil_known_.erase(&image);
+  }
+  void KnownStencilEDRAM4(const Image& image, uint32_t start, uint32_t count, int32_t value) {
+    if (!REXCVAR_GET(masseffect_native_edram4_stencil_known) || !image.edram_depth) return;
+    auto& known = edram4_stencil_known_[&image];
+    if (known.empty()) known.assign(2048, int16_t(-1));
+    for (uint32_t i = 0; i < count; ++i) known[(start + i) & 2047u] = int16_t(value);
+  }
+  // The value all `count` tiles from `start` hold, or -1 (unknown, or not one value).
+  int32_t KnownValueEDRAM4(const Image& image, uint32_t start, uint32_t count) const {
+    const auto it = edram4_stencil_known_.find(&image);
+    if (it == edram4_stencil_known_.end() || !count) return -1;
+    const int32_t value = it->second[start & 2047u];
+    for (uint32_t i = 1; i < count && value >= 0; ++i)
+      if (it->second[(start + i) & 2047u] != value) return -1;
+    return value;
+  }
+  bool ReportFetchEDRAM4() const {
+    return REXCVAR_GET(masseffect_native_edram4_stencil_known) ||
+           REXCVAR_GET(masseffect_native_edram4_stencil_fetch_area) ||
+           REXCVAR_GET(masseffect_native_edram4_stencil_copy_rows);
+  }
+  void NoteFetchEDRAM4(const Image& source, const Image& view, uint32_t count, const char* kind) {
+    auto& n = edram4_fetch_pairs_[fmt::format("{}{:03X}:{}x{}:mx{}my{}s{}->{:03X}:{}x{}:mx{}my{} {}",
+        source.edram_depth ? "D" : "C", source.edram_base, source.width, source.height, source.edram_msaa_x,
+        source.edram_msaa_y, uint32_t(source.sample_count), view.edram_base, view.width, view.height,
+        view.edram_msaa_x, view.edram_msaa_y, kind)];
+    ++n.first;
+    n.second += count;
+  }
+  // The stencil of view tiles [first, +count) set to `value` with stencil-only attachment clears (one rectangle
+  // per tile-row run, vertically adjacent full runs merged). Depth is not touched. false = not possible here
+  // (nothing recorded: the caller imports as before).
+  bool ClearKnownStencilEDRAM4(Image& view, uint32_t first, uint32_t count, uint32_t value) {
+    if (!draws_ || !view.edram_depth || !view.prepared || view.invalid_content || view.guest_width ||
+        view.guest_height || !me::native::IsSingleSample(uint32_t(view.sample_count)) || value > 255u)
+      return false;
+    const uint32_t pitch = PitchTilesEDRAM(view);
+    const uint32_t tw = 80u >> view.edram_msaa_x, th = 16u >> view.edram_msaa_y;
+    if (!pitch) return false;
+    std::vector<VkRect2D> rects;
+    for (uint32_t t = 0; t < count;) {
+      const uint32_t tile = first + t, column = tile % pitch;
+      const uint32_t n = std::min(count - t, pitch - column);
+      const uint32_t x = (column * tw) << view.raster_grid_x, y = (tile / pitch) * th;
+      const uint32_t width = (n * tw) << view.raster_grid_x;
+      if (x >= view.width || y >= view.height || width > view.width - x || th > view.height - y) return false;
+      VkRect2D r{{int32_t(x), int32_t(y)}, {width, th}};
+      VkRect2D* last = rects.empty() ? nullptr : &rects.back();
+      if (last && last->offset.x == r.offset.x && last->extent.width == r.extent.width &&
+          uint32_t(last->offset.y) + last->extent.height == y)
+        last->extent.height += th;
+      else
+        rects.push_back(r);
+      t += n;
+    }
+    if (rects.empty()) return false;
+    draws_->FinishPass();
+    if (!Record()) return false;
+    MarkGpu(kGpuCleared);
+    ForgetClear(view);
+    BarrierClearEDRAM4();
+    for (const VkRect2D& r : rects)
+      if (!draws_->ClearStencilInPass(commands_work_, view, value, r))
+        return FailureEDRAM4("known-stencil fetch clear failed", view);
+    BarrierClearEDRAM4();
+    WrittenStencilEDRAM4(view);
+    view.edram4_bits_stencil |= uint8_t(value);
+    return true;
+  }
+  // Every 10 s with the mode-4 report, while one of the section-10 cvars is on.
+  void ReportFetchesEDRAM4() {
+    if (!ReportFetchEDRAM4()) return;
+    std::string pairs;
+    for (const auto& [k, v] : edram4_fetch_pairs_) pairs += fmt::format(" [{} {}ops/{}t]", k, v.first, v.second);
+    REXLOG_INFO("[native] EDRAM late stencil fetches, 10 s:{}; known-value clears {} ({} tiles); area-limited "
+                "draws {} ({} tiles left deferred); copy rows merged {}",
+                pairs.empty() ? " none" : pairs, edram4_known_fetches_, edram4_known_tiles_,
+                edram4_fetch_area_draws_, edram4_fetch_area_tiles_skipped_, edram4_stencil_rows_merged_);
+    edram4_fetch_pairs_.clear();
+    edram4_known_fetches_ = edram4_known_tiles_ = edram4_fetch_area_draws_ = edram4_fetch_area_tiles_skipped_ =
+        edram4_stencil_rows_merged_ = 0;
+  }
+  // One run of a late fetch (FetchStencilDeferredEDRAM4): true = done here as a known-value stencil clear;
+  // false = the caller imports as before. Also feeds the late fetch report.
+  bool FetchKnownStencilEDRAM4(Image& source, Image& view, uint32_t source_tile, uint32_t view_tile, uint32_t n) {
+    if (!ReportFetchEDRAM4()) return false;
+    const char* kind = !source.edram_depth ? "import (color source)" : "import (no known value)";
+    int32_t value = -1;
+    if (REXCVAR_GET(masseffect_native_edram4_stencil_known) && source.edram_depth) {
+      value = KnownValueEDRAM4(source, source_tile, n);
+      if (value >= 0 && ClearKnownStencilEDRAM4(view, view_tile, n, uint32_t(value))) {
+        ++edram4_known_fetches_;
+        edram4_known_tiles_ += n;
+        NoteFetchEDRAM4(source, view, n, "known value: clear");
+        if (++edram4_known_logged_ <= 8)
+          REXLOG_INFO("[native] EDRAM known stencil: {} tiles of {:03X}:{}x{} (from {:03X}:{}x{} tile {}, all "
+                      "holding stencil {} since a clear) set by a stencil clear instead of an import",
+                      n, view.edram_base, view.width, view.height, source.edram_base, source.width,
+                      source.height, source_tile, value);
+        return true;
+      }
+      if (value >= 0) kind = "import (clear not possible)";
+    }
+    const bool copy = REXCVAR_GET(masseffect_native_edram4_stencil_copy) &&
+        n >= uint32_t(REXCVAR_GET(masseffect_native_edram4_stencil_copy_min_tiles)) &&
+        me::native::IsSingleSample(uint32_t(view.sample_count)) && view.accepts_target_of_copy &&
+        !view.edram_msaa_x && !view.edram_msaa_y;
+    NoteFetchEDRAM4(source, view, n, fmt::format("{}, {}", kind, copy ? "copy engine" : "bit passes").c_str());
+    return false;
+  }
+  // PrepareDrawEDRAM4's late fetch for a stencil-using draw on `image` (bound range [0, length)).
+  bool FetchStencilDrawEDRAM4(Image& image, uint32_t length) {
+    if (!REXCVAR_GET(masseffect_native_edram4_stencil_fetch_area) || image.raster_grid_x ||
+        !StencilDeferredEDRAM4(image, 0, length))
+      return FetchStencilDeferredEDRAM4(image, 0, length);
+    RangeTiles4 range;
+    if (!RangeTilesEDRAM4(image, RasterArea(image, edram4_draw_area_), range))
+      return FetchStencilDeferredEDRAM4(image, 0, length);
+    ++edram4_fetch_area_draws_;
+    if (range.tx0 == 0 && range.tx1 == range.pitch) {
+      // Whole rows: one run, as the full fetch would be.
+      const uint32_t s = std::min(length, range.ty0 * range.pitch), e = std::min(length, range.ty1 * range.pitch);
+      if (e > s && !FetchStencilDeferredEDRAM4(image, s, e - s)) return false;
+    } else {
+      for (uint32_t ty = range.ty0; ty < range.ty1; ++ty) {
+        const uint32_t s = std::min(length, ty * range.pitch + range.tx0);
+        const uint32_t e = std::min(length, ty * range.pitch + range.tx1);
+        if (e > s && !FetchStencilDeferredEDRAM4(image, s, e - s)) return false;
+      }
+    }
+    // Tiles of the range that keep their deferred record (report only).
+    const auto it = edram4_stencil_source_.find(&image);
+    if (it != edram4_stencil_source_.end())
+      for (uint32_t t = 0; t < length && t < 2048; ++t) edram4_fetch_area_tiles_skipped_ += it->second[t].image ? 1 : 0;
+    return true;
   }
 
   struct ViewsDepthEDRAM {
@@ -3628,6 +4537,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     const uint32_t trace_physical = TraceTileEDRAM4();
     RangeTiles4 range;
     ++edram4_pub_calls_;
+    if (!keep_version) ++image.edram4_writes;
+    if (!keep_version && edram4_publish_stencil_only_) ++edram4_stencil_only_writes_[&image];
     // Fast path: all tiles of the area already ours and nobody cached their versions: nothing changes.
     if (REXCVAR_GET(masseffect_native_edram4_fast) && !keep_version &&
         image.edram4_epoch == edram4_epoch_ && !image.edram4_exported &&
@@ -3682,6 +4593,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
           owners_tiles_edram4_[physical] = {&image, uint16_t(tile), old.version};
         } else {
           owners_tiles_edram4_[physical] = {&image, uint16_t(tile), ++edram4_version_};
+          // masseffect_native_resolve_repeat: same owner and tile, stencil plane only.
+          if (edram4_publish_stencil_only_ && old.image == &image && old.tile_local == tile)
+            edram4_depth_versions_.Note(physical, old.version, edram4_version_);
         }
       }
     }
@@ -3761,6 +4675,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         if (!draws_->ClearStencilInPass(commands_work_, canonical,
                                            proof.stencil_reference, region.area))
           return FailureEDRAM4("canonical stencil-only attachment clear failed", drawn, &canonical);
+        KnownStencilEDRAM4(canonical, region.local, region.count, int32_t(proof.stencil_reference & 255u));
         BarrierClearEDRAM4();
         const uint32_t physical = TraceTileEDRAM4();
         const uint32_t local = (physical - drawn.edram_base) & 2047u;
@@ -3778,8 +4693,12 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     StencilRealEDRAM4(drawn, 0, limit);
     for (uint32_t tile = 0; tile < limit; ++tile) {
       auto& owner = owners_tiles_edram4_[(drawn.edram_base + tile) & 2047u];
+      const bool owned = owner.image != nullptr;
       if (!owner.image) { owner = {&drawn, uint16_t(tile)}; ++edram4_epoch_; }
+      const uint32_t previous = owner.version;
       owner.version = ++edram4_version_;  // the owner's stencil changed
+      if (owned && REXCVAR_GET(masseffect_native_resolve_repeat))  // the depth plane is preserved
+        edram4_depth_versions_.Note((drawn.edram_base + tile) & 2047u, previous, owner.version);
     }
     if (++edram4_stencil_preserves_ <= 16)
       REXLOG_INFO("[native] canonical stencil-only clear preserved depth: draw={} base={:03X} "
@@ -3844,6 +4763,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     };
     // Phase 1 collects the runs (tile-row pieces) to transfer; phase 2 records them.
     std::vector<SpanEDRAM4> spans;
+    const bool lean = SyncLeanEDRAM4(clear_overwrite, clear_cutout);  // masseffect_native_edram4_sync_lean
     // Full-width areas are one contiguous span (a transfer run may cross rows, as before).
     const bool complete_width = has_range && range.tx0 == 0 && range.tx1 == range.pitch;
     const uint32_t ty_end = complete_width ? range.ty0 + 1 : range.ty1;
@@ -3854,7 +4774,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       const auto owner_state = owners_tiles_edram4_[(target.edram_base + tile) & 2047u];
       if (!owner_state.image || owner_state.image == &target) { ++tile; continue; }
       bool whole = false;
-      if (!TileUsedEDRAM4(target, tile, area, &whole)) { ++tile; continue; }
+      if (lean ? !SyncLeanUsedEDRAM4(target, tile, area) : !TileUsedEDRAM4(target, tile, area, &whole)) {
+        ++tile;
+        continue;
+      }
       if (clear_cutout) {
         whole = false;
         TileUsedEDRAM4(target, tile, *clear_cutout, &whole);
@@ -3893,7 +4816,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       while (tile + count < row_end) {
         bool whole_next = false;
         const auto next = owners_tiles_edram4_[(target.edram_base + tile + count) & 2047u];
-        const bool used = TileUsedEDRAM4(target, tile + count, area, &whole_next);
+        const bool used = lean ? SyncLeanUsedEDRAM4(target, tile + count, area)
+                               : TileUsedEDRAM4(target, tile + count, area, &whole_next);
         if (clear_cutout) {
           whole_next = false;
           TileUsedEDRAM4(target, tile + count, *clear_cutout, &whole_next);
@@ -3949,6 +4873,26 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                       edram4_traces_, count, target.edram_base, source.width, source.height, source.edram_msaa_y,
                       target.width, target.height, target.edram_msaa_y, edram4_draw_desc_);
         }
+        if (edram4_pair_keys_on_ < 0) edram4_pair_keys_on_ = REXCVAR_GET(masseffect_native_edram4_pair_keys) ? 1 : 0;
+        if (edram4_pair_keys_on_) {
+          // The same statistics as below without building strings (masseffect_native_edram4_pair_keys).
+          auto& kp = edram4_pair_keys_[{PairImageEDRAM4(source), PairImageEDRAM4(target)}];
+          if (!kp.ops) kp.example = edram4_reason_ == 0 ? DescribeDrawEDRAM4() : "-";
+          if (edram4_reason_ == 0 && edram4_submission_ && edram4_submission_->registers) {
+            const auto& q = *edram4_submission_;
+            const bool ow = q.edram_overwrite_rect && (q.edram_overwrite_slots & (1u << edram4_slot_));
+            PairDrawKeyEDRAM4 dk{q.vs ? int32_t(q.vs->number) : -1, q.ps ? int32_t(q.ps->number) : -1,
+                                 q.registers[gr::XE_GPU_REG_VGT_DRAW_INITIATOR] & 63,
+                                 q.registers[gr::XE_GPU_REG_RB_MODECONTROL] & 7,
+                                 q.registers[gr::XE_GPU_REG_RB_DEPTHCONTROL], ow, {}};
+            if (ow) dk.rect = *q.edram_overwrite_rect;
+            auto& d = kp.draws[dk];
+            ++d.first;
+            d.second += count;
+          }
+          ++kp.ops;
+          kp.tiles += count;
+        } else {
         const auto describe = [](const Image& im) {
           return fmt::format("{}{:03X}/f{}:{}x{}:mx{}my{}g{}{}", im.edram_depth ? "D" : "C", im.edram_base,
                              im.edram_format, im.width, im.height, im.edram_msaa_x, im.edram_msaa_y,
@@ -3974,8 +4918,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         }
         ++par.ops;
         par.tiles += count;
+        }
       }
       spans.push_back({&source, owner_state.tile_local, tile, count, native_msaa_import});
+      if (edram4_restore_live_) ObserveRestoreEDRAM4(source, target, tile, count);
       {
         const RedirectedStamp& stamp = edram4_stamps_[(target.edram_base + tile) & 2047u];
         if (stamp.site && stamp.version == owner_state.version) {
@@ -3991,6 +4937,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       if (!target.edram_depth && !clear_overwrite) PublishEDRAM4(target, area, limit, true);
       return true;
     }
+    me::native::ring_partition::Scope phase_transfer(me::native::ring_partition::kEdramTransfer);
     const bool batch = REXCVAR_GET(masseffect_native_edram4_batch) && spans.size() > 1 && !edram4_batch_.active &&
         slots_[slot_].conversions_edram + 2 * spans.size() + 16 < kConversionsEDRAMPerSlot;
     if (batch) {
@@ -4149,6 +5096,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
 
   bool CopyTilesEDRAM4(Image& source, Image& target, uint32_t source_start,
                          uint32_t target_start, uint32_t count) {
+    WrittenStencilEDRAM4(target);  // masseffect_native_edram4_stencil_known
     // The native2x depth utility is routed separately. No multisample image
     // may silently enter the legacy physical-copy mapping.
     if (!me::native::IsSingleSample(uint32_t(source.sample_count)) ||
@@ -4286,6 +5234,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   }
 
 
+  // masseffect_native_edram4_clear_alias_raw64: a 64bpp color owner of a tile a depth-only clear drawn through
+  // the 4x alias covers. Drawn literally, the clear leaves the tile's stencil in the drawn view's host image
+  // (PublishEDRAM4 never makes a 64bpp view a lazy stencil source, so the drawn view's stencil counts as real),
+  // and every later 1x import of the tile carries that stencil along. The redirect records exactly that source.
+  static bool Raw64ClearOwnerEDRAM4(const Image& w) {
+    return !w.edram_depth && w.edram_64bpp;
+  }
   bool RedirectClearDepthEDRAM4(const SubmissionDraw& p) {
     if (!REXCVAR_GET(masseffect_native_edram4_redirected_clear) || !p.registers || !p.edram_overwrite_rect ||
         !(p.edram_overwrite_slots & 1) || !draws_) return false;
@@ -4408,6 +5363,15 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     Image* const alias = alias_it != edram4_alias_1x_.end() && REXCVAR_GET(masseffect_native_edram4_clear_alias)
                               ? alias_it->second : nullptr;
     struct Goal { Image* w; uint32_t local; bool reassign; };
+    // masseffect_native_edram4_clear_alias_raw64: only depth-only clears (the stencil is not written, so it has to
+    // stay where the literal draw leaves it), through a single-sample (collapsed) 4x view with a known 1x alias.
+    // The drawn view's host stencil must be there to be fetched later (prepared, not swapped away).
+    const bool raw64 = alias && stencil_value < 0 && drawn->edram_msaa_x && drawn->edram_msaa_y &&
+                       drawn->prepared && !drawn->invalid_content &&
+                       me::native::IsSingleSample(uint32_t(drawn->sample_count)) &&
+                       REXCVAR_GET(masseffect_native_edram4_clear_alias_raw64) &&
+                       REXCVAR_GET(masseffect_native_edram4_stencil_lazy);
+    bool raw64_used = false;  // this clear took a tile from a 64bpp color owner (report)
     const auto goal = [&](uint32_t local) -> Goal {
       const auto owner = owners_tiles_edram4_[(drawn->edram_base + local) & 2047u];
       // A depth owner with the same encoding is cleared in place. Any other owner (a color view, a different
@@ -4416,9 +5380,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       const bool owner_utilizable = owner.image && owner.image != drawn && owner.image->edram_depth &&
           ((owner.image->edram_format == drawn->edram_format &&
             owner.image->depth_float24_half == drawn->depth_float24_half) || zero_depth);
-      // A color owner can only be a later stencil-fetch source in the classes the import reads.
-      const bool color_supported = owner.image && !owner.image->edram_depth && !owner.image->edram_64bpp &&
-          (owner.image->edram_format == 0 || owner.image->edram_format == 2 || owner.image->edram_format == 3);
+      // A color owner can only be a later stencil-fetch source in the classes the import reads
+      // (masseffect_native_edram4_clear_alias_raw64: a 64bpp owner too; the stencil source recorded for it is the
+      // drawn view, as the literal clear would leave it; see Raw64ClearOwnerEDRAM4).
+      const bool color_supported = owner.image && !owner.image->edram_depth &&
+          ((!owner.image->edram_64bpp && (owner.image->edram_format == 0 || owner.image->edram_format == 2 ||
+                                          owner.image->edram_format == 3)) ||
+           (raw64 && Raw64ClearOwnerEDRAM4(*owner.image)));
       if (owner_utilizable || (owner.image && owner.image != drawn && (!alias || (!owner.image->edram_depth &&
                                                                                     !color_supported))))
         return {owner.image, owner.tile_local, false};
@@ -4567,11 +5535,28 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         return FailureEDRAM4("redirected depth clear failed", *drawn, &w);
       BarrierClearEDRAM4();
       if (stencil_value >= 0) w.edram4_bits_stencil |= uint8_t(stencil_value);
+      // masseffect_native_edram4_stencil_known: whole owner tiles now hold the clear's stencil; a partial
+      // tile keeps old bits next to it. A depth-only clear leaves the stencil (and its known values) alone.
+      if (stencil_value >= 0 && !region.partial)
+        KnownStencilEDRAM4(w, region.owner_local, region.count, stencil_value);
+      else if (stencil_value >= 0)
+        WrittenStencilEDRAM4(w);
       for (uint32_t i = 0; i < region.count; ++i) {
         auto& d = owners_tiles_edram4_[(drawn->edram_base + region.first_local + i) & 2047u];
         if (region.reassign) {
           const uint32_t local = (region.owner_local + i) & 2047u;  // the new owner's own tile index
-          if (stencil_value < 0 && REXCVAR_GET(masseffect_native_edram4_stencil_lazy) && d.image &&
+          if (raw64 && !direct && d.image && d.image != &w && Raw64ClearOwnerEDRAM4(*d.image)) {
+            // masseffect_native_edram4_clear_alias_raw64: the stencil stays where the literal clear would have
+            // left it, the drawn 4x view's own host tile (see Raw64ClearOwnerEDRAM4); that tile's stencil is
+            // then real there, as after the literal draw's publish.
+            const uint32_t drawn_local = (region.first_local + i) & 2047u;
+            StencilRealEDRAM4(*drawn, drawn_local, 1);
+            auto& sources = edram4_stencil_source_[&w];
+            if (sources.empty()) sources.resize(2048);
+            sources[local] = SourceStencil{drawn, uint16_t(drawn_local)};
+            ++edram4_raw64_tiles_;
+            raw64_used = true;
+          } else if (stencil_value < 0 && REXCVAR_GET(masseffect_native_edram4_stencil_lazy) && d.image &&
               d.image != &w) {
             const auto previous = edram4_stencil_source_.find(d.image);
             const SourceStencil f = previous != edram4_stencil_source_.end() && previous->second[d.tile_local & 2047u].image
@@ -4590,6 +5575,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       edram4_redirected_tiles_ += region.count;
     }
     ++edram4_redirected_;
+    if (raw64_used) ++edram4_raw64_clears_;
     return true;
   }
 
@@ -4676,9 +5662,15 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       BarrierClearEDRAM4();
       // The owner's stencil is now real (and known) for these tiles: no lazy record may bring older bits.
       StencilRealEDRAM4(w, region.owner_local, region.count);
+      KnownStencilEDRAM4(w, region.owner_local, region.count, value);  // whole owner tiles
       w.edram4_bits_stencil |= uint8_t(value);
-      for (uint32_t i = 0; i < region.count; ++i)
-        owners_tiles_edram4_[(drawn->edram_base + region.first_local + i) & 2047u].version = ++edram4_version_;
+      for (uint32_t i = 0; i < region.count; ++i) {
+        const uint32_t physical = (drawn->edram_base + region.first_local + i) & 2047u;
+        const uint32_t previous = owners_tiles_edram4_[physical].version;
+        owners_tiles_edram4_[physical].version = ++edram4_version_;
+        if (REXCVAR_GET(masseffect_native_resolve_repeat))  // stencil only: the depth plane is unchanged
+          edram4_depth_versions_.Note(physical, previous, edram4_version_);
+      }
       edram4_stencil_redirected_tiles_ += region.count;
     }
     ++edram4_stencil_redirected_;
@@ -4701,6 +5693,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         ++n;
       }
       Image& src_data = *const_cast<Image*>(f.image);
+      if (FetchKnownStencilEDRAM4(src_data, view, f.tile, (start + i) & 2047u, n)) {
+        StencilRealEDRAM4(view, start + i, n);
+        i += n;
+        continue;
+      }
       edram4_import_stencil_only_ = true;
       const bool ok = src_data.prepared && ImportColorDepthEDRAM4(src_data, view, f.tile, (start + i) & 2047u, n);
       edram4_import_stencil_only_ = false;
@@ -4713,11 +5710,264 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     return true;
   }
 
+  /*
+   * Restore into 7e3 (masseffect_native_restore_into_7e3; docs/vulkan-frame-time.md section 8).
+   *
+   * UE3 restores the resolved scene into EDRAM through the k_2_10_10_10 view of 2D0 (VS6906/PS21415, a plain
+   * full-screen copy) right before each shadowed light, and the additive light pass then binds the 7e3 view of
+   * the same tiles: a whole-region f2 -> f3 conversion per light. When this draw qualifies, it binds the 7e3
+   * image instead, the pixel shader gets the epilogue that computes exactly what the f2 store plus the
+   * conversion compute (me_restore_7e3_spirv.h, proven in tests/cpu/test_native_restore_7e3_spirv.cpp), and
+   * the 7e3 view becomes the owner of the tiles, so the light pass transfers nothing.
+   *
+   * Conditions (all on this draw's registers, otherwise the usual path):
+   *   - the slot's view is the 32-bpp UNORM10 class, its color mask is F and the pixel shader writes it;
+   *   - blending ONE/ZERO/ADD on both channel groups, no alpha test, no alpha to mask, no shader kill, no
+   *     exponent bias (the epilogue reproduces a plain store only);
+   *   - a proven full overwrite of this slot, and every tile the draw touches lies wholly inside the proven
+   *     rectangles (no tile keeps old pixels that would then come from another conversion path);
+   *   - the 7e3 image of the same base, pitch and sample layout already exists with the same geometry;
+   *   - the site (VS, PS, base, slot) has been seen at least kRestoreConfidence times with its restored tiles
+   *     pulled next by that 7e3 view, and never, while redirected, by a UNORM10 view;
+   *   - the pixel shader's output takes the epilogue (DrawsVulkan::SupportsRestore7e3).
+   * Returns the 7e3 image to bind, or nullptr. Sets edram4_restore_site_[slot] for every candidate (all but
+   * the last two conditions), so the published tiles are stamped and the next consumer is learned.
+   */
+  Image* RestoreTargetEDRAM4(const SubmissionDraw& p, Image& image, uint32_t slot, uint32_t info, uint32_t pitch) {
+    const auto no = [&](const char* why) -> Image* { ++edram4_restore_no_[why]; return nullptr; };
+    if (image.edram_depth || image.edram_64bpp || image.edram_format != 2 || !p.ps || !p.registers) return nullptr;
+    const uint32_t* r = p.registers;
+    const uint32_t i = slot - 1;
+    static constexpr uint32_t kBlend[4] = {gr::XE_GPU_REG_RB_BLENDCONTROL0, gr::XE_GPU_REG_RB_BLENDCONTROL1,
+                                           gr::XE_GPU_REG_RB_BLENDCONTROL2, gr::XE_GPU_REG_RB_BLENDCONTROL3};
+    if (!p.edram_overwrite_rect || !(p.edram_overwrite_slots & (1u << slot))) return no("not a proven overwrite");
+    if (((r[gr::XE_GPU_REG_RB_COLOR_MASK] >> (i * 4)) & 0xFu) != 0xFu || !(p.ps->outputs & (1u << i)))
+      return no("partial color mask");
+    if ((r[kBlend[i]] & 0x1FFF1FFFu) != 0x00010001u) return no("blending");
+    const uint32_t cc = r[gr::XE_GPU_REG_RB_COLORCONTROL];
+    if ((((cc >> 3) & 1u) && (cc & 7u) != 7u) || ((cc >> 4) & 1u) || p.ps->discards)
+      return no("alpha test, alpha to mask or kill");
+    if (int32_t(info << 6) >> 26) return no("exponent bias");
+    const auto it = targets_.find(KeyTarget(image.edram_base,
+                                            uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT), pitch));
+    if (it == targets_.end()) return no("no 7e3 image of the base yet");
+    Image& f3 = it->second;
+    if (f3.edram_depth || f3.edram_64bpp || f3.edram_format != 3 || f3.format != image.format ||
+        f3.width != image.width || f3.height != image.height || f3.raster_grid_x != image.raster_grid_x ||
+        f3.edram_msaa_x != image.edram_msaa_x || f3.edram_msaa_y != image.edram_msaa_y ||
+        f3.sample_count != image.sample_count || f3.guest_width || f3.guest_height || image.guest_width ||
+        image.guest_height || f3.edram_base != image.edram_base)
+      return no("7e3 image of another geometry");
+    // Every touched tile wholly inside a proven rectangle.
+    const VkRect2D area = RasterArea(f3, edram4_draw_area_);
+    std::array<VkRect2D, 9> proven{};
+    uint32_t n = 0;
+    {
+      const auto& o = *p.edram_overwrite_rect;
+      proven[n++] = RasterArea(f3, VkRect2D{{o[0], o[1]}, {uint32_t(o[2] - o[0]), uint32_t(o[3] - o[1])}});
+      for (uint32_t k = 0; k < p.edram_overwrite_rect_count && k < p.edram_overwrite_rects.size(); ++k) {
+        const auto& q = p.edram_overwrite_rects[k];
+        proven[n++] = RasterArea(f3, VkRect2D{{q[0], q[1]}, {uint32_t(q[2] - q[0]), uint32_t(q[3] - q[1])}});
+      }
+    }
+    const uint32_t tiles = std::min<uint32_t>(edram4_draw_plan_.length_tiles[slot], 2048u);
+    uint32_t touched = 0;
+    for (uint32_t t = 0; t < tiles; ++t) {
+      if (!TileUsedEDRAM4(f3, t, area)) continue;
+      bool whole = false;
+      for (uint32_t k = 0; k < n && !whole; ++k) TileUsedEDRAM4(f3, t, proven[k], &whole);
+      if (!whole) return no("a touched tile is not wholly overwritten");
+      ++touched;
+    }
+    if (!touched) return no("no tile touched");
+    const uint64_t site = (uint64_t(p.vs ? p.vs->number : 0) << 40) | (uint64_t(p.ps->number & 0xFFFFFFu) << 16) |
+                          (uint64_t(image.edram_base) << 4) | slot;
+    edram4_restore_site_[slot] = site;
+    const RestoreSite& state = edram4_restore_sites_[site];
+    if (state.disabled) return no("a UNORM10 view read the restored tiles");
+    if (state.confidence < kRestoreConfidence) return no("learning the consumer");
+    if (!draws_ || !draws_->SupportsRestore7e3(*p.ps, i)) return no("pixel shader output");
+    ++edram4_restore_draws_;
+    edram4_restore_tiles_ += touched;
+    if (++edram4_restore_logged_ <= 16)
+      REXLOG_INFO("[native] EDRAM restore into 7e3: VS n{} PS n{} base {:03X} slot {} tiles {} drawn into the 7e3 "
+                  "image (no UNORM10 -> 7e3 import), draw {}", p.vs ? int(p.vs->number) : -1, p.ps->number,
+                  image.edram_base, i, touched, draws_ ? draws_->Drawn() + 1 : 0);
+    return &f3;
+  }
+
+  // After a candidate restore published `image`: stamp each tile it now owns in the draw area.
+  void StampRestoreEDRAM4(const Image& image, uint32_t slot) {
+    const VkRect2D area = RasterArea(image, edram4_draw_area_);
+    const uint32_t tiles = std::min<uint32_t>(edram4_draw_plan_.length_tiles[slot], 2048u);
+    for (uint32_t t = 0; t < tiles; ++t) {
+      const uint32_t physical = (image.edram_base + t) & 2047u;
+      const auto& owner = owners_tiles_edram4_[physical];
+      if (owner.image != &image || !TileUsedEDRAM4(image, t, area)) continue;
+      edram4_restore_stamps_[physical] = {edram4_restore_site_[slot], &image, owner.version, image.edram4_writes};
+      ++edram4_restore_live_;
+    }
+  }
+
+  // A transfer of tiles [tile, tile + count) of `target` from `source` is about to be recorded: if they are
+  // unchanged restored tiles, learn who reads them. Each stamp is used once.
+  void ObserveRestoreEDRAM4(const Image& source, const Image& target, uint32_t tile, uint32_t count) {
+    uint64_t site = 0;
+    for (uint32_t k = 0; k < count; ++k) {
+      const uint32_t physical = (target.edram_base + tile + k) & 2047u;
+      RestoreStamp& stamp = edram4_restore_stamps_[physical];
+      if (!stamp.site) continue;
+      const auto& owner = owners_tiles_edram4_[physical];
+      if (stamp.owner == &source && owner.image == &source && owner.version == stamp.version &&
+          source.edram4_writes == stamp.writes)
+        site = stamp.site;
+      stamp = {};
+    }
+    if (!site) return;
+    RestoreSite& state = edram4_restore_sites_[site];
+    const bool f3_reader = !target.edram_depth && !target.edram_64bpp && target.edram_format == 3 &&
+                           target.edram_base == source.edram_base;
+    const bool f2_reader = !target.edram_depth && !target.edram_64bpp && target.edram_format == 2;
+    if (f3_reader && source.edram_format == 2) {
+      if (state.confidence < 255) ++state.confidence;
+      ++edram4_restore_good_;
+    } else if (f2_reader && source.edram_format == 3 && !state.disabled) {
+      state.disabled = true;
+      ++edram4_restore_disabled_;
+      REXLOG_WARN("[native] EDRAM restore into 7e3: site {:016X} disabled: a UNORM10 view (base {:03X}) read the "
+                  "restored tiles before the 7e3 view changed them; that site keeps the conversion", site,
+                  target.edram_base);
+    }
+  }
+
+  /*
+   * masseffect_native_edram4_rect_list_tiles (backlog E35, docs/vulkan-frame-time.md section 9).
+   *
+   * A proven rectangle list (ProveRectangleList: every rectangle's covered pixels lie inside its own bounds,
+   * computed by running the vertex shader on the CPU) writes no pixel outside the union of those bounds. The
+   * usual path syncs and publishes their bounding box instead: for the shadow attenuation slot's border clear
+   * (VS9828/PS10237, rectangles 0,176-320,182 and 320,0-322,182 at 1280) that is every tile of the 322x182
+   * box, ~108 tiles per frame imported from D5A0 (depth export, with a late stencil fetch) and C400 only to be
+   * overwritten by the next draw. With the cvar on, each rectangle's bounds (clipped to the scissor) is synced
+   * and published on its own. A tile no rectangle touches is not transferred and keeps its owner: the guest
+   * leaves its EDRAM bytes as they are, and the owner still holds exactly those bytes.
+   */
+  void TouchRectsEDRAM4(const SubmissionDraw& p, int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+    edram4_touch_rects_.clear();
+    if (!REXCVAR_GET(masseffect_native_edram4_rect_list_tiles) ||
+        !REXCVAR_GET(masseffect_native_edram4_area_rect) || !p.edram_bounds_rect ||
+        p.edram_overwrite_rect_count < 2 || p.edram_overwrite_rect_count > p.edram_bounds_rects.size())
+      return;
+    for (uint32_t k = 0; k < p.edram_overwrite_rect_count; ++k) {
+      const auto& b = p.edram_bounds_rects[k];
+      if (b[2] <= b[0] || b[3] <= b[1]) {  // not filled in: keep the bounding box
+        edram4_touch_rects_.clear();
+        return;
+      }
+      const int32_t ax0 = std::max(x0, b[0]), ay0 = std::max(y0, b[1]);
+      const int32_t ax1 = std::min(x1, b[2]), ay1 = std::min(y1, b[3]);
+      if (ax1 <= ax0 || ay1 <= ay0) continue;  // clipped away by the scissor: touches nothing
+      edram4_touch_rects_.push_back({{ax0, ay0}, {uint32_t(ax1 - ax0), uint32_t(ay1 - ay0)}});
+    }
+    // Nothing visible: an empty list would mean "bounding box"; the box (scissor-clipped) is then empty too.
+    if (edram4_touch_rects_.empty()) return;
+    ++edram4_touch_draws_;
+  }
+
+  // Tiles of `image` in `area` (TileUsedEDRAM4 semantics), for the report.
+  uint64_t CountTilesEDRAM4(const Image& image, const VkRect2D& area, uint32_t limit) const {
+    RangeTiles4 range;
+    if (!RangeTilesEDRAM4(image, area, range)) return 0;
+    uint64_t n = 0;
+    for (uint32_t ty = range.ty0; ty < range.ty1; ++ty)
+      for (uint32_t tile = ty * range.pitch + range.tx0; tile < ty * range.pitch + range.tx1 && tile < limit; ++tile)
+        n += TileUsedEDRAM4(image, tile, area);
+    return n;
+  }
+
+  // The draw's sync of one slot: its bounding area, or each touched rectangle (rect_list_tiles).
+  bool SyncDrawEDRAM4(Image& image, uint32_t limit, const VkRect2D* overwritten) {
+    if (edram4_touch_rects_.empty())
+      return overwritten ? SynchronizeEDRAM4(image, RasterArea(image, edram4_draw_area_), limit, true, 0, overwritten)
+                         : SynchronizeEDRAM4(image, RasterArea(image, edram4_draw_area_), limit);
+    if (edram4_touch_logs_ < 8) {
+      const uint64_t box = CountTilesEDRAM4(image, RasterArea(image, edram4_draw_area_), limit);
+      uint64_t touched = 0;
+      std::vector<bool> seen(2048, false);
+      for (const VkRect2D& r : edram4_touch_rects_) {
+        RangeTiles4 range;
+        const VkRect2D a = RasterArea(image, r);
+        if (!RangeTilesEDRAM4(image, a, range)) continue;
+        for (uint32_t ty = range.ty0; ty < range.ty1; ++ty)
+          for (uint32_t t = ty * range.pitch + range.tx0; t < ty * range.pitch + range.tx1 && t < limit; ++t)
+            if (TileUsedEDRAM4(image, t, a) && !seen[t & 2047u]) { seen[t & 2047u] = true; ++touched; }
+      }
+      {
+        ++edram4_touch_logs_;
+        REXLOG_INFO("[native] EDRAM rect list tiles: {}{:03X}/f{}:{}x{} {} rectangles touch {} of the {} tiles of "
+                    "their bounding box {},{}+{}x{} (VS n{} PS n{})",
+                    image.edram_depth ? "D" : "C", image.edram_base, image.edram_format, image.width, image.height,
+                    edram4_touch_rects_.size(), touched, box, edram4_draw_area_.offset.x,
+                    edram4_draw_area_.offset.y, edram4_draw_area_.extent.width, edram4_draw_area_.extent.height,
+                    edram4_submission_ && edram4_submission_->vs ? int(edram4_submission_->vs->number) : -1,
+                    edram4_submission_ && edram4_submission_->ps ? int(edram4_submission_->ps->number) : -1);
+      }
+    }
+    for (const VkRect2D& r : edram4_touch_rects_) {
+      const bool ok = overwritten ? SynchronizeEDRAM4(image, RasterArea(image, r), limit, true, 0, overwritten)
+                                  : SynchronizeEDRAM4(image, RasterArea(image, r), limit);
+      if (!ok) return false;
+    }
+    ++edram4_touch_syncs_;
+    return true;
+  }
+
+  /*
+   * masseffect_native_query_occlusion_depth (docs/occlusion-queries.md section E): a D3D Clear of a whole depth
+   * surface (a draw proven to write one constant depth over a rectangle from 0,0 across the full pitch, depth
+   * ALWAYS + write, no color) is reported to the draws, which clear the occlusion depth twin of that surface.
+   * Only the report: what this draw does to the targets is unchanged.
+   */
+  void NoteDepthClearDraw(const SubmissionDraw& p) {
+    if (!draws_ || !p.registers || !p.edram_overwrite_rect || !(p.edram_overwrite_slots & 1) ||
+        p.edram_overwrite_slots != 1 || !p.edram_overwrite_depth)
+      return;
+    const uint32_t* r = p.registers;
+    const uint32_t mode = r[gr::XE_GPU_REG_RB_MODECONTROL] & 7;
+    if (mode != 5 && !(mode == uint32_t(xenos::EdramMode::kColorDepth) && !r[gr::XE_GPU_REG_RB_COLOR_MASK]))
+      return;
+    const uint32_t dc = r[gr::XE_GPU_REG_RB_DEPTHCONTROL];
+    if ((dc & 0x76) != 0x76) return;  // Z enable, Z write, ALWAYS
+    // Pitch and rectangle in samples along X: D3D clears a 1x surface as a 4x MSAA rectangle of half the width
+    // (pitch 480 for a 960 surface), and the draws match the clear by base, format and this pitch.
+    const uint32_t shift = ((r[gr::XE_GPU_REG_RB_SURFACE_INFO] >> 16) & 3) >= 2 ? 1 : 0;
+    const uint32_t pitch = (r[gr::XE_GPU_REG_RB_SURFACE_INFO] & 0x3FFF) << shift;
+    const auto& o = *p.edram_overwrite_rect;
+    if (o[0] != 0 || o[1] != 0 || (uint64_t(std::max(0, o[2])) << shift) < pitch) return;
+    const uint32_t info = r[gr::XE_GPU_REG_RB_DEPTH_INFO];
+    // Stencil: the constant the clear writes when it replaces stencil over the same rectangle, else 0 (the twin
+    // only feeds depth-tested query boxes).
+    uint32_t stencil = 0;
+    if ((dc & 1) && p.edram_stencil_replace_rect && *p.edram_stencil_replace_rect == o && ((dc >> 14) & 7) == 2)
+      stencil = r[gr::XE_GPU_REG_RB_STENCILREFMASK] & 0xFF;
+    draws_->NoteDepthClear(info & 0xFFF, (info >> 16) & 1, pitch, *p.edram_overwrite_depth, stencil);
+  }
+
+  // The draw's publish of one slot: its bounding area, or each touched rectangle (rect_list_tiles).
+  void PublishDrawEDRAM4(Image& image, uint32_t limit) {
+    if (edram4_touch_rects_.empty()) {
+      PublishEDRAM4(image, RasterArea(image, edram4_draw_area_), limit);
+      return;
+    }
+    for (const VkRect2D& r : edram4_touch_rects_) PublishEDRAM4(image, RasterArea(image, r), limit);
+  }
+
   bool PrepareDrawEDRAM4(const SubmissionDraw& p) {
     // Per-draw state must not leak past this call (early returns included): stale cutouts would make a
     // later clear skip imports, a stale replace rect would zero stencil, a stale request would dangle.
     edram4_cuts_extra_.clear();
     edram4_stencil_replacement_.reset();
+    edram4_touch_rects_.clear();
     struct Clean {
       TargetsVulkan* d;
       ~Clean() { d->edram4_cuts_extra_.clear(); d->edram4_stencil_replacement_.reset(); d->edram4_submission_ = nullptr; }
@@ -4746,6 +5996,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       const int32_t ax1 = std::max(ax0, std::min(x1, o[2])), ay1 = std::max(ay0, std::min(y1, o[3]));
       edram4_draw_area_ = {{ax0, ay0}, {uint32_t(ax1 - ax0), uint32_t(ay1 - ay0)}};
     }
+    TouchRectsEDRAM4(p, x0, y0, x1, y1);
     me::native::EdramBoundRequest request;
     request.pitch_pixels = r[gr::XE_GPU_REG_RB_SURFACE_INFO] & 0x3FFF;
     request.msaa = msaa_edram_actual_;
@@ -4772,6 +6023,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       const uint32_t info = slot ? r[kDiagRegsColorInfo[slot - 1]] : r[gr::XE_GPU_REG_RB_DEPTH_INFO];
       Image* image = slot ? GetTarget(info & 0xFFF, (info >> 16) & 15, request.pitch_pixels)
                              : GetDepth(info & 0xFFF, (info >> 16) & 1, request.pitch_pixels);
+      if (slot && image && REXCVAR_GET(masseffect_native_restore_into_7e3) &&
+          mode == uint32_t(xenos::EdramMode::kColorDepth)) {
+        if (Image* f3 = RestoreTargetEDRAM4(p, *image, slot, info, request.pitch_pixels)) {
+          image = f3;
+          edram4_restore_mask_ |= 1u << (slot - 1);
+        }
+      }
       edram4_reason_ = 0;
       edram4_submission_ = &p;
       edram4_slot_ = slot;
@@ -4806,12 +6064,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         const auto& o = *p.edram_overwrite_rect;
         const VkRect2D overwritten = RasterArea(*image, VkRect2D{{o[0], o[1]},
             {uint32_t(o[2] - o[0]), uint32_t(o[3] - o[1])}});
-        if (!SynchronizeEDRAM4(*image, RasterArea(*image, edram4_draw_area_),
-                               edram4_draw_plan_.length_tiles[slot], true, 0, &overwritten))
+        if (!SyncDrawEDRAM4(*image, edram4_draw_plan_.length_tiles[slot], &overwritten))
           return false;
         ++edram4_overwrites_;
-      } else if (!SynchronizeEDRAM4(*image, RasterArea(*image, edram4_draw_area_),
-                                    edram4_draw_plan_.length_tiles[slot]))
+      } else if (!SyncDrawEDRAM4(*image, edram4_draw_plan_.length_tiles[slot], nullptr))
         return false;
       edram4_cuts_extra_.clear();
       edram4_stencil_replacement_.reset();
@@ -4827,8 +6083,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
             if (TileUsedEDRAM4(*image, t, replacement, &whole) && whole) StencilRealEDRAM4(*image, t, 1);
           }
         }
-        if (!FetchStencilDeferredEDRAM4(*image, 0, edram4_draw_plan_.length_tiles[0])) return false;
+        if (!FetchStencilDrawEDRAM4(*image, edram4_draw_plan_.length_tiles[0])) return false;
       }
+      if (slot == 0) WrittenStencilEDRAM4(*image);  // masseffect_native_edram4_stencil_known: bound as depth
       edram4_draw_images_[slot] = image;
       const uint32_t front = r[gr::XE_GPU_REG_RB_STENCILREFMASK];
       const uint32_t back = (dc & 0x80) ? r[gr::XE_GPU_REG_RB_STENCILREFMASK_BF] : front;
@@ -4839,6 +6096,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       edram4_draw_writes_[slot] = slot != 0 || ((dc & 6) == 6) ||
                                     ((dc & 1) && (front_writes || back_writes));
       if (slot == 0) edram4_draw_writes_stencil_ = (dc & 1) && (front_writes || back_writes);
+      if (slot == 0) edram4_draw_writes_depth_ = (dc & 6) == 6;  // masseffect_native_resolve_repeat
       if (slot == 0 && (dc & 1)) {
         // Bits this draw can set: REPLACE writes ref & wmask; INCR/DECR/INVERT (3..7) any bit of wmask.
         const auto bits_face = [](uint32_t refmask, uint32_t ops) -> uint8_t {
@@ -4960,6 +6218,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   uint64_t overlaps_conversions_ = 0, overlaps_tiles_converted_ = 0;
 
   void SynchronizeOverlapsEDRAM(uint32_t base, Image& target, const VkRect2D* area = nullptr) {
+    WrittenStencilEDRAM4(target);  // masseffect_native_edram4_stencil_known
     if (!copy_image_ || !target.width || !target.height) return;
     constexpr uint32_t kTileWidth = xenos::kEdramTileWidthSamples;
     constexpr uint32_t kTileHeight = xenos::kEdramTileHeightSamples;
@@ -5186,6 +6445,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   }
 
   bool CopyAliasEDRAMPitch(Image& source, Image& target) {
+    WrittenStencilEDRAM4(target);  // masseffect_native_edram4_stencil_known
     if (!copy_image_ || source.format != target.format ||
         source.edram_format != target.edram_format ||
         source.edram_64bpp != target.edram_64bpp || !source.width || !target.width) {
@@ -5273,8 +6533,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   bool ResolverDirect7e3(Image& owner, Image& target, int32_t sx, int32_t sy, uint32_t dx, uint32_t dy,
                          uint32_t width, uint32_t height) {
     if (owner.format != VK_FORMAT_R16G16B16A16_SFLOAT || target.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-        owner.image == target.image || !width || !height || !pipelines_conversion_edram_[13] ||
-        !EnsureCapacityConversionEDRAM4("resolve from 7e3")) return false;
+        owner.image == target.image || !width || !height) return false;
+    if (REXCVAR_GET(masseffect_native_resolve_7e3_frag) &&
+        ResolverDirect7e3Frag(owner, target, sx, sy, dx, dy, width, height))
+      return true;
+    if (!pipelines_conversion_edram_[13] || !EnsureCapacityConversionEDRAM4("resolve from 7e3")) return false;
     SlotWork& slot = slots_[slot_];
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSetAllocateInfo reserve{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -5319,6 +6582,646 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     dfn_.vkCmdPipelineBarrier(commands_work_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    ++resolves_direct_7e3_;
+    return true;
+  }
+
+  /*
+   * masseffect_native_resolve_bias_probe (docs/vulkan-frame-time.md section 9, item e). Diagnostic only.
+   * The content of the resolve's source is identified by the (owner, tile, version) of every EDRAM tile of
+   * area_edram_: a version changes with every write that is published, so equal signatures mean equal bits.
+   *   - "repeat": a resolve into the same texture with the same rectangle, bias and format as the previous
+   *     resolve into it, from an unchanged source: the texture already holds exactly that result (resolved
+   *     textures are written only by resolves);
+   *   - "pair": a bias resolve and a 7e3 -> UNORM10 resolve back to back from the same unchanged source (one
+   *     pass with two outputs would read it once).
+   */
+  uint64_t SignatureSourceEDRAM4(Image& view, const VkRect2D& area) {
+    RangeTiles4 range;
+    if (!RangeTilesEDRAM4(view, area, range)) return 0;
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t ty = range.ty0; ty < range.ty1; ++ty)
+      for (uint32_t tile = ty * range.pitch + range.tx0; tile < ty * range.pitch + range.tx1; ++tile) {
+        if (!TileUsedEDRAM4(view, tile, area)) continue;
+        const auto o = owners_tiles_edram4_[(view.edram_base + tile) & 2047u];
+        for (uint64_t v : {uint64_t(reinterpret_cast<uintptr_t>(o.image)), uint64_t(o.tile_local),
+                           uint64_t(o.version), uint64_t(tile)})
+          h = (h ^ v) * 1099511628211ull;
+      }
+    return h;
+  }
+  struct ProbeResolve {
+    uint64_t signature = 0;
+    int32_t rect[4]{};
+    int32_t bias = 0;
+    uint32_t format = 0, kind = 0;
+  };
+  void ProbeResolveEDRAM4(uint32_t kind, uint32_t base, Image& view, uint32_t dx, uint32_t dy, uint32_t width,
+                          uint32_t height, int32_t bias, uint32_t format) {
+    ProbeResolve now;
+    now.signature = SignatureSourceEDRAM4(view, area_edram_);
+    if (!now.signature) return;
+    now.rect[0] = area_edram_.offset.x;
+    now.rect[1] = area_edram_.offset.y;
+    now.rect[2] = int32_t(dx | (dy << 16));
+    now.rect[3] = int32_t(width | (height << 16));
+    now.bias = bias;
+    now.format = format;
+    now.kind = kind;
+    ++probe_resolves_[kind & 3];
+    ProbeResolve& last = probe_last_by_base_[base];
+    if (last.signature == now.signature && last.bias == bias && last.format == format && last.kind == kind &&
+        std::equal(std::begin(last.rect), std::end(last.rect), std::begin(now.rect)))
+      ++probe_repeats_[kind & 3];
+    last = now;
+    if (probe_previous_.signature == now.signature && probe_previous_.kind && probe_previous_.kind != kind)
+      ++probe_pairs_;
+    probe_previous_ = now;
+  }
+  std::unordered_map<uint32_t, ProbeResolve> probe_last_by_base_;
+
+  /*
+   * masseffect_native_bias_life_probe (docs/vulkan-frame-time.md section 12, me_bias_life.h). Diagnostic only:
+   * reads registers, publish write counts and resolve requests, records nothing on the GPU.
+   * Approximations (all conservative for the "exact" classes): a draw's tiles are the whole tile rows of its
+   * scissor (or proven) area; redirected depth/stencil clears (RedirectClear*EDRAM4) are not seen; a resolve's sync
+   * counts as an import into its view whenever that view is not the single owner of the area.
+   */
+  static uint64_t BiasLifeId(const Image* image) { return uint64_t(reinterpret_cast<uintptr_t>(image)); }
+
+  static me::native::BiasLifeSpan BiasLifeSpanEDRAM4(const Image& image, const VkRect2D& area) {
+    RangeTiles4 range;
+    if (!RangeTilesEDRAM4(image, area, range)) return {};
+    const uint32_t first = range.ty0 * range.pitch + range.tx0;
+    const uint32_t last = (range.ty1 - 1) * range.pitch + range.tx1;  // exclusive
+    return {(image.edram_base + first) & 2047u, std::min<uint32_t>(last - first, 2048u)};
+  }
+
+  bool BiasLifeSource(const Image* image) const {
+    return std::find(bias_life_sources_.begin(), bias_life_sources_.end(), image) != bias_life_sources_.end();
+  }
+
+  // Before PrepareDrawEDRAM4: the write counts of the bias sources (their syncs are part of the draw's write).
+  void BiasLifeBeforeDraw() {
+    bias_life_before_.resize(bias_life_sources_.size());
+    for (size_t i = 0; i < bias_life_sources_.size(); ++i)
+      bias_life_before_[i] = bias_life_sources_[i]->edram4_writes;
+  }
+
+  bool BiasLifeDumping() {
+    if (bias_life_dump_until_ && presented_ < bias_life_dump_until_ && bias_life_dump_lines_ < 600) return true;
+    const int32_t at = REXCVAR_GET(masseffect_native_bias_life_dump_s);
+    if (at > 0 && !bias_life_dump_until_ &&
+        std::chrono::steady_clock::now() - dump_start_ > std::chrono::seconds(at)) {  // renderer start
+      bias_life_dump_until_ = presented_ + 3;  // the rest of this frame and the next 2
+      REXLOG_INFO("[native] bias life dump: frames {} to {}", presented_, bias_life_dump_until_ - 1);
+      return true;
+    }
+    return false;
+  }
+
+  // After a recorded draw (and its publish): its reads of bias textures and its colour/depth writes.
+  void BiasLifeAfterDraw(const SubmissionDraw& p) {
+    const uint32_t* r = p.registers;
+    if (!r) return;
+    me::native::BiasLifeDraw& d = bias_life_draw_;
+    d.vs = p.vs ? p.vs->number : 0;
+    d.ps = p.ps ? p.ps->number : 0;
+    d.reads.clear();
+    d.writes.clear();
+    d.depth_writes.clear();
+    constexpr uint32_t kRegFetchConstants = 0x4800;
+    if (p.ps && bias_life_.AnyLife()) {
+      for (const auto& sampler : p.ps->samplers) {
+        if (sampler.register_value >= 16) continue;
+        const uint32_t* f = r + kRegFetchConstants + uint32_t(sampler.register_value) * 6;
+        if ((f[0] & 3u) != uint32_t(xenos::FetchConstantType::kTexture) ||
+            ((f[5] >> 9) & 3u) != uint32_t(xenos::DataDimension::k2DOrStacked)) continue;
+        const uint32_t address = ((f[1] >> 12) << 12) & 0x1FFFFFFFu;
+        if (!bias_life_.Tracks(address)) continue;
+        me::native::BiasLifeRead read;
+        read.address = address;
+        read.point = ((f[3] >> 19) & 3u) == 0 && ((f[3] >> 21) & 3u) == 0;  // mag and min filter: point
+        read.exp_adjust = ((f[3] >> 13) & 0x3Fu) != 0;
+        d.reads.push_back(read);
+      }
+    }
+    static constexpr uint32_t kBlend[4] = {gr::XE_GPU_REG_RB_BLENDCONTROL0, gr::XE_GPU_REG_RB_BLENDCONTROL1,
+                                           gr::XE_GPU_REG_RB_BLENDCONTROL2, gr::XE_GPU_REG_RB_BLENDCONTROL3};
+    const uint32_t cc = r[gr::XE_GPU_REG_RB_COLORCONTROL];
+    const bool kills = (((cc >> 3) & 1u) && (cc & 7u) != 7u) || ((cc >> 4) & 1u) || (p.ps && p.ps->discards);
+    bool relevant = !d.reads.empty();
+    for (uint32_t slot = 0; slot < 5; ++slot) {
+      Image* image = edram4_draw_images_[slot];
+      if (!image || !edram4_draw_writes_[slot]) continue;
+      const me::native::BiasLifeSpan span = BiasLifeSpanEDRAM4(*image, RasterArea(*image, edram4_draw_area_));
+      if (slot == 0) {
+        d.depth_writes.push_back(span);
+        continue;
+      }
+      const uint32_t i = slot - 1;
+      const uint32_t mask = (r[gr::XE_GPU_REG_RB_COLOR_MASK] >> (i * 4)) & 0xFu;
+      const uint32_t m = r[kBlend[i]] & 0x1FFF1FFFu;
+      const bool rgb = (m & 0x1Fu) == 1 && ((m >> 8) & 0x1Fu) == 0 && ((m >> 5) & 7u) == 0;
+      const bool alpha = ((m >> 16) & 0x1Fu) == 1 && ((m >> 24) & 0x1Fu) == 0 && ((m >> 21) & 7u) == 0;
+      const uint32_t info = r[kDiagRegsColorInfo[i]];
+      me::native::BiasLifeWrite w;
+      w.image = BiasLifeId(image);
+      w.base = image->edram_base;
+      w.span = span;
+      w.direct = (!(mask & 7u) || rgb) && (!(mask & 8u) || alpha) && !(int32_t(info << 6) >> 26);
+      w.full_mask = mask == 0xFu;
+      w.no_kill = !kills;
+      if (p.edram_overwrite_rect && (p.edram_overwrite_slots & (1u << slot))) {
+        const auto& o = *p.edram_overwrite_rect;
+        w.has_proven = true;
+        w.proven = {o[0], o[1], o[2], o[3]};
+      }
+      w.writes_before = me::native::kBiasLifeUnknown;
+      for (size_t k = 0; k < bias_life_sources_.size() && k < bias_life_before_.size(); ++k)
+        if (bias_life_sources_[k] == image) {
+          w.writes_before = bias_life_before_[k];
+          relevant = true;
+        }
+      w.writes_after = image->edram4_writes;
+      d.writes.push_back(w);
+    }
+    bias_life_.Draw(d);
+    if (relevant && BiasLifeDumping()) {
+      ++bias_life_dump_lines_;
+      std::string writes;
+      for (const auto& w : d.writes)
+        writes += fmt::format(" [{:03X}{} tiles {}+{} {} mask{} {}{}]", w.base,
+                              BiasLifeSource(reinterpret_cast<const Image*>(uintptr_t(w.image))) ? "*" : "",
+                              w.span.first, w.span.count, w.direct ? "direct" : "BLEND", w.full_mask ? "F" : "<F",
+                              w.no_kill ? "" : "kill ",
+                              w.has_proven ? fmt::format("proven {},{}-{},{}", w.proven[0], w.proven[1],
+                                                         w.proven[2], w.proven[3]) : "unproven");
+      std::string reads;
+      for (const auto& rd : d.reads)
+        reads += fmt::format(" {:08X}({}{})", rd.address, rd.point ? "point" : "filtered",
+                             rd.exp_adjust ? ", exp adjust" : "");
+      REXLOG_INFO("[native] bias life dump f{} draw {}: VS n{} PS n{} writes:{} reads:{}", presented_,
+                  draws_ ? draws_->Drawn() : 0, d.vs, d.ps, writes.empty() ? " -" : writes,
+                  reads.empty() ? " -" : reads);
+    }
+  }
+
+  // A colour or depth clear of `span` (CopyInternal): breaks chains over those tiles, may make a source dead.
+  void BiasLifeClear(const Image* image, const me::native::BiasLifeSpan& span, uint32_t base,
+                     const me::native::BiasLifeRect* rect) {
+    bias_life_.Clear(BiasLifeId(image), span, base, rect);
+    if (BiasLifeDumping()) {
+      ++bias_life_dump_lines_;
+      REXLOG_INFO("[native] bias life dump f{} clear {:03X}{} tiles {}+{}{}", presented_, base,
+                  BiasLifeSource(image) ? "*" : "", span.first, span.count,
+                  rect ? fmt::format(" rect {},{}-{},{}", (*rect)[0], (*rect)[1], (*rect)[2], (*rect)[3]) : "");
+    }
+  }
+
+  // A colour resolve into `address` (CopyInternal, before it is recorded or skipped). exp_bias != 0: a bias
+  // resolve from `source`, which starts a life; otherwise it only ends the address's previous life.
+  void BiasLifeResolve(Image& source, uint32_t address, int32_t exp_bias, bool full_cover, int32_t x0, int32_t y0,
+                       int32_t x1, int32_t y1, uint32_t texture_format) {
+    if (!exp_bias) {
+      const uint32_t end = bias_life_.Retire(address);
+      if (end != me::native::kBiasEndCount && BiasLifeDumping()) {
+        ++bias_life_dump_lines_;
+        REXLOG_INFO("[native] bias life dump f{} resolve (no bias, format {}) into {:08X}: life ends {}", presented_,
+                    texture_format, address, end);
+      }
+      return;
+    }
+    if (half_rop_test_.state == 0) RecordHalfRopTest();  // once, outside any pass (CopyInternal)
+    if (!BiasLifeSource(&source)) {
+      if (bias_life_sources_.size() >= 8) return;  // more sources than the scene's: not followed
+      bias_life_sources_.push_back(&source);
+    }
+    const me::native::BiasLifeRect rect{x0, y0, x1, y1};
+    const auto span = BiasLifeSpanEDRAM4(source, RasterArea(source, VkRect2D{{x0, y0},
+        {uint32_t(std::max(0, x1 - x0)), uint32_t(std::max(0, y1 - y0))}}));
+    const bool was = bias_life_.Tracks(address);
+    const uint32_t producer = bias_life_.Resolve(BiasLifeId(&source), source.edram4_writes, source.edram_base, span,
+                                                 rect, address, full_cover);
+    if (BiasLifeDumping()) {
+      static const char* kProducer[me::native::kBiasProducerCount] = {"strict", "chain", "blended", "other",
+                                                                      "small", "no start"};
+      ++bias_life_dump_lines_;
+      REXLOG_INFO("[native] bias life dump f{} BIAS RESOLVE {:03X}/f{} {},{}-{},{} bias {} into {:08X}{} "
+                  "(previous life {}): producer {}", presented_, source.edram_base, uint32_t(source.edram_format),
+                  x0, y0, x1, y1, exp_bias, address, full_cover ? " full cover" : " partial", was ? "ended" : "none",
+                  kProducer[producer]);
+    }
+  }
+
+  void ReportBiasLife() {
+    const auto& c = bias_life_.Counts();
+    REXLOG_INFO("[native] bias life, 10 s: {} bias resolves ({} cover the whole texture); producer: strict {}, "
+                "chain {}, blended {}, other {}, small {}, no start {}; lives ended: unread {}, hand-off {} ({} with "
+                "point reads only), copy (reader writes the source) {}, copy (read after the source changed) {}; "
+                "source content dead after the resolve {} / not {}; dual output and dead {}; round trips {}; reader draws {} "
+                "({} lives with an exponent-adjusted fetch); {} sources", c.resolves, c.full_cover,
+                c.producer[me::native::kBiasProducerStrict], c.producer[me::native::kBiasProducerChain],
+                c.producer[me::native::kBiasProducerBlended], c.producer[me::native::kBiasProducerOther],
+                c.producer[me::native::kBiasProducerSmall], c.producer[me::native::kBiasProducerNoStart],
+                c.end[me::native::kBiasEndUnread], c.end[me::native::kBiasEndHandOff], c.hand_off_point,
+                c.end[me::native::kBiasEndCopyWriter], c.end[me::native::kBiasEndCopyChanged], c.dead, c.not_dead,
+                c.dual_and_dead, c.round_trip, c.reads, c.reads_exp_adjust, bias_life_sources_.size());
+    std::vector<std::pair<uint64_t, std::array<uint64_t, me::native::kBiasProducerCount>>> sites(
+        bias_life_.ProducerSites().begin(), bias_life_.ProducerSites().end());
+    const auto total = [](const auto& a) { uint64_t n = 0; for (uint64_t v : a) n += v; return n; };
+    std::sort(sites.begin(), sites.end(), [&](const auto& a, const auto& b) { return total(a.second) > total(b.second); });
+    std::string producers;
+    for (size_t i = 0; i < sites.size() && i < 10; ++i) {
+      const auto& a = sites[i].second;
+      producers += fmt::format(" VS{}/PS{}=[{} {} {} {} {} {}]", sites[i].first >> 32, sites[i].first & 0xFFFFFFFFu,
+                               a[0], a[1], a[2], a[3], a[4], a[5]);
+    }
+    std::vector<std::pair<uint32_t, std::array<uint64_t, me::native::kBiasEndCount>>> readers(
+        bias_life_.ReaderShaders().begin(), bias_life_.ReaderShaders().end());
+    std::sort(readers.begin(), readers.end(), [&](const auto& a, const auto& b) { return total(a.second) > total(b.second); });
+    std::string reader_list;
+    for (size_t i = 0; i < readers.size() && i < 16; ++i) {
+      const auto& a = readers[i].second;
+      reader_list += fmt::format(" PS{}=[{} {} {}]", readers[i].first, a[1], a[2], a[3]);
+    }
+    REXLOG_INFO("[native] bias life producers (chain start or last writer) [strict chain blended other small "
+                "nostart]:{}", producers.empty() ? " none" : producers);
+    REXLOG_INFO("[native] bias life readers [hand-off copy-writer copy-changed]:{}",
+                reader_list.empty() ? " none" : reader_list);
+    bias_life_.ClearCounts();
+  }
+
+  /*
+   * masseffect_native_bias_life_probe, once (me_half_rop_test.h): how the colour output stage converts float32
+   * fragment outputs into an RGBA16F attachment. Known float32 patterns go into an RGBA32F image; the exponent-bias
+   * resolve pass itself (ResolverWithBiasFrag: texelFetch * 2^bias through an RGBA16F attachment) runs with bias 0
+   * and -3; both targets are read back after the slot's fence and compared with candidate conversion models
+   * (CompleteA -> EvaluateHalfRopTest). The test images are small (64x80) and kept: the fragment-conversion
+   * framebuffer cache is keyed by their handles.
+   */
+  struct HalfRopTest {
+    int32_t state = 0;  // 0 not run, 1 recorded (waiting for its slot's fence), 2 finished or not possible
+    uint32_t slot = 0;
+    Image source;
+    std::array<Image, 2> targets;
+    VkBuffer upload = VK_NULL_HANDLE, readback = VK_NULL_HANDLE;
+    VkDeviceMemory upload_memory = VK_NULL_HANDLE, readback_memory = VK_NULL_HANDLE;
+    const uint8_t* readback_data = nullptr;
+    bool readback_coherent = true;
+    std::vector<uint32_t> inputs;
+  };
+  HalfRopTest half_rop_test_;
+
+  void FreeHalfRopBuffers() {
+    HalfRopTest& t = half_rop_test_;
+    for (auto [buffer, memory, mapped] : {std::tuple{&t.upload, &t.upload_memory, false},
+                                          std::tuple{&t.readback, &t.readback_memory, t.readback_data != nullptr}}) {
+      if (*memory != VK_NULL_HANDLE) {
+        if (mapped) dfn_.vkUnmapMemory(device_, *memory);
+        dfn_.vkFreeMemory(device_, *memory, nullptr);
+        *memory = VK_NULL_HANDLE;
+      }
+      if (*buffer != VK_NULL_HANDLE) {
+        dfn_.vkDestroyBuffer(device_, *buffer, nullptr);
+        *buffer = VK_NULL_HANDLE;
+      }
+    }
+    t.readback_data = nullptr;
+  }
+
+  void RecordHalfRopTest() {
+    HalfRopTest& t = half_rop_test_;
+    if (t.state != 0 || !Record()) return;
+    t.state = 2;  // any failure below is final
+    const auto fail = [&](const char* why) {
+      FreeHalfRopBuffers();
+      REXLOG_WARN("[native] bias life ROP test not run: {}", why);
+    };
+    constexpr uint32_t w = me::native::kHalfRopTestWidth, h = me::native::kHalfRopTestHeight;
+    t.inputs = me::native::HalfRopTestInputs();
+    const VkImageUsageFlags target_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!Create(t.source, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                VK_FORMAT_R32G32B32A32_SFLOAT) ||
+        !Create(t.targets[0], w, h, target_usage, VK_FORMAT_R16G16B16A16_SFLOAT) ||
+        !Create(t.targets[1], w, h, target_usage, VK_FORMAT_R16G16B16A16_SFLOAT))
+      return fail("image creation failed");
+    Prepare(t.source);
+    Prepare(t.targets[0]);
+    Prepare(t.targets[1]);
+    if (!t.source.prepared || !t.targets[0].prepared || !t.targets[1].prepared) return fail("image preparation");
+    const VkDeviceSize in_bytes = VkDeviceSize(t.inputs.size()) * 4;
+    const VkDeviceSize out_bytes = VkDeviceSize(w) * h * 8;
+    uint32_t type = 0;
+    void* mapped = nullptr;
+    if (!rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device_, in_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, rex::ui::vulkan::util::MemoryPurpose::kUpload,
+            t.upload, t.upload_memory, &type) ||
+        dfn_.vkMapMemory(device_, t.upload_memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+      return fail("upload buffer");
+    std::memcpy(mapped, t.inputs.data(), size_t(in_bytes));
+    if (!((vulkan_device_->memory_types().host_coherent >> type) & 0x1)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = t.upload_memory;
+      range.size = VK_WHOLE_SIZE;
+      dfn_.vkFlushMappedMemoryRanges(device_, 1, &range);
+    }
+    dfn_.vkUnmapMemory(device_, t.upload_memory);
+    mapped = nullptr;
+    if (!rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device_, out_bytes * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            rex::ui::vulkan::util::MemoryPurpose::kReadback, t.readback, t.readback_memory, &type) ||
+        dfn_.vkMapMemory(device_, t.readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+      return fail("read-back buffer");
+    t.readback_data = static_cast<const uint8_t*>(mapped);
+    t.readback_coherent = (vulkan_device_->memory_types().host_coherent >> type) & 0x1;
+    if (draws_) draws_->FinishPass();
+    if (!Record()) return fail("recording");
+    const auto barrier = [&](VkPipelineStageFlags from, VkAccessFlags from_access, VkPipelineStageFlags to,
+                             VkAccessFlags to_access) {
+      VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      b.srcAccessMask = from_access;
+      b.dstAccessMask = to_access;
+      dfn_.vkCmdPipelineBarrier(commands_work_, from, to, 0, 1, &b, 0, nullptr, 0, nullptr);
+    };
+    barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {w, h, 1};
+    dfn_.vkCmdCopyBufferToImage(commands_work_, t.upload, t.source.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT);
+    if (!ResolverWithBiasFrag(t.source, t.targets[0], 0, 0, 0, 0, w, h, 0) ||
+        !ResolverWithBiasFrag(t.source, t.targets[1], 0, 0, 0, 0, w, h, -3) || !Record())
+      return fail("the fragment resolve pass is not available");
+    barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (uint32_t i = 0; i < 2; ++i) {
+      VkBufferImageCopy back{};
+      back.bufferOffset = out_bytes * i;
+      back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      back.imageExtent = {w, h, 1};
+      dfn_.vkCmdCopyImageToBuffer(commands_work_, t.targets[i].image, VK_IMAGE_LAYOUT_GENERAL, t.readback, 1, &back);
+    }
+    barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_HOST_READ_BIT);
+    if (draws_) draws_->NotifyGraphicsExternalState();
+    t.slot = slot_;  // the pass may have rotated the slot: the read-back is in the current one
+    t.state = 1;
+    REXLOG_INFO("[native] bias life ROP test recorded ({} float32 values, bias 0 and -3)", t.inputs.size());
+  }
+
+  void EvaluateHalfRopTest() {
+    HalfRopTest& t = half_rop_test_;
+    t.state = 2;
+    if (!t.readback_data) return FreeHalfRopBuffers();
+    if (!t.readback_coherent) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = t.readback_memory;
+      range.size = VK_WHOLE_SIZE;
+      dfn_.vkInvalidateMappedMemoryRanges(device_, 1, &range);
+    }
+    static const char* kModel[me::native::kHalfModelCount] = {"RNE+denormals", "RNE+flush", "RTZ+denormals",
+                                                              "RTZ+flush", "RNE+saturate"};
+    const size_t n = t.inputs.size();
+    std::vector<uint16_t> halves(n);
+    for (int pass = 0; pass < 2; ++pass) {
+      std::memcpy(halves.data(), t.readback_data + size_t(pass) * n * 2, n * 2);
+      const int bias = pass ? -3 : 0;
+      const auto v = me::native::HalfRopEvaluate(t.inputs, halves.data(), bias);
+      std::string models, examples;
+      for (uint32_t m = 0; m < me::native::kHalfModelCount; ++m)
+        models += fmt::format(" {} {};", kModel[m], v.mismatches[m]);
+      for (const auto& e : v.examples)
+        examples += fmt::format(" {:08X}->{:04X}(gpu {:04X})", e[0], e[1], e[2]);
+      REXLOG_INFO("[native] bias life ROP test, float32 x 2^{} -> RGBA16F attachment: {} values compared ({} "
+                  "skipped), mismatches per model:{} best {}{}{}", bias, v.compared, v.skipped, models,
+                  kModel[v.best], examples.empty() ? "" : "; first mismatches of the best:", examples);
+    }
+    FreeHalfRopBuffers();
+  }
+
+  me::native::BiasLifeProbe bias_life_;
+  std::vector<Image*> bias_life_sources_;  // images bias resolves read (targets_ never erases: stable pointers)
+  std::vector<uint64_t> bias_life_before_;
+  me::native::BiasLifeDraw bias_life_draw_;
+  uint64_t bias_life_dump_until_ = 0;
+  uint32_t bias_life_dump_lines_ = 0;
+
+  /*
+   * masseffect_native_resolve_repeat (docs/vulkan-frame-time.md section 11, me_resolve_repeat.h).
+   * Source identity of a resolve: for every EDRAM tile of the area (the whole tile rectangle, conservative), its
+   * physical index, owner, owner image handle, owner tile, version and the owner's write count. For a depth
+   * resolve (depth_plane) the version and the write count leave out stencil-only changes. Empty = not hookable.
+   */
+  std::vector<uint64_t> SignatureRepeatEDRAM4(const Image& view, const VkRect2D& area, bool depth_plane) {
+    std::vector<uint64_t> signature;
+    RangeTiles4 range;
+    if (view.raster_grid_x || view.guest_width || view.guest_height || view.invalid_content ||
+        !RangeTilesEDRAM4(view, area, range))
+      return signature;
+    const uint32_t rows = (view.height + (16u >> view.edram_msaa_y) - 1) / (16u >> view.edram_msaa_y);
+    const uint32_t tiles = std::min(range.pitch * rows, 2048u);
+    signature.reserve(size_t(range.tx1 - range.tx0) * (range.ty1 - range.ty0) * 6 + 2);
+    for (uint32_t ty = range.ty0; ty < range.ty1; ++ty)
+      for (uint32_t tile = ty * range.pitch + range.tx0; tile < ty * range.pitch + range.tx1; ++tile) {
+        if (tile >= tiles) return {};
+        const uint32_t physical = (view.edram_base + tile) & 2047u;
+        const OwnerTileEDRAM o = owners_tiles_edram4_[physical];
+        if (!o.image) return {};  // never written: nothing to compare
+        uint64_t writes = o.image->edram4_writes;
+        uint64_t version = o.version;
+        if (depth_plane) {
+          if (const auto w = edram4_stencil_only_writes_.find(o.image); w != edram4_stencil_only_writes_.end())
+            writes -= w->second;
+          version = edram4_depth_versions_.Depth(physical, o.version);
+        }
+        signature.push_back(physical);
+        signature.push_back(uint64_t(reinterpret_cast<uintptr_t>(o.image)));
+        signature.push_back(uint64_t(o.image->image));
+        signature.push_back(o.tile_local);
+        signature.push_back(version);
+        signature.push_back(writes);
+      }
+    uint64_t view_writes = view.edram4_writes;
+    if (depth_plane)
+      if (const auto w = edram4_stencil_only_writes_.find(&view); w != edram4_stencil_only_writes_.end())
+        view_writes -= w->second;
+    signature.push_back(uint64_t(view.image));
+    signature.push_back(view_writes);
+    return signature;
+  }
+
+  // Before recording a hooked resolve into `resolved` at `base`: true = skip it (mode 2 and an identical earlier
+  // resolve). Counts per kind (1 bias, 2 7e3 -> UNORM10, 3 depth guestspace, 4 depth copy).
+  bool RepeatResolveEDRAM4(uint32_t kind, uint32_t base, const Resolved& resolved, const Image& source,
+                           const VkRect2D& area, const me::native::ResolveRepeatKey& key) {
+    resolve_repeat_pending_ = {};
+    const int32_t mode = REXCVAR_GET(masseffect_native_resolve_repeat);
+    if (mode <= 0 || REXCVAR_GET(masseffect_native_edram_alias_mode) != 4) {
+      if (resolve_repeat_.Textures()) resolve_repeat_.Clear();
+      return false;
+    }
+    ++resolve_repeat_counts_[kind & 7][0];
+    std::vector<uint64_t> signature = SignatureRepeatEDRAM4(source, area, kind >= 3);
+    if (signature.empty()) {
+      ++resolve_repeat_counts_[kind & 7][3];
+      return false;
+    }
+    const uint64_t destination = uint64_t(resolved.image.image);
+    // A texture just woken from the pool has a new revision, so it never matches; checked anyway.
+    if (resolved_clear_owed_ == VK_NULL_HANDLE &&
+        resolve_repeat_.Repeats(base, key, signature, destination, resolved.revision, edram4_version_)) {
+      ++resolve_repeat_counts_[kind & 7][1];
+      if (mode >= 2) {
+        ++resolve_repeat_counts_[kind & 7][2];
+        if (++resolve_repeat_logged_ <= 8)
+          REXLOG_INFO("[native] resolve repeat: kind {} into {:08X} {}x{} skipped (identical source tiles, texture "
+                      "unchanged since the same resolve)", kind, base, area.extent.width, area.extent.height);
+        return true;
+      }
+    }
+    resolve_repeat_pending_.active = true;
+    resolve_repeat_pending_.base = base;
+    resolve_repeat_pending_.revision_before = resolved.revision;
+    resolve_repeat_pending_.record.key = key;
+    resolve_repeat_pending_.record.signature = std::move(signature);
+    resolve_repeat_pending_.record.destination = destination;
+    resolve_repeat_pending_.record.version_floor = edram4_version_;
+    return false;
+  }
+
+  // After the hooked resolve was recorded and ResolvedWritten bumped the texture's revision.
+  void RepeatWrittenEDRAM4(uint32_t base, uint32_t dx, uint32_t dy, uint32_t width, uint32_t height) {
+    if (!resolve_repeat_pending_.active || resolve_repeat_pending_.base != base) {
+      resolve_repeat_pending_ = {};
+      resolve_repeat_.Forget(base);
+      return;
+    }
+    const auto it = resolved_.find(base);
+    if (it == resolved_.end() || uint64_t(it->second.image.image) != resolve_repeat_pending_.record.destination) {
+      resolve_repeat_pending_ = {};
+      resolve_repeat_.Forget(base);
+      return;
+    }
+    resolve_repeat_pending_.record.rect = {dx, dy, width, height};
+    resolve_repeat_pending_.record.revision = it->second.revision;
+    resolve_repeat_.Written(base, std::move(resolve_repeat_pending_.record), resolve_repeat_pending_.revision_before);
+    resolve_repeat_pending_ = {};
+  }
+
+  struct PendingRepeat {
+    bool active = false;
+    uint32_t base = 0;
+    uint64_t revision_before = 0;
+    me::native::ResolveRepeatRecord record;
+  };
+  me::native::ResolveRepeatCache resolve_repeat_;
+  me::native::StencilOnlyVersions edram4_depth_versions_;
+  std::unordered_map<const Image*, uint64_t> edram4_stencil_only_writes_;
+  PendingRepeat resolve_repeat_pending_;
+  // [kind][0 hooked, 1 identical, 2 skipped, 3 not comparable]
+  std::array<std::array<uint64_t, 4>, 8> resolve_repeat_counts_{};
+  uint64_t resolve_repeat_logged_ = 0;
+  ProbeResolve probe_previous_;
+  std::array<uint64_t, 4> probe_resolves_{}, probe_repeats_{};
+  uint64_t probe_pairs_ = 0;
+
+  // masseffect_native_resolve_7e3_frag: the 7e3 -> UNORM10 resolve as a fragment pass
+  // (me_resolve_7e3_to_unorm10_frag.frag): the compute shader's word math, written through the A2B10G10R10 texture
+  // as a color attachment instead of a storage image (SUST is slow on Maxwell; the exponent-bias resolve gained
+  // about 1 ms from the same change). The render pass dependencies replace the compute path's two barriers.
+  // false = not possible here (the compute version runs).
+  bool ResolverDirect7e3Frag(Image& owner, Image& target, int32_t sx, int32_t sy, uint32_t dx, uint32_t dy,
+                             uint32_t width, uint32_t height) {
+    if (!me::native::IsSingleSample(uint32_t(target.sample_count)) ||
+        !me::native::IsSingleSample(uint32_t(owner.sample_count)) ||
+        dx + width > target.width || dy + height > target.height ||
+        uint32_t(sx) + width > owner.width || uint32_t(sy) + height > owner.height || sx < 0 || sy < 0)
+      return false;
+    // masseffect_native_resolve_7e3_pack: 3 = original, 4 = cheaper pack, 5 = cheaper pack + word output.
+    const int32_t pack = REXCVAR_GET(masseffect_native_resolve_7e3_pack);
+    uint32_t variant = pack >= 1 ? 4u : 3u;
+    VkImageView attachment = target.view;
+    PassConversionColorFrag* pass = nullptr;
+    if (pack >= 2) {
+      if (const VkImageView word = GetViewWord7e3(target)) {
+        if ((pass = EnsureConversionColorFrag(VK_FORMAT_R32_UINT, 5))) {
+          variant = 5;
+          attachment = word;
+          ++resolves_7e3_word_;
+        }
+      }
+    }
+    if (!pass) pass = EnsureConversionColorFrag(VK_FORMAT_A2B10G10R10_UNORM_PACK32, variant);
+    if (!pass && variant == 4) pass = EnsureConversionColorFrag(VK_FORMAT_A2B10G10R10_UNORM_PACK32, variant = 3);
+    if (!pass) return false;
+    auto [framebuffer, new_value] = framebuffers_conv_color_frag_.try_emplace({target.image, variant}, VK_NULL_HANDLE);
+    if (new_value) {
+      VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+      info.renderPass = pass->render_pass;
+      info.attachmentCount = 1;
+      info.pAttachments = &attachment;
+      info.width = target.width;
+      info.height = target.height;
+      info.layers = 1;
+      if (dfn_.vkCreateFramebuffer(device_, &info, nullptr, &framebuffer->second) != VK_SUCCESS) {
+        framebuffers_conv_color_frag_.erase(framebuffer);
+        return false;
+      }
+    }
+    const VkFramebuffer framebuffer_7e3 = framebuffer->second;
+    if (!EnsureCapacityConversionEDRAM4("resolve from 7e3 (fragment)")) return false;
+    SlotWork& slot = slots_[slot_];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo reserve{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    reserve.descriptorPool = slot.pool_conv_color_frag;
+    reserve.descriptorSetCount = 1;
+    reserve.pSetLayouts = &layout_conv_color_frag_;
+    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    ++slot.conversions_edram;
+    VkDescriptorImageInfo sampled{sampler_depth_edram_, owner.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &sampled;
+    dfn_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    const struct {
+      int32_t source_offset[2];
+      int32_t destination_offset[2];
+      int32_t unused;
+    } constants = {{sx, sy}, {int32_t(dx), int32_t(dy)}, 0};
+    if (draws_) draws_->FinishPass();
+    if (edram4_batch_.active) {
+      CloseComputeBatchEDRAM4();
+      if (!CloseImportBatchEDRAM4()) return false;
+    }
+    LabelMarkGpu((44u << 16) | 0u);  // report label: resolve from the 7e3 owner (fragment)
+    const VkRect2D area{{int32_t(dx), int32_t(dy)}, {width, height}};
+    VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    begin.renderPass = pass->render_pass;
+    begin.framebuffer = framebuffer_7e3;
+    begin.renderArea = area;
+    dfn_.vkCmdBeginRenderPass(commands_work_, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    const VkViewport viewport{float(dx), float(dy), float(width), float(height), 0, 1};
+    dfn_.vkCmdSetViewport(commands_work_, 0, 1, &viewport);
+    dfn_.vkCmdSetScissor(commands_work_, 0, 1, &area);
+    dfn_.vkCmdBindPipeline(commands_work_, VK_PIPELINE_BIND_POINT_GRAPHICS, pass->pipeline);
+    dfn_.vkCmdBindDescriptorSets(commands_work_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_conv_color_frag_, 0,
+                                 1, &set, 0, nullptr);
+    dfn_.vkCmdPushConstants(commands_work_, layout_pipeline_conv_color_frag_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                            sizeof(constants), &constants);
+    dfn_.vkCmdDraw(commands_work_, 3, 1, 0, 0);
+    dfn_.vkCmdEndRenderPass(commands_work_);
+    if (draws_) draws_->NotifyGraphicsExternalState();
+    if (++resolves_7e3_frag_ <= 4)
+      REXLOG_INFO("[native] resolve from the 7e3 owner as a fragment pass: {}x{} at {},{} -> {},{} ({} so far, "
+                  "variant {}, {} with the word output)", width, height, sx, sy, dx, dy, resolves_7e3_frag_, variant,
+                  resolves_7e3_word_);
     ++resolves_direct_7e3_;
     return true;
   }
@@ -5392,6 +7295,92 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     dfn_.vkCmdEndRenderPass(commands_work_);
     if (draws_) draws_->NotifyGraphicsExternalState();
     ++resolves_bias_frag_;
+    return true;
+  }
+
+  // masseffect_native_velocity_16_16: resolve of a k_16_16 render target whose host R16G16_UNORM image holds the
+  // Xenos EDRAM word (me_fixed16_spirv.h). The Xenos does not copy the word: it unpacks the -32...32 fixed-point
+  // value, applies RB_COPY_DEST_INFO.copy_dest_exp_bias and packs it by copy_dest_number into the destination
+  // (me_resolve_fixed16_frag.frag). `number` > 0 needs an R16G16_UNORM destination (exact 16-bit pattern); number
+  // 0 also writes other normalized destinations. false = not possible here; nothing was recorded.
+  bool ResolverFixed16Frag(Image& source, Image& target, int32_t sx, int32_t sy, uint32_t dx, uint32_t dy,
+                           uint32_t width, uint32_t height, int32_t exp_bias, uint32_t number) {
+    const bool pack16 = target.format == VK_FORMAT_R16G16_UNORM;
+    const bool normalized = pack16 || target.format == VK_FORMAT_R8G8B8A8_UNORM ||
+                            target.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (source.format != VK_FORMAT_R16G16_UNORM || !normalized || (!pack16 && number != 0) || number > 3 ||
+        source.image == target.image || !width || !height ||
+        !me::native::IsSingleSample(uint32_t(source.sample_count)) ||
+        !me::native::IsSingleSample(uint32_t(target.sample_count)) ||
+        dx + width > target.width || dy + height > target.height) return false;
+    PassConversionColorFrag* pass = EnsureConversionColorFrag(target.format, 6);
+    if (!pass) return false;
+    auto [framebuffer, new_value] = framebuffers_conv_color_frag_.try_emplace({target.image, 6u}, VK_NULL_HANDLE);
+    if (new_value) {
+      VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+      info.renderPass = pass->render_pass;
+      info.attachmentCount = 1;
+      info.pAttachments = &target.view;
+      info.width = target.width;
+      info.height = target.height;
+      info.layers = 1;
+      if (dfn_.vkCreateFramebuffer(device_, &info, nullptr, &framebuffer->second) != VK_SUCCESS) {
+        framebuffers_conv_color_frag_.erase(framebuffer);
+        return false;
+      }
+    }
+    const VkFramebuffer framebuffer_fixed16 = framebuffer->second;
+    if (!EnsureCapacityConversionEDRAM4("resolve k_16_16")) return false;
+    SlotWork& slot = slots_[slot_];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo reserve{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    reserve.descriptorPool = slot.pool_conv_color_frag;
+    reserve.descriptorSetCount = 1;
+    reserve.pSetLayouts = &layout_conv_color_frag_;
+    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    ++slot.conversions_edram;
+    VkDescriptorImageInfo sampled{sampler_depth_edram_, source.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &sampled;
+    dfn_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    const struct {
+      int32_t source_offset[2];
+      int32_t destination_offset[2];
+      int32_t exponent_bias;
+      uint32_t number;
+      uint32_t pack16;
+    } constants = {{sx, sy}, {int32_t(dx), int32_t(dy)}, exp_bias, number, pack16 ? 1u : 0u};
+    if (draws_) draws_->FinishPass();
+    if (edram4_batch_.active) {
+      CloseComputeBatchEDRAM4();
+      if (!CloseImportBatchEDRAM4()) return false;
+    }
+    LabelMarkGpu((45u << 16) | 0u);  // report label: k_16_16 resolve (fragment)
+    const VkRect2D area{{int32_t(dx), int32_t(dy)}, {width, height}};
+    VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    begin.renderPass = pass->render_pass;
+    begin.framebuffer = framebuffer_fixed16;
+    begin.renderArea = area;
+    dfn_.vkCmdBeginRenderPass(commands_work_, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    const VkViewport viewport{float(dx), float(dy), float(width), float(height), 0, 1};
+    dfn_.vkCmdSetViewport(commands_work_, 0, 1, &viewport);
+    dfn_.vkCmdSetScissor(commands_work_, 0, 1, &area);
+    dfn_.vkCmdBindPipeline(commands_work_, VK_PIPELINE_BIND_POINT_GRAPHICS, pass->pipeline);
+    dfn_.vkCmdBindDescriptorSets(commands_work_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_conv_color_frag_, 0,
+                                 1, &set, 0, nullptr);
+    dfn_.vkCmdPushConstants(commands_work_, layout_pipeline_conv_color_frag_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                            sizeof(constants), &constants);
+    dfn_.vkCmdDraw(commands_work_, 3, 1, 0, 0);
+    dfn_.vkCmdEndRenderPass(commands_work_);
+    if (draws_) draws_->NotifyGraphicsExternalState();
+    if (++resolves_fixed16_ <= 4)
+      REXLOG_INFO("[native] k_16_16 resolve (fixed point -32...32 decoded): {}x{} at {},{} -> {},{} target host "
+                  "format {}, exp bias {}, number {} ({} so far)", width, height, sx, sy, dx, dy,
+                  uint32_t(target.format), exp_bias, number, resolves_fixed16_);
     return true;
   }
 
@@ -5873,6 +7862,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   // tile-row run so tiles outside the range keep their stencil. Depth is untouched.
   bool CopyStencilEDRAM4(Image& source, Image& target, uint32_t source_start, uint32_t target_start,
                            uint32_t count, const VkRect2D& rect) {
+    WrittenStencilEDRAM4(target);  // masseffect_native_edram4_stencil_known
     const bool msaa2 = source.sample_count == VK_SAMPLE_COUNT_2_BIT;
     const bool color = !source.edram_depth;
     ViewsDepthEDRAM* views = color ? nullptr : GetViewsDepthEDRAM4(source);
@@ -5922,22 +7912,21 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     dfn_.vkCmdPipelineBarrier(commands_work_,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mid, 0, nullptr, 0, nullptr);
+    // One region per tile-row run; with masseffect_native_edram4_stencil_copy_rows consecutive whole rows are
+    // one region (me_stencil_copy_regions.h, tests/cpu/test_native_stencil_copy_regions.cpp).
     std::vector<VkBufferImageCopy> regions;
-    const uint32_t pitch = PitchTilesEDRAM(target);
-    for (uint32_t t = 0; t < count;) {
-      const uint32_t tile = target_start + t, row = tile / pitch, col = tile % pitch;
-      const uint32_t n = std::min(count - t, pitch - col);
-      const uint32_t x = col * 80u, y = row * 16u;
-      if (x >= target.width || y >= target.height) { t += n; continue; }
+    for (const auto& p : me::native::PlanStencilCopyRegions(
+             PitchTilesEDRAM(target), target.width, target.height, uint32_t(rect.offset.x),
+             uint32_t(rect.offset.y), rect.extent.width, target_start, count,
+             REXCVAR_GET(masseffect_native_edram4_stencil_copy_rows), &edram4_stencil_rows_merged_)) {
       VkBufferImageCopy r{};
-      r.bufferOffset = VkDeviceSize(y - uint32_t(rect.offset.y)) * rect.extent.width + (x - uint32_t(rect.offset.x));
+      r.bufferOffset = VkDeviceSize(p.buffer_offset);
       r.bufferRowLength = rect.extent.width;
       r.bufferImageHeight = rect.extent.height;
       r.imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
-      r.imageOffset = {int32_t(x), int32_t(y), 0};
-      r.imageExtent = {std::min(n * 80u, target.width - x), std::min(16u, target.height - y), 1};
+      r.imageOffset = {int32_t(p.x), int32_t(p.y), 0};
+      r.imageExtent = {p.width, p.height, 1};
       regions.push_back(r);
-      t += n;
     }
     dfn_.vkCmdCopyBufferToImage(commands_work_, slot.buffer_stencil_copy, target.image, VK_IMAGE_LAYOUT_GENERAL,
                                 uint32_t(regions.size()), regions.data());
@@ -5953,6 +7942,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
 
   bool ImportColorDepthEDRAM4(Image& source, Image& target,
                                  uint32_t source_start, uint32_t target_start, uint32_t count) {
+    WrittenStencilEDRAM4(target);  // masseffect_native_edram4_stencil_known
     const bool source_depth = source.edram_depth;
     const bool source_raw64 = source.edram_64bpp;
     const bool native_msaa_import = IsDepthNative2xEDRAM4(source) &&
@@ -6504,6 +8494,44 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         if (dfn_.vkCreateDescriptorPool(device_, &pool, nullptr, &slot.pool_conv_color_frag) != VK_SUCCESS)
           return fail();
     }
+    // Variant 3 (masseffect_native_resolve_7e3_frag) has its own module, created on first use; failing it
+    // leaves the other variants alone (the 7e3 resolve then stays on compute).
+    if (variant == 5 && !fs_7e3_word_frag_) {  // masseffect_native_resolve_7e3_pack = 2
+      if (fs_7e3_word_frag_failed_) return nullptr;
+      VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      module.codeSize = sizeof(shaders::me_resolve_7e3_word_fs);
+      module.pCode = shaders::me_resolve_7e3_word_fs;
+      if (dfn_.vkCreateShaderModule(device_, &module, nullptr, &fs_7e3_word_frag_) != VK_SUCCESS) {
+        fs_7e3_word_frag_ = VK_NULL_HANDLE;
+        fs_7e3_word_frag_failed_ = true;
+        REXLOG_WARN("[native] resolve from the 7e3 owner: word fragment shader unavailable");
+        return nullptr;
+      }
+    }
+    if (variant == 6 && !fs_fixed16_frag_) {  // masseffect_native_velocity_16_16
+      if (fs_fixed16_frag_failed_) return nullptr;
+      VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      module.codeSize = sizeof(shaders::me_resolve_fixed16_fs);
+      module.pCode = shaders::me_resolve_fixed16_fs;
+      if (dfn_.vkCreateShaderModule(device_, &module, nullptr, &fs_fixed16_frag_) != VK_SUCCESS) {
+        fs_fixed16_frag_ = VK_NULL_HANDLE;
+        fs_fixed16_frag_failed_ = true;
+        REXLOG_WARN("[native] k_16_16 resolve: fragment shader unavailable (raw copy kept)");
+        return nullptr;
+      }
+    }
+    if ((variant == 3 || variant == 4) && !fs_7e3_frag_) {
+      if (fs_7e3_frag_failed_) return nullptr;
+      VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      module.codeSize = sizeof(shaders::me_resolve_7e3_to_unorm10_fs);
+      module.pCode = shaders::me_resolve_7e3_to_unorm10_fs;
+      if (dfn_.vkCreateShaderModule(device_, &module, nullptr, &fs_7e3_frag_) != VK_SUCCESS) {
+        fs_7e3_frag_ = VK_NULL_HANDLE;
+        fs_7e3_frag_failed_ = true;
+        REXLOG_WARN("[native] resolve from the 7e3 owner: fragment shader unavailable, compute path");
+        return nullptr;
+      }
+    }
     auto [it, new_value] = passes_conv_color_frag_.try_emplace(uint64_t(uint32_t(format)) | (uint64_t(variant) << 32));
     PassConversionColorFrag& pass = it->second;
     if (!new_value) return pass.render_pass && pass.pipeline ? &pass : nullptr;
@@ -6547,15 +8575,24 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     render_pass.pSubpasses = &subpass;
     render_pass.dependencyCount = 2;
     render_pass.pDependencies = dependencies;
-    if (dfn_.vkCreateRenderPass(device_, &render_pass, nullptr, &pass.render_pass) != VK_SUCCESS) return fail();
+    // A variant-3 failure keeps the pass entry empty (nullptr from now on) without disabling the others.
+    if (dfn_.vkCreateRenderPass(device_, &render_pass, nullptr, &pass.render_pass) != VK_SUCCESS)
+      return variant >= 3 ? nullptr : fail();
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
     stages[0].module = vs_conv_color_frag_;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = variant == 2 ? fs_bias_frag_ : variant ? fs_conv_r64_frag_ : fs_conv_color_frag_;
+    stages[1].module = variant == 6 ? fs_fixed16_frag_ : variant == 5 ? fs_7e3_word_frag_
+                     : (variant == 3 || variant == 4) ? fs_7e3_frag_
+                     : variant == 2 ? fs_bias_frag_ : variant ? fs_conv_r64_frag_ : fs_conv_color_frag_;
     stages[1].pName = "main";
+    // Variant 4: constant 0 (kPackFast) of me_resolve_7e3_to_unorm10_frag.frag (masseffect_native_resolve_7e3_pack).
+    const VkSpecializationMapEntry pack_entry{0, 0, sizeof(VkBool32)};
+    const VkBool32 pack_fast = VK_TRUE;
+    const VkSpecializationInfo pack_special{1, &pack_entry, sizeof(pack_fast), &pack_fast};
+    if (variant == 4) stages[1].pSpecializationInfo = &pack_special;
     VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -6592,7 +8629,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     pipeline.layout = layout_pipeline_conv_color_frag_;
     pipeline.renderPass = pass.render_pass;
     if (dfn_.vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pass.pipeline) != VK_SUCCESS)
-      return fail();
+      return variant >= 3 ? nullptr : fail();
     return &pass;
   }
 
@@ -6759,6 +8796,30 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       pipeline = 12;  // 7e3/UNORM10 (host RGBA16F) -> k_16_16
     } else {
       return false;
+    }
+    // masseffect_diag_velocity bit 16 (diagnostic, off by default): a k_8_8_8_8 -> k_16_16 conversion (the old
+    // content under the velocity buffer) clears the whole k_16_16 image to 0 instead of moving the words. Every
+    // pixel the velocity draws do not cover then reads "no dynamic velocity" in the motion blur. Other tiles of
+    // that image are wiped too; diagnostic only.
+    if (pipeline == 10u && (REXCVAR_GET(masseffect_diag_velocity) & 16)) {
+      if (draws_) draws_->FinishPass();
+      if (edram4_batch_.active) {
+        CloseComputeBatchEDRAM4();
+        if (!CloseImportBatchEDRAM4()) return false;
+      }
+      BarrierBeforeCopyResolve();
+      const VkClearColorValue zero{};
+      const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      dfn_.vkCmdClearColorImage(commands_work_, target.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+      BarrierAfterCopyResolve();
+      if (draws_) draws_->NotifyGraphicsExternalState();
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_INFO("[native] velocity diag: k_8_8_8_8 -> k_16_16 conversions replaced by a clear to 0 "
+                    "(masseffect_diag_velocity bit 16)");
+      }
+      return true;
     }
     // masseffect_native_conversion_copy_32: k_16_16 <-> k_8_8_8_8 is the same 32-bit EDRAM word in both views. With
     // the same tile layout the texels are the same texels, so a plain image copy (both formats are in the 32-bit
@@ -7131,10 +9192,12 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     resolved_pool_report_ = now;
     REXLOG_INFO("[native] resolved allocation pool enabled={}: allocations={}, reuse={}, "
                 "retirements={}, evictions={}, eviction waits={}, ineligible={}, busy={}, "
-                "dormant={} / {} bytes", REXCVAR_GET(masseffect_native_reuse_alloc_resolved),
+                "dormant={} / {} bytes; wake clears skipped (full-cover resolve)={}, recorded late (no write)={}",
+                REXCVAR_GET(masseffect_native_reuse_alloc_resolved),
                 resolved_pool_allocations_, resolved_pool_hits_, resolved_pool_retirements_,
                 resolved_pool_evictions_, resolved_pool_waits_, resolved_pool_ineligible_,
-                resolved_pool_busy_, resolved_sleeping_.size(), resolved_sleeping_bytes_);
+                resolved_pool_busy_, resolved_sleeping_.size(), resolved_sleeping_bytes_,
+                resolved_wake_clears_skipped_, resolved_wake_clears_late_);
   }
 
   bool CanSleepResolved(const Image& image) {
@@ -7217,6 +9280,40 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     return true;
   }
 
+  // The whole-image zero clear of a texture woken from the pool, ordered inside WORK like a new zero image.
+  void ClearWokenResolved(VkImage vk_image) {
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = vk_image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const VkCommandBuffer cmd = slots_[slot_].work;
+    dfn_.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    const VkClearColorValue zero{};
+    dfn_.vkCmdClearColorImage(cmd, vk_image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1,
+                             &barrier.subresourceRange);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    dfn_.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+  }
+
+  // End of a CopyInternal: a skipped wake clear stands only if a resolve write was recorded (copies_ grew).
+  void SettleWokenClearResolved(uint64_t copies_before) {
+    if (resolved_clear_owed_ == VK_NULL_HANDLE) return;
+    const VkImage owed = resolved_clear_owed_;
+    resolved_clear_owed_ = VK_NULL_HANDLE;
+    if (copies_ != copies_before) return;
+    ++resolved_wake_clears_late_;
+    if (draws_) draws_->FinishPass();
+    if (!Record()) return;
+    ClearWokenResolved(owed);
+  }
+
   bool WakeResolved(uint32_t base, uint32_t width, uint32_t height, VkFormat format,
                         Image& image) {
     if (resolved_pool_device_error_ || !REXCVAR_GET(masseffect_native_reuse_alloc_resolved) ||
@@ -7243,24 +9340,17 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       image.prepared = true;
       resolved_sleeping_bytes_ -= resolved_sleeping_[i].bytes;
       resolved_sleeping_.erase(resolved_sleeping_.begin() + i);
-      VkImageMemoryBarrier barrier{};
-      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-      barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-      barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-      barrier.oldLayout = barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.image = image.image;
-      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-      const VkCommandBuffer cmd = slots_[slot_].work;
-      dfn_.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-      const VkClearColorValue zero{};
-      dfn_.vkCmdClearColorImage(cmd, image.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1,
-                               &barrier.subresourceRange);
-      barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-      barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-      dfn_.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+      // masseffect_native_resolved_wake_no_clear: the resolve that asked for this texture writes every texel,
+      // so the zeros would all be overwritten. The pool only wakes an image whose last use is in a submission
+      // that has completed (ResolvedSleepingFinished), so no older GPU access needs ordering either.
+      // With masseffect_native_lazy_front a postponed front-buffer copy does not grow copies_, so the guard at the
+      // end of CopyInternal records the owed clear right away, before the deferred copy (exact either way).
+      if (resolved_wake_full_cover_ && REXCVAR_GET(masseffect_native_resolved_wake_no_clear)) {
+        resolved_clear_owed_ = image.image;
+        ++resolved_wake_clears_skipped_;
+      } else {
+        ClearWokenResolved(image.image);
+      }
       image.swap_rb = false;
       image.depth_float24_half = false;
       image.resolved_depth_guestspace = false;
@@ -7286,12 +9376,14 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
           me::native::IsSingleSample(uint32_t(it->second.image.sample_count))) {
         if (it->second.guest_format != format || it->second.swap_rb != swap_rb) {
           it->second.revision = ++revision_resolved_;
-          if (draws_) draws_->InvalidateTextures();  // changes the swizzle it is sampled with
+          if (draws_) draws_->InvalidateTexturesAt(base, DrawsVulkan::kInvalidationFormat);  // changes the swizzle it is sampled with
         }
         it->second.guest_format = format;
         it->second.swap_rb = swap_rb;
         it->second.image.swap_rb = swap_rb;
         it->second.image.resolved_guest_format = format;
+        it->second.footprint = ResolvedFootprint(base, width, height, format);  // masseffect_native_resolved_cpu_overwrite
+        NoteResolvedContent(base, it->second);
         ResolvedReportPool();
         return &it->second;
       }
@@ -7342,13 +9434,15 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     resolved.swap_rb = swap_rb;
     resolved.image.swap_rb = swap_rb;
     resolved.image.resolved_guest_format = format;
+    resolved.footprint = ResolvedFootprint(base, width, height, format);  // masseffect_native_resolved_cpu_overwrite
+    resolved.resolve_present = presented_;
     if (!reused) {
       ++resolved_pool_allocations_;
       REXLOG_INFO("[native] targets: resolved texture at {:08X}, {}x{}, format {}", base, width, height,
                   format);
     }
     if (draws_) {
-      draws_->InvalidateTextures();  // that address is now sampled from the resolved texture
+      draws_->InvalidateTexturesAt(base, DrawsVulkan::kInvalidationCreated);  // that address is now sampled from the resolved texture
     }
     ResolvedReportPool();
     return &resolved_.emplace(base, resolved).first->second;
@@ -7410,6 +9504,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       // Only what points to these two images: invalidating the whole cache here costs more than the copy
       // it saves (+0.18 ms of scene per frame when measured).
       draws_->InvalidateImages(target.image, resolved.image.image);
+      draws_->NoteResolvedAt(base);  // masseffect_native_texture_inval_by_address: the prepared flag moved too
     }
     return true;
   }
@@ -7558,6 +9653,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
    * pipeline drain. The whole target is copied: that is what the EDRAM held and what the resolve reads.
    */
   bool CopyOfLapForResolver(Image& target, Image& source) {
+    WrittenStencilEDRAM4(target);  // masseffect_native_edram4_stencil_known
     Prepare(source);
     Prepare(target);
     const bool mode4 = REXCVAR_GET(masseffect_native_edram_alias_mode) == 4;
@@ -7617,11 +9713,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   void ResolvedWritten(uint32_t base, uint64_t pixels = 0) {
     if (auto it = resolved_.find(base); it != resolved_.end()) {
       it->second.revision = ++revision_resolved_;
+      NoteResolvedContent(base, it->second);  // masseffect_native_resolved_cpu_overwrite
+      if (blur_journal_ > 0) BlurNoteWrite(base, it->second);  // masseffect_diag_blur_source
       // The direct image updates in place, but derived ROIs must go through PrepareTexture again,
       // including consecutive draws within one frame. Partial writes invalidate the complete ROI.
       for (const auto& crop : resolved_clips_) {
         if (crop.address == base) {
-          if (draws_) draws_->InvalidateTextures();
+          if (draws_) draws_->InvalidateTexturesAt(base, DrawsVulkan::kInvalidationCrop);
           break;
         }
       }
@@ -7632,6 +9730,121 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         c->second.pixels += pixels;
       }
     }
+  }
+
+  // --- masseffect_native_resolved_cpu_overwrite ---------------------------------------------------------------
+  bool ResolvedCpuOverwriteOn() {
+    if (resolved_overwrite_on_ < 0) {
+      resolved_overwrite_on_ = REXCVAR_GET(masseffect_native_resolved_cpu_overwrite) ? 1 : 0;
+      REXLOG_INFO("[native] resolved textures rewritten by the CPU (masseffect_native_resolved_cpu_overwrite) = {}",
+                  resolved_overwrite_on_ ? "YES (guest memory is read once the CPU rewrites a resolve destination)"
+                                         : "no (resolved copy forever)");
+    }
+    return resolved_overwrite_on_ > 0;
+  }
+
+  // Guest bytes of a resolve destination in tiled 32x32 blocks (what a texture at that base can occupy).
+  static uint64_t ResolvedFootprint(uint32_t base, uint32_t pitch, uint32_t height, uint32_t guest_format) {
+    const gr::FormatInfo* info = gr::FormatInfo::Get(guest_format);
+    const uint64_t bytes_texel = info && info->bits_per_pixel >= 8 ? info->bits_per_pixel / 8 : 4;
+    const uint64_t bytes = uint64_t((pitch + 31) & ~31u) * ((height + 31) & ~31u) * bytes_texel;
+    const uint64_t start = base & 0x1FFFFFFFu;
+    return start >= 0x20000000ull ? 0 : std::min<uint64_t>(bytes, 0x20000000ull - start);
+  }
+
+  // Fingerprint of [address, address + bytes) of guest physical memory. Up to 256 KB in full; above that 256
+  // bytes of every 4 KB plus the first and last 4 KB (a texture created over the range rewrites all its pages).
+  uint64_t GuestFingerprint(uint32_t address, uint64_t bytes) {
+    const uint8_t* p = memory_->TranslatePhysical(address & 0x1FFFFFFF);
+    if (bytes <= (256u << 10)) return XXH3_64bits(p, size_t(bytes));
+    uint64_t h = XXH3_64bits(p, 4096);
+    for (uint64_t o = 4096; o + 4096 <= bytes; o += 4096) h = XXH3_64bits_withSeed(p + o, 256, h);
+    return XXH3_64bits_withSeed(p + bytes - 4096, 4096, h);
+  }
+
+  // A resolve (or a read-back into guest memory) gave this entry new content: serve it again and take a new
+  // fingerprint once it has not been written for a whole frame.
+  void NoteResolvedContent(uint32_t base, Resolved& r) {
+    r.resolve_present = presented_;
+    r.baseline = false;
+    r.check_interval = 1;
+    if (r.cpu_overwritten) {
+      r.cpu_overwritten = false;
+      if (draws_) draws_->InvalidateTexturesAt(base, DrawsVulkan::kInvalidationCreated);
+    }
+  }
+
+  // At each present: fingerprints of the entries resolved into before it. Small destinations (up to 512 KB: UI
+  // render-to-texture, thumbnails; full XXH3) at the first present after their last resolve, because the game's
+  // Scaleform frees its textures one frame later (two swapped release lists) and the freed block can be refilled by
+  // the CPU right after; large ones (scene targets re-resolved every frame; sampled) once a whole frame passed
+  // without a resolve, so that a live 2-4 MB target is not hashed every frame.
+  void CaptureResolvedFingerprints() {
+    if (!ResolvedCpuOverwriteOn()) return;
+    for (auto& [base, r] : resolved_) {
+      if (r.baseline || r.cpu_overwritten || !r.footprint) continue;
+      if (r.resolve_present + (r.footprint <= (512u << 10) ? 1u : 2u) > presented_) continue;
+      r.guest_fingerprint = GuestFingerprint(base, r.footprint);
+      resolved_fingerprint_bytes_ += r.footprint <= (256u << 10) ? r.footprint : (r.footprint >> 4) + 8192;
+      r.baseline = true;
+      r.check_interval = 1;
+      r.next_check = presented_ + 1;
+      ++resolved_fingerprints_;
+    }
+    // Every 600 presents: what it cost and what it found.
+    if (presented_ - resolved_overwrite_reported_ >= 600) {
+      resolved_overwrite_reported_ = presented_;
+      REXLOG_INFO("[native] ME resolved CPU-overwrite check (masseffect_native_resolved_cpu_overwrite), session: {} "
+                  "fingerprints ({:.1f} MB hashed), {} rechecks, {} resolved textures found rewritten by the CPU",
+                  resolved_fingerprints_, double(resolved_fingerprint_bytes_) / 1048576.0, resolved_overwrite_checks_,
+                  resolved_overwritten_);
+    }
+  }
+
+  // Did the CPU rewrite the destination since the fingerprint? Checked on the schedule, or at once for a fetch
+  // whose format or size is not the resolve's (the shape a reused allocation shows).
+  bool CpuOverwroteResolved(uint32_t base, Resolved& r, const uint32_t* fetch) {
+    bool other_shape = false;
+    uint32_t fetch_format = 0, fetch_width = 0, fetch_height = 0;
+    if (fetch) {
+      fetch_format = fetch[1] & 0x3Fu;
+      fetch_width = (fetch[2] & 0x1FFFu) + 1;
+      fetch_height = ((fetch[2] >> 13) & 0x1FFFu) + 1;
+      other_shape = fetch_format != r.guest_format || fetch_width != r.image.width || fetch_height != r.image.height;
+    }
+    const bool shape_differs = other_shape;
+    // A fetch of another shape rechecks at once, but at most once per present (a game may sample a resolve with
+    // another format or a logical crop on purpose: that must not hash on every draw), and not while the entry is
+    // live (resolved into during the last frame: the scheduled recheck covers it).
+    if (other_shape && r.shape_checked != presented_ && r.resolve_present + 1 < presented_) {
+      r.shape_checked = presented_;
+    } else if (presented_ < r.next_check) {
+      return false;
+    } else {
+      other_shape = false;  // the scheduled recheck
+    }
+    ++resolved_overwrite_checks_;
+    resolved_fingerprint_bytes_ += r.footprint <= (256u << 10) ? r.footprint : (r.footprint >> 4) + 8192;
+    if (GuestFingerprint(base, r.footprint) == r.guest_fingerprint) {
+      if (!other_shape) {
+        r.check_interval = std::min<uint32_t>(r.check_interval * 2, 8);
+        r.next_check = presented_ + r.check_interval;
+      }
+      return false;
+    }
+    r.cpu_overwritten = true;
+    r.baseline = false;
+    ++resolved_overwritten_;
+    if (draws_) draws_->InvalidateTexturesAt(base, DrawsVulkan::kInvalidationCreated);
+    if (REXCVAR_GET(masseffect_native_resolved_cpu_overwrite_log) && resolved_overwritten_ <= 64) {
+      REXLOG_INFO("[native] ME resolved texture rewritten by the CPU at {:08X} ({} so far): last resolve {}x{} guest "
+                  "format {} {} presents ago, {} KB of guest bytes changed after it; fetch {} {}x{}{} now reads "
+                  "guest memory (masseffect_native_resolved_cpu_overwrite)",
+                  base, resolved_overwritten_, r.image.width, r.image.height, r.guest_format,
+                  presented_ - r.resolve_present, r.footprint >> 10, fetch_format, fetch_width, fetch_height,
+                  fetch ? (shape_differs ? " (another shape)" : " (same shape)") : "");
+    }
+    return true;
   }
 
   // The render target's content is no longer that of its last clear (something was copied over it or
@@ -7690,9 +9903,14 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       return Reject(9, "real multisample allocation is not enabled in this backend");
     VkImageCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    // masseffect_native_resolve_7e3_pack = 2: A2B10G10R10 textures also get an R32_UINT attachment view (same
+    // 32-bit compatibility class) for the 7e3 resolve's word output.
+    const bool unorm10_mutable = format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+                                 (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+                                 REXCVAR_GET(masseffect_native_resolve_7e3_pack) >= 2;
     info.flags = (format == VK_FORMAT_R16G16B16A16_SFLOAT ||
                   format == VK_FORMAT_R8G8B8A8_UNORM ||
-                  format == VK_FORMAT_R16G16_UNORM)
+                  format == VK_FORMAT_R16G16_UNORM || unorm10_mutable)
                  ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     info.imageType = VK_IMAGE_TYPE_2D;
     info.format = format;
@@ -7734,7 +9952,31 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     image.format = format;
     image.sample_count = sample_count;
     image.prepared = false;
+    if (unorm10_mutable) unorm10_mutable_.insert(image.image);
     return true;
+  }
+
+  // masseffect_native_resolve_7e3_pack = 2: R32_UINT color-attachment view of an A2B10G10R10 texture created with
+  // MUTABLE_FORMAT (kept in views_raw32_edram_, destroyed with the image). VK_NULL_HANDLE = not available.
+  VkImageView GetViewWord7e3(const Image& image) {
+    if (image.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 || !unorm10_mutable_.count(image.image))
+      return VK_NULL_HANDLE;
+    auto [it, fresh] = views_raw32_edram_.try_emplace(image.image, VK_NULL_HANDLE);
+    if (fresh) {
+      VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      view.image = image.image;
+      view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      view.format = VK_FORMAT_R32_UINT;
+      view.subresourceRange = kRangeColor;
+      VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+      usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      view.pNext = &usage;
+      if (dfn_.vkCreateImageView(device_, &view, nullptr, &it->second) != VK_SUCCESS) {
+        views_raw32_edram_.erase(it);
+        return VK_NULL_HANDLE;
+      }
+    }
+    return it->second;
   }
 
   void Destroy(Image& image) {
@@ -7779,7 +10021,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       if (it->second.stencil) dfn_.vkDestroyImageView(device_, it->second.stencil, nullptr);
       views_depth_edram_.erase(it);
     }
-    for (uint32_t variant = 0; variant < 3; ++variant)  // 2 = the exponent-bias resolve pass
+    unorm10_mutable_.erase(image.image);
+    for (uint32_t variant = 0; variant < 7; ++variant)  // 2 = exponent-bias resolve, 3-5 = 7e3 resolve, 6 = k_16_16
       if (auto it = framebuffers_conv_color_frag_.find({image.image, variant});
           it != framebuffers_conv_color_frag_.end()) {
         if (it->second) dfn_.vkDestroyFramebuffer(device_, it->second, nullptr);
@@ -7851,7 +10094,17 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     }
     image.prepared = true;
     if (draws_) {
-      draws_->InvalidateTextures();  // ResolvedTexture only returns prepared ones
+      // ResolvedTexture only returns prepared ones. Which address that concerns: the resolved texture holding this
+      // image, if any (masseffect_native_texture_inval_by_address; the old rule invalidates everything either way).
+      uint32_t address = UINT32_MAX;
+      for (const auto& [base, resolved] : resolved_) {
+        if (&resolved.image == &image || (image.image != VK_NULL_HANDLE && resolved.image.image == image.image)) {
+          address = base;
+          break;
+        }
+      }
+      draws_->InvalidateTexturesAt(address, address == UINT32_MAX ? DrawsVulkan::kInvalidationPreparedOther
+                                                                  : DrawsVulkan::kInvalidationPrepared);
     }
   }
 
@@ -7974,6 +10227,18 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                                slot_ * kStatsDrawPerSlot,
                                kStatsDrawPerSlot);
     }
+    if (occlusion_ != VK_NULL_HANDLE) {
+      // Only what the slot used last time (the whole range the first time): a reset of a non-timestamp query
+      // costs a chained semaphore write in NVK (see above). The results were read in Complete.
+      const uint32_t dirty = slot.occlusion_reset ? slot.occlusion_used : kOcclusionPerSlot;
+      if (dirty) dfn_.vkCmdResetQueryPool(commands_work_, occlusion_, slot_ * kOcclusionPerSlot, dirty);
+      slot.occlusion_reset = true;
+      slot.occlusion_used = 0;
+      slot.occlusion_multipliers.clear();
+      for (const auto& guest : slot.occlusion)  // never submitted: nothing to read
+        if (guest.latent && occlusion_latent_outstanding_) --occlusion_latent_outstanding_;
+      slot.occlusion.clear();
+    }
     slot.precise_marks = precise_marks_;
     recording_ = true;
     MarkGpu(kGpuOther);
@@ -8095,6 +10360,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     slot.draws_mark.clear();
     ReadStats(slot);
     ReadStatsDraw(slot);
+    ReadOcclusion(slot);
+    if (half_rop_test_.state == 1 && &slot == &slots_[half_rop_test_.slot]) EvaluateHalfRopTest();
     WriteReads(slot.reads);
   }
 
@@ -8281,6 +10548,23 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   // Mass Effect: full GPU drains per call site since the last report (see ReportWaitsGpu).
   std::array<uint64_t, 16> waits_gpu_reason_{};
   void ReportWaitsGpu() {
+    if (REXCVAR_GET(masseffect_native_bias_life_probe) && REXCVAR_GET(masseffect_native_edram_alias_mode) == 4)
+      ReportBiasLife();
+    if (REXCVAR_GET(masseffect_native_restore_into_7e3)) {
+      uint32_t learned = 0, disabled = 0;
+      for (const auto& [site, state] : edram4_restore_sites_) {
+        learned += state.confidence >= kRestoreConfidence && !state.disabled;
+        disabled += state.disabled;
+      }
+      std::string declined;
+      for (const auto& [why, n] : edram4_restore_no_) declined += fmt::format(" [{}: {}]", why, n);
+      REXLOG_INFO("[native] EDRAM restore into 7e3, 10 s: {} draws ({} tiles) drawn into the 7e3 image; {} f3 "
+                  "reads of restored tiles observed; sites {} learned, {} disabled ({} new); declined:{}",
+                  edram4_restore_draws_, edram4_restore_tiles_, edram4_restore_good_, learned, disabled,
+                  edram4_restore_disabled_, declined.empty() ? " none" : declined);
+      edram4_restore_draws_ = edram4_restore_tiles_ = edram4_restore_good_ = edram4_restore_disabled_ = 0;
+      edram4_restore_no_.clear();
+    }
     std::string list;
     for (size_t i = 1; i < waits_gpu_reason_.size(); ++i) {
       if (waits_gpu_reason_[i]) list += fmt::format(" site{}={}", i, waits_gpu_reason_[i]);
@@ -8296,6 +10580,28 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                   edram4_batch_saved_passes_, edram4_batch_saved_barriers_);
       edram4_sync_skipped_ = edram4_sync_copied_ = 0;
       edram4_batch_spans_ = edram4_batch_saved_passes_ = edram4_batch_saved_barriers_ = 0;
+      if (REXCVAR_GET(masseffect_native_resolve_bias_probe)) {
+        REXLOG_INFO("[native] resolve probe, 10 s: bias resolves {} ({} repeat an identical earlier one from an "
+                    "unchanged source), 7e3 resolves {} ({} repeats); bias + 7e3 pairs from the same unchanged "
+                    "source {}", probe_resolves_[1], probe_repeats_[1], probe_resolves_[2], probe_repeats_[2],
+                    probe_pairs_);
+        probe_resolves_ = {};
+        probe_repeats_ = {};
+        probe_pairs_ = 0;
+      }
+      if (REXCVAR_GET(masseffect_native_resolve_repeat)) {
+        static const char* kRepeatKind[5] = {"", "bias", "7e3", "depth guestspace", "depth copy"};
+        std::string kinds;
+        for (uint32_t k = 1; k < 5; ++k)
+          if (resolve_repeat_counts_[k][0])
+            kinds += fmt::format(" [{}: {} resolves, {} identical to the previous one, {} skipped, {} not "
+                                 "comparable]", kRepeatKind[k], resolve_repeat_counts_[k][0],
+                                 resolve_repeat_counts_[k][1], resolve_repeat_counts_[k][2],
+                                 resolve_repeat_counts_[k][3]);
+        REXLOG_INFO("[native] resolve repeat, 10 s:{} (mode {}, {} textures tracked)", kinds,
+                    REXCVAR_GET(masseffect_native_resolve_repeat), resolve_repeat_.Textures());
+        resolve_repeat_counts_ = {};
+      }
       static const char* kCaller[4] = {"draw", "clear", "color-resolve", "depth-resolve"};
       static const char* kKind[5] = {"depth-repr-switch", "depth-depth", "color->depth", "depth->color",
                                      "color->color"};
@@ -8324,6 +10630,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         conv_color_frag_uses_report_ = conv_color_frag_uses_;
         conv_color_frag_rejections_report_ = conv_color_frag_rejections_;
       }
+      FlushPairKeysEDRAM4();  // masseffect_native_edram4_pair_keys: into edram4_transfer_pairs_, same strings
       std::vector<std::pair<std::string, ParEDRAM4>> pairs(edram4_transfer_pairs_.begin(),
                                                            edram4_transfer_pairs_.end());
       std::sort(pairs.begin(), pairs.end(),
@@ -8364,6 +10671,12 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       if (edram4_redirected_color_tiles_)
         REXLOG_INFO("[native] EDRAM mode4 redirected clears into color owners: {} tiles", edram4_redirected_color_tiles_);
       edram4_redirected_color_tiles_ = 0;
+      if (REXCVAR_GET(masseffect_native_edram4_clear_alias_raw64))
+        REXLOG_INFO("[native] EDRAM mode4 clear alias raw64, 10 s: {} depth clears drawn through a 4x alias were "
+                    "redirected although a 64bpp color view owned some of their tiles; {} such tiles cleared in the "
+                    "1x alias (stencil kept in the 4x view, as the drawn clear leaves it)",
+                    edram4_raw64_clears_, edram4_raw64_tiles_);
+      edram4_raw64_clears_ = edram4_raw64_tiles_ = 0;
       if (edram4_consumer_uses_)
         REXLOG_INFO("[native] EDRAM mode4 redirected clears straight into their consumer: {}", edram4_consumer_uses_);
       edram4_consumer_uses_ = 0;
@@ -8402,6 +10715,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                   edram4_stencil_fetched_, edram4_stencil_fetched_tiles_);
       edram4_stencil_inherited_ = edram4_stencil_replaced_ = edram4_stencil_fetched_ =
           edram4_stencil_fetched_tiles_ = 0;
+      if (REXCVAR_GET(masseffect_native_edram4_rect_list_tiles)) {
+        REXLOG_INFO("[native] EDRAM rect list tiles, 10 s: {} draws synced and published per rectangle "
+                    "({} slot syncs)", edram4_touch_draws_, edram4_touch_syncs_);
+        edram4_touch_draws_ = edram4_touch_syncs_ = 0;
+      }
       std::string nine;
       for (const auto& [k, v] : edram4_import9_pairs_) nine += fmt::format(" [{} {}ops/{}t]", k, v.first, v.second);
       REXLOG_INFO("[native] EDRAM mode4 9-pass imports:{}; stencil bit passes skipped (bit never set): {}; "
@@ -8410,11 +10728,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                   edram4_stencil_copies_tiles_);
       edram4_bits_skipped_ = edram4_stencil_copies_ = edram4_stencil_copies_tiles_ = 0;
       edram4_import9_pairs_.clear();
+      ReportFetchesEDRAM4();
       edram4_stencil_skipped_ = edram4_stencil_returned_ = edram4_stencil_inexact_ = edram4_stencil_late_ =
           edram4_stencil_exported_ = 0;
       edram4_sync_calls_ = edram4_sync_visited_ = edram4_pub_calls_ = edram4_pub_visited_ = 0;
       edram4_overwrites_ = edram4_redirected_ = edram4_redirected_tiles_ = edram4_redirected_no_ = 0;
       edram4_transfer_pairs_.clear();
+      edram4_pair_keys_.clear();
       edram4_transfer_ops_ = {}; edram4_transfer_tiles_ = {}; edram4_transfer_full_ = {};
     }
     uint64_t full_count = 0, ns_full = 0;
@@ -8720,6 +11040,29 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       const uint64_t base = uint64_t(p.base & 0x1FFFFFFF);
       const auto& table = TableTile2DTexel4();
       const uint64_t tiles_per_row = ((p.pitch + 31) & ~uint32_t(31)) >> 5;
+      if (p.height && me::native::texture_coherency::Enabled()) {
+        // masseffect_native_texture_coherency: these tile rows of guest memory change now; an ordinary texture
+        // over them must not be taken as unchanged.
+        const uint64_t y_first = uint64_t(std::max<int32_t>(p.y0, 0));
+        const uint64_t y_last = uint64_t(int64_t(p.y0) + p.height > 0 ? int64_t(p.y0) + p.height - 1 : 0);
+        const uint64_t first = base + (((y_first >> 5) * tiles_per_row) << 12);
+        const uint64_t last = base + ((((y_last >> 5) + 1) * tiles_per_row) << 12);
+        if (last > first && first < 0x20000000) {
+          me::native::texture_coherency::Mark(uint32_t(first), uint32_t(std::min<uint64_t>(last - first, 0x20000000)),
+                                              me::native::texture_coherency::kSourceReadback);
+        }
+      }
+      // masseffect_native_resolved_cpu_overwrite: these guest bytes change now by our own hand, not the CPU's: a
+      // resolved texture over them takes a new fingerprint (a handful of entries: a scan is cheap).
+      if (resolved_overwrite_on_ > 0) {
+        const uint64_t rows = uint64_t(std::max<int64_t>(int64_t(p.y0) + int64_t(p.height), 0)) + 32;
+        const uint64_t end = base + ((uint64_t(p.pitch) + 31) & ~31ull) * rows * 4;
+        for (auto& [resolved_base, entry] : resolved_) {
+          if (base < uint64_t(resolved_base) + entry.footprint && uint64_t(resolved_base) < end) {
+            NoteResolvedContent(resolved_base, entry);
+          }
+        }
+      }
       for (uint32_t j = 0; j < p.height; ++j) {
         const uint32_t ty = uint32_t(p.y0) + j;
         if (p.target_height && ty >= p.target_height) {
@@ -8966,6 +11309,30 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   // Mass Effect: two timestamps per diagnostic draw (before / after), and GPU time, fragments and draws
   // per (category, pixel shader) of the diagnostic frames since the last report.
   VkQueryPool marks_draw_ = VK_NULL_HANDLE;
+  // Real occlusion queries (masseffect_native_query_mode 2 and 3).
+  VkQueryPool occlusion_ = VK_NULL_HANDLE;
+  bool occlusion_precise_ = false;
+  bool occlusion_open_ = false;           // between a guest begin and end
+  bool occlusion_open_split_ = false;
+  uint64_t occlusion_open_generation_ = UINT64_MAX;  // recording of its first measured draw
+  uint32_t occlusion_open_slot_ = 0;
+  uint32_t occlusion_open_first_ = 0;
+  uint32_t occlusion_open_measured_ = 0;
+  uint64_t occlusion_serial_ = 0;
+  uint64_t occlusion_frames_ = 0;  // Swaps presented
+  uint64_t occlusion_no_room_ = 0;
+  std::unordered_map<uint32_t, uint64_t> occlusion_pending_;  // end structure -> serial of the wanted result
+  // Latency-1 queries (masseffect_native_query_mode 3).
+  struct HistoryOcclusion {
+    uint64_t frame = 0;         // Swaps seen when the folded issue ended
+    uint32_t last_nonzero = 0;  // last non-zero count (after scaling)
+    uint32_t zero_streak = 0;   // consecutive zero results up to the folded one
+  };
+  std::unordered_map<uint64_t, HistoryOcclusion> occlusion_history_;  // query identity -> its results
+  std::unordered_map<uint64_t, uint32_t> occlusion_content_address_;  // box content -> last end structure
+  uint64_t occlusion_history_pruned_ = 0;
+  uint64_t occlusion_latent_outstanding_ = 0;  // measured issues not yet folded
+  StatsQueries occlusion_stats_;
   struct CostShader {
     uint64_t ns = 0, fragments = 0, draws = 0, vertices = 0, primitives = 0;
     uint32_t vs = 0, draw_more_expensive_ns = 0;  // VS of the costliest draw
@@ -8988,6 +11355,192 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     return until > from ? uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(until - from).count()) : 0;
   }
   std::chrono::steady_clock::time_point last_swap_{};
+  double swap_interval_ms_ = 0.0;  // last Swap-to-Swap interval (ring thread only)
+
+  // --- masseffect_diag_blur_source (docs/image-defects-feros.md 3.8) -----------------------------------------------
+  // A per-frame journal, kept only while the cvar is > 0 (blur_journal_ is read once per frame at the Swap).
+  struct BlurWrite {
+    uint64_t present = UINT64_MAX;  // presented_ of the last write into that address
+    uint32_t order = 0;             // its ordinal among the frame's writes into that address
+    uint32_t guest_format = 0;
+    const Image* source = nullptr;  // EDRAM color view it was resolved from (nullptr: depth or not a resolve)
+    uint64_t source_draws = 0;      // blur_draws_[source] at the write
+    uint64_t velocity_draws = 0;    // blur_velocity_draws_ at the write
+    // blur_draws_[source] at the first velocity draw after the write (UINT64_MAX: none yet). On the 360 the velocity
+    // pass overwrites the scene's EDRAM, so the scene color the blur reads must be the view's last state before it.
+    uint64_t source_draws_at_velocity = UINT64_MAX;
+    VkImage image = VK_NULL_HANDLE;
+  };
+  int32_t blur_journal_ = 0;                               // cvar value for this frame (0 = off)
+  const Image* blur_copy_source_ = nullptr;                // set inside CopyInternal for color resolves
+  std::unordered_map<uint32_t, BlurWrite> blur_writes_;    // last write per resolved address
+  std::unordered_map<uint32_t, uint32_t> blur_writes_frame_;  // writes per address in this frame
+  std::unordered_map<const Image*, uint64_t> blur_draws_;  // draws recorded into each EDRAM color view (session)
+  uint64_t blur_velocity_draws_ = 0;                       // draws into k_16_16 views (session)
+  uint64_t blur_velocity_frame_start_ = 0;                 // blur_velocity_draws_ at the frame start
+  std::string blur_frame_resolves_;                        // the frame's resolves, compact
+  std::string blur_frame_draw_;                            // the frame's motion blur fetches
+  std::string blur_frame_reasons_;                         // why the frame is flagged
+  bool blur_frame_seen_ = false;
+  uint64_t blur_frame_calls_ = 0, blur_frame_recorded_ = 0;  // Draw() calls and recorded draws in this frame
+  uint32_t blur_frames_logged_ = 0, blur_suspect_lines_ = 0;
+  uint64_t blur_frames_ = 0, blur_frames_suspect_ = 0, blur_stale_bindings_ = 0, blur_old_writes_ = 0;
+  uint64_t blur_late_scene_draws_frames_ = 0, blur_no_velocity_frames_ = 0, blur_format_mismatches_ = 0;
+  std::chrono::steady_clock::time_point blur_report_{};
+
+  static std::string BlurViewName(const Image* view) {
+    if (!view) return "-";
+    return fmt::format("C{:X}/f{}", view->edram_base, view->edram_format);
+  }
+
+  // ResolvedWritten: a resolve (or read-back) gave `base` new content.
+  void BlurNoteWrite(uint32_t base, const Resolved& entry) {
+    BlurWrite& w = blur_writes_[base];
+    w.present = presented_;
+    w.order = ++blur_writes_frame_[base];
+    w.guest_format = entry.guest_format;
+    w.source = blur_copy_source_;
+    w.source_draws = blur_copy_source_ ? blur_draws_[blur_copy_source_] : 0;
+    w.velocity_draws = blur_velocity_draws_;
+    w.source_draws_at_velocity = UINT64_MAX;  // a new write: no velocity draw after it yet
+    w.image = entry.image.image;
+    if (blur_frame_resolves_.size() < 1600)
+      blur_frame_resolves_ += fmt::format(" {:08X}#{}:f{}<{}@{}", base, w.order, w.guest_format,
+                                          BlurViewName(w.source), w.source_draws);
+  }
+
+  // Draw: a draw was recorded into these EDRAM views.
+  void BlurNoteDraw() {
+    bool velocity = false;
+    for (uint32_t slot = 1; slot < 5; ++slot) {
+      const Image* image = edram4_draw_images_[slot];
+      if (!image || !edram4_draw_writes_[slot] || image->edram_depth) continue;
+      ++blur_draws_[image];
+      velocity |= image->edram_format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16);
+    }
+    if (!velocity) return;
+    for (auto& [address, w] : blur_writes_)
+      if (w.velocity_draws == blur_velocity_draws_ && w.source && w.source_draws_at_velocity == UINT64_MAX)
+        w.source_draws_at_velocity = blur_draws_[w.source];
+    ++blur_velocity_draws_;
+  }
+
+  // Present: logs the frame's journal when it had a motion blur draw, and resets it.
+  void BlurJournalSwap() {
+    if (blur_journal_ > 0 && blur_frame_seen_) {
+      ++blur_frames_;
+      const bool suspect = !blur_frame_reasons_.empty();
+      if (suspect) ++blur_frames_suspect_;
+      if ((blur_frames_logged_ < uint32_t(blur_journal_)) || (suspect && blur_suspect_lines_ < 2000)) {
+        if (suspect) ++blur_suspect_lines_;
+        else ++blur_frames_logged_;
+        const std::string line = fmt::format(
+            "[native] blur source{} frame {} ({:.1f} ms): draws {} recorded of {}, velocity draws {}; resolves "
+            "(address#n:format<view@draws into the view before it):{}; blur:{}{}",
+            suspect ? " SUSPECT" : "", presented_,
+            last_swap_ != std::chrono::steady_clock::time_point{}
+                ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last_swap_).count()
+                : 0.0,
+            blur_frame_recorded_, blur_frame_calls_,
+            blur_velocity_draws_ - blur_velocity_frame_start_, blur_frame_resolves_, blur_frame_draw_,
+            suspect ? " -- " + blur_frame_reasons_ : std::string());
+        if (suspect) REXLOG_WARN("{}", line);
+        else REXLOG_INFO("{}", line);
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (blur_journal_ > 0 && now - blur_report_ >= std::chrono::seconds(10)) {
+      blur_report_ = now;
+      REXLOG_INFO("[native] blur source (10 s, masseffect_diag_blur_source): {} frames with the motion blur draw, {} "
+                  "flagged: {} stale bindings, {} textures last written in an earlier frame, {} fetches served by a "
+                  "resolve of another format, {} frames with scene draws between the scene color resolve and the "
+                  "velocity pass, {} without velocity draws after it",
+                  blur_frames_, blur_frames_suspect_, blur_stale_bindings_, blur_old_writes_, blur_format_mismatches_,
+                  blur_late_scene_draws_frames_, blur_no_velocity_frames_);
+      blur_frames_ = blur_frames_suspect_ = blur_stale_bindings_ = blur_old_writes_ = 0;
+      blur_late_scene_draws_frames_ = blur_no_velocity_frames_ = blur_format_mismatches_ = 0;
+    }
+    blur_journal_ = REXCVAR_GET(masseffect_diag_blur_source);
+    blur_frame_seen_ = false;
+    blur_frame_resolves_.clear();
+    blur_frame_draw_.clear();
+    blur_frame_reasons_.clear();
+    blur_writes_frame_.clear();
+    blur_velocity_frame_start_ = blur_velocity_draws_;
+    blur_frame_calls_ = blur_frame_recorded_ = 0;
+  }
+
+  public:
+  bool BlurSourceJournal() const override { return blur_journal_ > 0; }
+
+  VkImage ResolvedImageNow(uint32_t address) const override {
+    const auto entry = resolved_.find(address);
+    if (entry == resolved_.end() || entry->second.cpu_overwritten || !entry->second.image.prepared)
+      return VK_NULL_HANDLE;
+    return entry->second.image.image;
+  }
+
+  void NoteMotionBlurFetch(uint32_t ps_number, uint32_t sampler_register, const uint32_t* fetch,
+                           bool stale_binding) override {
+    const uint32_t address = (fetch[1] & 0xFFFFF000u) & 0x1FFFFFFFu;
+    const uint32_t format = fetch[1] & 0x3F;
+    const auto entry = resolved_.find(address);
+    const bool served = entry != resolved_.end() && !entry->second.cpu_overwritten && entry->second.image.prepared;
+    if (blur_journal_ <= 0) return;
+    blur_frame_seen_ = true;
+    const auto w = blur_writes_.find(address);
+    std::string what;
+    if (!served) {
+      what = "not a resolved texture here";
+    } else if (w == blur_writes_.end()) {
+      what = fmt::format("resolved f{}, write unknown", entry->second.guest_format);
+    } else {
+      const BlurWrite& b = w->second;
+      const uint64_t source_after = b.source ? blur_draws_[b.source] - b.source_draws : 0;
+      const uint64_t velocity_after = blur_velocity_draws_ - b.velocity_draws;
+      const uint64_t frames_ago = presented_ - b.present;
+      what = fmt::format("f{} write #{}/{} {}from {} (+{} draws into it since), velocity draws since {}",
+                         b.guest_format, b.order, frames_ago ? 0u : blur_writes_frame_[address],
+                         frames_ago ? fmt::format("{} frames ago ", frames_ago) : std::string(),
+                         BlurViewName(b.source), source_after, velocity_after);
+      if (frames_ago) {
+        ++blur_old_writes_;
+        blur_frame_reasons_ += fmt::format("t{} written {} frames ago; ", sampler_register, frames_ago);
+      }
+      // The same address is resolved as k_2_10_10_10 (UE3's raw scene save before each shadowed light) and as
+      // k_16_16_16_16_FLOAT (the scene color the blur reads) in one frame. A fetch whose format is not the one of the
+      // resolve now served there reads the other one's image.
+      if (b.source && b.guest_format != format && !(b.guest_format == 7 && format == 6) &&
+          !(b.guest_format == 6 && format == 7)) {  // color resolves only (depth copies have their own formats)
+        ++blur_format_mismatches_;
+        blur_frame_reasons_ += fmt::format("t{} fetch f{} served by a f{} resolve; ", sampler_register, format,
+                                           b.guest_format);
+      }
+      // The scene color (a 64-bpp float or 32-bpp color resolve read by the blur): draws into its source view after
+      // the resolve mean the blur samples an older scene than the one the frame drew before the velocity pass.
+      if (b.source && !b.source->edram_depth &&
+          b.source->edram_format != uint32_t(xenos::ColorRenderTargetFormat::k_16_16)) {
+        const uint64_t before_velocity =
+            b.source_draws_at_velocity != UINT64_MAX ? b.source_draws_at_velocity - b.source_draws : source_after;
+        what += fmt::format(", {} of them before the velocity pass", before_velocity);
+        if (!frames_ago && before_velocity) {
+          ++blur_late_scene_draws_frames_;
+          blur_frame_reasons_ += fmt::format("t{} {} received {} draws between its resolve and the velocity pass; ",
+                                             sampler_register, BlurViewName(b.source), before_velocity);
+        }
+        if (!velocity_after) ++blur_no_velocity_frames_;
+      }
+    }
+    if (stale_binding) {
+      ++blur_stale_bindings_;
+      blur_frame_reasons_ += fmt::format("t{} bound to another image than the one resolved now; ", sampler_register);
+    }
+    if (blur_frame_draw_.size() < 1200)
+      blur_frame_draw_ += fmt::format(" PS n{} t{} {:08X} fetch f{}: {}{};", ps_number, sampler_register, address,
+                                      format, what, stale_binding ? ", STALE BINDING" : "");
+  }
+
+  private:
   FnBlit blit_ = nullptr;
   // The game's shadow map, and the scale it is being drawn at (0 = not decided yet).
   static constexpr uint32_t kSideShadows = 1600;
@@ -9020,6 +11573,17 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   std::unordered_map<VkImage, VkImageView> views_raw64_rt_edram_;  // UINT views as color attachments
   VkShaderModule fs_conv_r64_frag_ = VK_NULL_HANDLE;
   VkShaderModule fs_bias_frag_ = VK_NULL_HANDLE;
+  VkShaderModule fs_7e3_frag_ = VK_NULL_HANDLE;  // masseffect_native_resolve_7e3_frag
+  bool fs_7e3_frag_failed_ = false;
+  VkShaderModule fs_7e3_word_frag_ = VK_NULL_HANDLE;  // masseffect_native_resolve_7e3_pack = 2
+  bool fs_7e3_word_frag_failed_ = false;
+  VkShaderModule fs_fixed16_frag_ = VK_NULL_HANDLE;  // masseffect_native_velocity_16_16
+  bool fs_fixed16_frag_failed_ = false;
+  uint64_t resolves_fixed16_ = 0;
+  std::unordered_set<uint64_t> fixed16_resolve_logged_;  // masseffect_diag_velocity bit 1 / declined resolves
+  uint64_t resolves_7e3_word_ = 0;
+  std::unordered_set<VkImage> unorm10_mutable_;  // A2B10G10R10 images created with MUTABLE_FORMAT (pack = 2)
+  uint64_t resolves_7e3_frag_ = 0;
   VkDescriptorSetLayout layout_conv_color_frag_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_pipeline_conv_color_frag_ = VK_NULL_HANDLE;
   VkShaderModule vs_conv_color_frag_ = VK_NULL_HANDLE;
@@ -9032,6 +11596,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   std::array<bool, 5> edram4_draw_writes_{};
   me::native::EdramBoundPlan edram4_draw_plan_{};
   VkRect2D edram4_draw_area_{};
+  // masseffect_native_edram4_rect_list_tiles: guest-pixel bounds of each rectangle of the current draw
+  // (empty = use edram4_draw_area_). Set by PrepareDrawEDRAM4, used by its syncs and by Draw's publish.
+  std::vector<VkRect2D> edram4_touch_rects_;
+  uint64_t edram4_touch_draws_ = 0, edram4_touch_syncs_ = 0;
+  uint32_t edram4_touch_logs_ = 0;
   uint64_t edram4_exports_ = 0;
   uint64_t edram4_imports_ = 0;
   uint64_t edram4_stencil_preserves_ = 0;
@@ -9193,11 +11762,21 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   uint64_t hitch_ns_record_ = 0;   // ns recording when the previous frame closed
   uint32_t warnings_hitch_ = 0;
   uint64_t copies_ = 0;
+  // masseffect_native_resolved_wake_no_clear: set around GetResolved by CopyInternal; the woken image whose
+  // clear was skipped until CopyInternal confirms the covering write; counters for the pool report.
+  bool resolved_wake_full_cover_ = false;
+  VkImage resolved_clear_owed_ = VK_NULL_HANDLE;
+  uint64_t resolved_wake_clears_skipped_ = 0, resolved_wake_clears_late_ = 0;
   uint64_t converted_copies_ = 0;  // Mass Effect: resolves with a format conversion (blit)
   std::unordered_set<uint64_t> recorded_conversions_;
   uint64_t cleared_in_failed_pass_ = 0;  // clears through a pass that could not be opened
   uint64_t cleared_ = 0;
   uint64_t presented_ = 0;
+  // masseffect_native_resolved_cpu_overwrite: -1 = cvar not read yet; fingerprints taken, rechecks, entries found
+  // rewritten by the CPU.
+  int32_t resolved_overwrite_on_ = -1;
+  uint64_t resolved_fingerprints_ = 0, resolved_overwrite_checks_ = 0, resolved_overwritten_ = 0;
+  uint64_t resolved_fingerprint_bytes_ = 0, resolved_overwrite_reported_ = 0;
   uint32_t changes_resolved_recorded_format_ = 0;  // ME: log of format/size changes at a resolve address
   uint64_t rejections_ = 0;
   std::unordered_set<uint32_t> warned_;

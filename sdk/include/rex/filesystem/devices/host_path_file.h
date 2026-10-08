@@ -146,6 +146,8 @@ class HostPathFile : public File {
   // File id inside the RAM cache (0 = this file is not cached). See
   // masseffect_io_cache_mb.
   uint32_t cache_id_ = 0;
+  // File id in the block cache (0 = not cached). See block_cache.cpp and docs/streaming-io.md.
+  uint32_t bcache_id_ = 0;
   // Tag in the startup trace (0 = not traced). See startup_trace.cpp.
   uint32_t trace_tag_ = 0;
 };

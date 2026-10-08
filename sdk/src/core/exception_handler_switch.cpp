@@ -433,6 +433,8 @@ __asm__(".text\n"
  * are no registers, only the stack from 'stack'.
  */
 extern "C" void _start(void);
+// log_nonblocking.cpp: synchronous drain of the non-blocking log on the crash paths.
+extern "C" void RexLogEmergencyDrain(void);
 
 namespace {
 
@@ -593,6 +595,10 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
   ScanStack(b, ctx ? ctx->sp.x : stack, base, text_lo, text_hi);
   Append(b, "\n");
   WriteCrashFile(b.data, b.len);
+  // log_nonblocking: the last lines are still in memory. After the crash report (the part that
+  // matters most), best effort: waits at most ~300 ms for the writer thread and does not rotate.
+  // A no-op with the synchronous file sink.
+  RexLogEmergencyDrain();
   busy.clear();
 }
 

@@ -5,6 +5,7 @@
 #include "masseffect_native_shaders.h"
 
 #include "masseffect_shader_library.h"
+#include "../me_shader_identity.h"
 
 #include <rex/logging.h>
 
@@ -291,11 +292,17 @@ struct ShadersNative::Data {
   std::unordered_map<uint64_t, uint32_t> per_fingerprint;  // container XXH3 -> entries (PerFingerprint)
   // (vertices, words) -> candidate entries.
   std::map<std::pair<bool, uint32_t>, std::vector<uint32_t>> candidates;
-  std::unordered_map<RawKey, const ShaderEntry*, HashRawKey> cache;
+  struct Cached {
+    const ShaderEntry* entry = nullptr;
+    bool patched = false;  // found by the second-stage lookup
+  };
+  std::unordered_map<RawKey, Cached, HashRawKey> cache;
   std::vector<uint32_t> temporal;
   StatsShaders stats;
   uint32_t warnings = 0;
+  uint32_t patched_logged = 0;
   bool loaded = false;
+  bool patched_lookup = true;
 };
 
 ShadersNative::ShadersNative() : data_(std::make_unique<Data>()) {}
@@ -426,14 +433,20 @@ bool ShadersNative::Load(const std::filesystem::path& file, bool use_index) {
   return d.loaded;
 }
 
+void ShadersNative::SetPatchedLookup(bool on) {
+  data_->patched_lookup = on;
+}
+
 const ShaderEntry* ShadersNative::Identify(bool vertices,
-                                                 std::span<const uint32_t> microcode) {
+                                                 std::span<const uint32_t> microcode, bool* patched) {
   Data& d = *data_;
   ++d.stats.loads;
+  if (patched) *patched = false;
   const RawKey key{XXH3_64bits(microcode.data(), microcode.size_bytes()),
                          uint32_t(microcode.size()), vertices};
   if (auto it = d.cache.find(key); it != d.cache.end()) {
-    return it->second;
+    if (patched) *patched = it->second.patched;
+    return it->second.entry;
   }
   ++d.stats.distinct;
 
@@ -459,6 +472,64 @@ const ShaderEntry* ShadersNative::Identify(bool vertices,
       ++matches;
     }
   }
+
+  // Second stage (SetPatchedLookup): the fetch swizzles D3D patched per vertex declaration, and the same-register
+  // fetch reorder. Only after the exact stage found nothing, so library variants stored with their patched
+  // swizzles (repair_vertex_variant_declarations) keep winning.
+  bool found_patched = false;
+  if (!chosen && vertices && d.patched_lookup) {
+    if (auto c = d.candidates.find({vertices, uint32_t(microcode.size())}); c != d.candidates.end()) {
+      const auto instruction = [](const ElementVertex& element) { return uint32_t(element.instruction); };
+      bool permuted = false;
+      std::string others;
+      for (uint32_t index : c->second) {
+        const ShaderEntry& e = d.inputs[index];
+        const me::native::ShaderIdentityView loaded{me::native::ShaderIdentityStage::Vertex, microcode};
+        const me::native::ShaderIdentityView selected{me::native::ShaderIdentityStage::Vertex, e.microcode};
+        bool by_permutation = false;
+        if (!me::native::VertexShaderIdentityMatches(loaded, selected, e.elements, instruction, 0)) {
+          if (!me::native::g_vs_identity_fetch_permutation.load(std::memory_order_relaxed) ||
+              !me::native::VertexShaderFetchPermutationMatches(loaded, selected, e.elements, instruction)) {
+            continue;
+          }
+          by_permutation = true;
+        }
+        if (!chosen) {
+          chosen = &e;
+          permuted = by_permutation;
+        } else if (others.size() < 64) {
+          others += fmt::format(" n{}", e.number);
+        }
+        ++matches;
+      }
+      if (chosen) {
+        found_patched = true;
+        ++d.stats.patched;
+        if (permuted) ++d.stats.patched_permuted;
+        if (matches > 1) ++d.stats.patched_ambiguous;
+        if (d.patched_logged < kMaxWarnings) {
+          ++d.patched_logged;
+          std::string swizzles;
+          for (const ElementVertex& element : chosen->elements) {
+            const size_t p = size_t(element.instruction) * 3 + 1;
+            if ((microcode[p] & 0xFFF) != (chosen->microcode[p] & 0xFFF)) {
+              swizzles += fmt::format(" {}{}@{}:{:03X}->{:03X}", kUses[element.usage & 0xF], element.usage_index,
+                                      element.instruction, chosen->microcode[p] & 0xFFF, microcode[p] & 0xFFF);
+            }
+          }
+          REXLOG_INFO("[native] shaders: VS {:016X} ({} words) identified by the patched-fetch lookup as n{} "
+                      "(container {:016X}){}; swizzles library->loaded:{}{}",
+                      key.fingerprint, microcode.size(), chosen->number,
+                      chosen->shader ? chosen->shader->fingerprint : 0,
+                      permuted ? ", same-register fetches reordered" : "", swizzles,
+                      matches > 1 ? fmt::format("; {} candidates, first in library order kept, others:{}", matches,
+                                                others)
+                                  : std::string());
+        }
+      }
+    }
+  }
+  if (patched) *patched = found_patched;
 
   // Vertex shaders arrive patched: a mismatch is normal.
   const bool warn = d.warnings < kMaxWarnings && !vertices;
@@ -528,7 +599,7 @@ const ShaderEntry* ShadersNative::Identify(bool vertices,
       }
     }
   }
-  d.cache.emplace(key, chosen);
+  d.cache.emplace(key, Data::Cached{chosen, found_patched});
   return chosen;
 }
 

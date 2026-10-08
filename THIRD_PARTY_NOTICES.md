@@ -69,6 +69,13 @@ from `shaders/` (the scanner includes its own LZO1X decoder) and, when it is bui
 (University of Illinois/NCSA Open Source License, with LLVM's license terms). The WebAssembly build uses
 [Emscripten](https://emscripten.org) (MIT and the University of Illinois/NCSA license).
 
+The page is set in two fonts that it serves itself from `installer/assets/fonts/` (no font service is contacted). They
+are converted to WOFF2 from the files in [google/fonts](https://github.com/google/fonts), with no other change:
+[Russo One](https://github.com/google/fonts/tree/main/ofl/russoone) by Jovanny Lemonad (SIL Open Font License 1.1,
+Reserved Font Name "Russo", `installer/assets/fonts/OFL-RussoOne.txt`) and
+[Golos Text](https://github.com/googlefonts/golos-text) by the Golos Text Project Authors (SIL Open Font License 1.1,
+`installer/assets/fonts/OFL-GolosText.txt`).
+
 ## Trademarks
 
 Mass Effect is a trademark of Electronic Arts Inc. Nintendo Switch is a trademark of Nintendo. Xbox 360 is a trademark of
@@ -82,6 +89,14 @@ The NSP build downloads and compiles [Forwarder-Mod](https://github.com/Skywalke
 (commit `745b16ecfc9ce055743067d200572204cb2aac6c`, GPL-2.0, with bundled mbedTLS).
 The loader is adapted to modern libnx/npdmtool and configured for a 39-bit full application.
 The exact adaptations are in `tools/build_nsp.sh`; upstream licenses stay in the source trees.
+
+The full NSP packer (`tools/build_full_nsp.py`, `installer/js/nsp.js`, docs/full-nsp.md) is an independent
+implementation of the NCA/PFS0/RomFS/CNMT formats. Its NPDM writer follows `npdmtool` of
+[switchbrew/switch-tools](https://github.com/switchbrew/switch-tools) (ISC license, Copyright 2018 SciresM; the output
+is byte-identical), its process configuration is the nx-hbloader `hbl.json` of Forwarder-Mod (ISC license, Copyright
+2017-2018 nx-hbloader Authors) with the patches of `tools/build_nsp.sh`, and its RomFS layout is the one of
+switch-tools `build_romfs` (ISC, Copyright 2017 libnx Authors). hacBrewPack (GPL-2.0) and hactool (ISC) were used as
+format references and hactool as an external verifier in the tests; no code is copied from hacBrewPack.
 
 The browser installer reuses the DXC v2025.1 WASM compiler from
 [StevensND/nfsmw-nx-installer](https://github.com/StevensND/nfsmw-nx-installer/tree/e7ec1b651321d752ea34b05bc61cc210543f44d6)

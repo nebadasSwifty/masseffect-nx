@@ -8,6 +8,7 @@
 // The app uses it when masseffect_renderer_native is true (see masseffect_app.h).
 
 #include "me_native_system.h"
+#include "me_packaged.h"
 #include "me_shader_identity.h"
 #include "me_shader_candidate_policy.h"
 #include "me_native_draw_extent_estimator.h"
@@ -15,6 +16,11 @@
 #include "me_object_table.h"
 #include "me_record_table.h"
 #include "me_native_ps_no_kill.h"
+#include "me_shader_load_memo.h"
+#include "me_ring_partition.h"
+#include "me_frame_coherence.h"
+#include "me_ring_split.h"
+#include "me_texture_coherency.h"  // masseffect_native_texture_coherency
 
 #include <algorithm>
 #include <array>
@@ -28,6 +34,7 @@
 #include <filesystem>
 #include <deque>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -66,6 +73,61 @@ extern const ShadersNative* g_active_library;  // me_masseffect_glue.cpp
 }
 
 REXCVAR_DECLARE(bool, masseffect_vblank_sleep_exact);  // me_audio_hooks.cpp
+REXCVAR_DECLARE(int32_t, masseffect_scene_width);   // me_resolution.cpp
+REXCVAR_DECLARE(int32_t, masseffect_scene_height);  // me_resolution.cpp
+REXCVAR_DECLARE(int32_t, masseffect_scene_parts);   // me_resolution.cpp
+
+// D3D9 occlusion queries (EVENT_WRITE_ZPD): docs/occlusion-queries.md.
+REXCVAR_DEFINE_INT32(masseffect_native_query_mode, 0, "Mass Effect",
+                     "Occlusion query results: 0 = every query reports 1000 samples (visible, as before); 1 = "
+                     "diagnostic, every query reports 0 samples (everything occlusion-tested is hidden: wrong image, "
+                     "bounds the gain); 2 = real Vulkan occlusion queries around the draws of each query, written "
+                     "into guest memory when the GPU has them; 3 = latency-1 real queries: answered at once from the "
+                     "most recent GPU result of the same query identity (unknown or stale = visible), while the GPU "
+                     "measures the current issue for the next ones (never waited for)")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_query_skip_boxes, false, "Mass Effect",
+                    "With query modes 0 and 1: draws between an occlusion query's begin and end that cannot change "
+                    "any pixel (no color writes, no depth writes, no stencil) are not recorded at all; they only "
+                    "fed the query, whose result is not measured. Ignored in mode 2")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_query_pair_by_address, true, "Mass Effect",
+                    "Occlusion queries, all modes: an EVENT_WRITE_ZPD whose address + 0x20 is the begin structure "
+                    "of the open query is its END even when the end structure no longer holds D3D's sentinel. "
+                    "D3D stores the sentinel at Issue(BEGIN) on the CPU; when the ring lags, writing the previous "
+                    "issue's result erases the sentinel of the next one, and the END was then taken for a BEGIN and "
+                    "zeroed (the game read 0 samples and culled). docs/image-defects-feros.md 3.8.2")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_query_flush_us, 500, "Mass Effect",
+                     "Query mode 2: when the ring has nothing left to parse and a finished query has waited this "
+                     "long in the work being recorded, submit that work early (the game is probably polling the "
+                     "query); -1 = never, results then wait for the Swap's submission")
+    .range(-1, 1000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_query_timeout_us, 50000, "Mass Effect",
+                     "Query mode 2: a query without a GPU result after this long is answered 'visible' (a game "
+                     "waiting for it can never hang); 0 = no timeout")
+    .range(0, 10000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_query_max_age, 4, "Mass Effect",
+                     "Query mode 3: a history result whose issue ended more than this many Swaps ago is not used "
+                     "(the query is answered 'visible')")
+    .range(1, 120)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_query_hidden_after, 2, "Mass Effect",
+                     "Query mode 3: a query is answered 0 samples (hidden) only after this many consecutive zero "
+                     "results of its identity; any non-zero result in between answers 'visible' (limits pop-in and "
+                     "flicker). 1 = the last result alone decides")
+    .range(1, 16)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_query_history_key, 0, "Mass Effect",
+                     "Query mode 3, identity of a query in the history table: 0 = end structure address + hash of "
+                     "the box vertex data and target (safe if UE3 pools its query objects; fewer hits if the pool "
+                     "reshuffles); 1 = box content hash only (survives pooling; wrong only if two primitives share "
+                     "identical box data); 2 = end structure address only (wrong if query objects are pooled)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // Read by MassEffectApp::PatchCoalescedHashForLocalTesting (masseffect_app.h). The Switch has no environment
 // variables: debug runs set it in masseffect.toml.
@@ -152,18 +214,119 @@ REXCVAR_DEFINE_BOOL(masseffect_native_pm4_fast, false, "Mass Effect",
                     "LOAD_ALU_CONSTANT) are byte-swapped, compared and stored four words at a time with NEON "
                     "straight from the guest words; same register contents and generation bumps")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_load_memo, false, "Mass Effect",
+                    "Ring: a shader IM_LOAD whose raw guest words equal the last load from the same address and "
+                    "size (one memcmp) reuses that load's byte-swapped microcode and XXH3 for the identity memo "
+                    "instead of swapping and hashing again; exact (me_shader_load_memo.h, self-checked for the "
+                    "first masseffect_native_verify_n hits)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_load_memo_generation, false, "Mass Effect",
+                    "Ring, with masseffect_native_load_memo: a load memo hit restores the identity generation its "
+                    "words had when stored, so the per-draw identity checks memoized for those exact words stay "
+                    "valid when shaders alternate (A, B, A); exact (the results depend only on the words)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_ring_partition, false, "Mass Effect",
+                    "Ring (measurement only): split the ring thread's time into phases (wait, PM4 parse, registers, "
+                    "shader loads, pairing, EDRAM prepare / transfers / publish, Vulkan draw, textures, copies, "
+                    "present, ...) with the ARM counter and report ms per 10 s and us per ring draw "
+                    "(me_ring_partition.h). Costs ~0.3-0.6 us per draw while on")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_coherence_stats, false, "Mass Effect",
+                    "Ring (measurement only): frame coherence of ring draws. Keys per draw (shaders, render state, "
+                    "texture fetch words, shader constants, index/vertex ranges and fingerprints) are compared with "
+                    "the previous frame; every 10 s two 'frame coherence' lines give the share of draws that match "
+                    "(same ordinal / any position) and the ring time and C6 stages of the matching draws "
+                    "(me_frame_coherence.h, docs/frame-coherence.md)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_coherence_every, 8, "Mass Effect",
+                     "masseffect_native_coherence_stats: record frame pairs every N frames (frames f % N == 0 and 1; "
+                     "the second is compared with the first). 1 = every frame")
+    .range(1, 1024)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_effects_stats, false, "Mass Effect",
+                    "Ring (measurement only, step 0 of docs/multithread-translation.md): count the guest-visible "
+                    "effects (fences, MEM_WRITE, REG_TO_MEM, COND_WRITE, EVENT_WRITE_EXT, scratch write-back, "
+                    "interrupts, occlusion writes, read-pointer write-back) and WAIT_REG_MEM sync points, and the ring "
+                    "draws between consecutive ones; one 'guest-visible effects' line every 10 s (me_ring_split.h)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_split_lockstep, false, "Mass Effect",
+                    "Ring (step 1 of docs/multithread-translation.md): the front journals every register store and "
+                    "microcode change; the back (draws, copies, Swaps behind TargetsNative) applies the journal to "
+                    "its own register/microcode mirror and reads only the mirror. Same thread, same order (no second "
+                    "thread); exact. One 'ring split (lockstep)' line every 10 s with the journal's cost")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_split_verify, 4096, "Mass Effect",
+                     "masseffect_native_split_lockstep: compare the back's mirror with the ring's registers (all "
+                     "0x5003 words) and microcode bit for bit at the first N back operations; any difference logs "
+                     "DIFFERENCE and turns the split off for the session (the back then reads the live registers "
+                     "again). 0 = no check")
+    .range(0, 1000000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_split_verify_every, 1024, "Mass Effect",
+                     "masseffect_native_split_lockstep: after the first masseffect_native_split_verify back "
+                     "operations, compare one in N; 0 = never")
+    .range(0, 1000000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_vblank_adaptive, false, "Mass Effect",
+                    "Adaptive VBlank: when a frame is already late (two VBlank periods since the previous Swap) and the "
+                    "GPU waits on memory for the game's VBlank handler, fire the VBlank now instead of at the next "
+                    "60 Hz tick. A late frame then costs its own time instead of a whole extra VBlank (35 ms -> 50 ms). "
+                    "Frames on time keep the 30 fps pacing. The output is presented immediately anyway");
+REXCVAR_DEFINE_INT32(masseffect_native_waitregmem_spin_us, 0, "Mass Effect",
+                     "PM4 WAIT_REG_MEM: poll with yields for up to this many microseconds before the 50 us sleeps "
+                     "(the Horizon sleep lasts much longer than asked; ~0.35 ms per wait measured); 0 = sleep at once")
+    .range(0, 5000);
+REXCVAR_DEFINE_BOOL(masseffect_native_waitregmem_stats, false, "Mass Effect",
+                    "Diagnostics: log every 10 s which WAIT_REG_MEM conditions the ring thread waited on (register or "
+                    "memory address, reference, mask), how often and for how long");
+REXCVAR_DEFINE_BOOL(masseffect_native_mismatch_log_info, false, "Mass Effect",
+                    "Ring: the periodic VS/PS identity mismatch lines (1 in 256 after the first 32, ~110 per 10 s "
+                    "in the Normandy walk) are written at info instead of warn level. Warn lines flush the log "
+                    "file to the SD card on the ring thread (flush_on(warn)); the text is the same")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(masseffect_native_verify_n, 2048, "Mass Effect",
                      "Self-check of the switches above: the old and the new path are both evaluated for the first N "
                      "uses and compared; any difference logs DIFFERENCE and turns that switch off. 0 = no check")
     .range(0, 1000000)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(masseffect_diag_missing_shader_draws, false, "Mass Effect",
+                    "Diagnostics (docs/image-defects-feros.md, 'Overheat bar missing'): for draws dropped because "
+                    "the VS or PS is not in the shader package, log the draw state once per distinct state "
+                    "(primitive, count, color mask, blend, alpha test, depth/stencil, target, texture 0) and the "
+                    "full microcode of each missing program once, so it can be wrapped into "
+                    "shaders/runtime_containers. Limits: masseffect_diag_missing_shader_states_max and "
+                    "masseffect_diag_missing_shader_programs_max. No image change");
+REXCVAR_DEFINE_INT32(masseffect_diag_missing_shader_states_max, 64, "Mass Effect",
+                     "masseffect_diag_missing_shader_draws: at most N distinct 'missing shader draw' state lines per "
+                     "run. 0 = no limit (one line per distinct state)")
+    .range(0, 1000000);
+REXCVAR_DEFINE_INT32(masseffect_diag_missing_shader_programs_max, 0, "Mass Effect",
+                     "masseffect_diag_missing_shader_draws: at most N missing programs get their microcode dumped "
+                     "('missing shader microcode' lines), each once per run. 0 = no limit (every distinct missing "
+                     "VS/PS once). The old fixed limit was 16")
+    .range(0, 1000000);
+REXCVAR_DEFINE_BOOL(masseffect_native_vs_identify_patched, true, "Mass Effect",
+                    "Vertex shaders the exact library lookup misses are looked up again with the fetch destination "
+                    "swizzles Direct3D patches per vertex declaration left out (FLOAT3 position 688 -> A88, "
+                    "D3DCOLOR texcoord E88 -> E0A). Exact otherwise: every ALU/CF word and every other fetch field "
+                    "identical, every swizzle change representable by the input remap (the draw-time identity "
+                    "test). Without it such draws are dropped (BDtS asteroid X57 VS 83D232C56BD49D57 and "
+                    "0D0AB386D5018592, Normandy/Wards VS 30458CCA865ABD51). Report line: 'VS patched-fetch lookup'")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_vs_fetch_permutation, true, "Mass Effect",
+                    "Vertex shader identity also accepts Direct3D's reorder of back-to-back fetches into the same "
+                    "temporary register (disjoint components, one exec clause; e.g. Eden Prime VS CD057930742AFE84, "
+                    "r3.xy and r3.zw swapped). Every other word stays exact; the vertex input then takes each "
+                    "element from the fetch of its run that writes its components")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(masseffect_native_vs_identity_tolerance, 0, "Mass Effect",
                      "Experimental: a vertex shader the ring loaded may differ from its library candidate (same size, "
                      "fetches still checked) in up to N ALU/CF words and still be drawn with that candidate. 0 = "
                      "exact identity (the draw is dropped when no candidate matches, as before). Try 4-16 when the "
-                     "log shows 'unresolved draw shader pairs' (e.g. VS CD057930742AFE84, 120 words, one draw per "
-                     "frame in the pause menu); see the '[native] VS word diff' lines")
+                     "log shows 'unresolved draw shader pairs' for a VS that masseffect_native_vs_identify_patched "
+                     "does not find (CD057930742AFE84 is now found by the fetch permutation); see the "
+                     "'[native] VS word diff' lines")
     .range(0, 64)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
@@ -184,6 +347,8 @@ constexpr uint32_t kRegScratchUmsk = 0x01DC;
 constexpr uint32_t kRegScratchAddr = 0x01DD;
 constexpr uint32_t kRegScratch0 = 0x0578;
 constexpr uint32_t kRegScratch7 = 0x057F;
+constexpr uint32_t kRegCoherSizeHost = 0x0A2F;  // bytes (D3D rounds them up to 4 KB)
+constexpr uint32_t kRegCoherBaseHost = 0x0A30;  // physical address (D3D rounds it down to 4 KB)
 constexpr uint32_t kRegCoherStatusHost = 0x0A31;
 constexpr uint32_t kRegRbEdramTiming = 0x0F00;
 constexpr uint32_t kRegRbBcControl = 0x0F01;
@@ -201,6 +366,7 @@ constexpr uint32_t kRegD1ModeViewportSize = 0x1961;
 constexpr uint32_t kRegVgtEventInitiator = 0x21F9;
 constexpr uint32_t kRegVgtDmaBase = 0x21FA;
 constexpr uint32_t kRegVgtDmaSize = 0x21FB;
+static_assert(kRegisterCount >= me::native::coherence::kRegMinRequired, "frame coherence reads 0x4900-0x4927");
 constexpr uint32_t kRegVgtDrawInitiator = 0x21FC;
 constexpr uint32_t kRegRbModeControl = 0x2208;
 constexpr uint32_t kRegRbSampleCountAddr = 0x2325;
@@ -640,20 +806,72 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     if (active_.exchange(true)) return X_STATUS_SUCCESS;
     g_vs_identity_alu_tolerance.store(uint32_t(REXCVAR_GET(masseffect_native_vs_identity_tolerance)),
                                       std::memory_order_relaxed);
+    g_vs_identity_fetch_permutation.store(REXCVAR_GET(masseffect_native_vs_fetch_permutation),
+                                          std::memory_order_relaxed);
+    shaders_.SetPatchedLookup(REXCVAR_GET(masseffect_native_vs_identify_patched));
     identity_flat_ = REXCVAR_GET(masseffect_native_flat_identity);
     g_record_fast = pairing_fast_ = REXCVAR_GET(masseffect_native_fast_pair);
     raw_microcode_ = REXCVAR_GET(masseffect_native_raw_microcode);
     pm4_fast_ = REXCVAR_GET(masseffect_native_pm4_fast);
-    check_identity_ = check_pairing_ = check_raw_ = check_pm4_ = check_objects_ =
+    query_mode_ = REXCVAR_GET(masseffect_native_query_mode);
+    query_skip_boxes_ = REXCVAR_GET(masseffect_native_query_skip_boxes);
+    query_pair_by_address_ = REXCVAR_GET(masseffect_native_query_pair_by_address);
+    query_flush_us_ = REXCVAR_GET(masseffect_native_query_flush_us);
+    query_timeout_us_ = uint32_t(std::max<int32_t>(0, REXCVAR_GET(masseffect_native_query_timeout_us)));
+    query_max_age_ = uint32_t(std::max<int32_t>(1, REXCVAR_GET(masseffect_native_query_max_age)));
+    query_hidden_after_ = uint32_t(std::max<int32_t>(1, REXCVAR_GET(masseffect_native_query_hidden_after)));
+    query_history_key_ = REXCVAR_GET(masseffect_native_query_history_key);
+    {
+      // The game draws its scene at masseffect_scene_width x _height when the viewport part is on
+      // (me_resolution.cpp): scale the counts so UE3's thresholds see the numbers of 1280x720.
+      const int32_t w = REXCVAR_GET(masseffect_scene_width), h = REXCVAR_GET(masseffect_scene_height);
+      if (w > 0 && h > 0 && (REXCVAR_GET(masseffect_scene_parts) & 1)) query_scale_ = (1280.0 * 720.0) / (double(w) * h);
+    }
+    if (query_mode_ || query_skip_boxes_)
+      REXLOG_INFO("[native] occlusion queries: mode {} ({}), skip boxes {}{}, flush {} us, timeout {} us, count scale {:.3f}",
+                  query_mode_,
+                  query_mode_ == 0   ? "visible"
+                  : query_mode_ == 1 ? "DIAGNOSTIC: all hidden"
+                  : query_mode_ == 2 ? "real"
+                                     : "latency-1 real",
+                  query_skip_boxes_, query_mode_ >= 2 && query_skip_boxes_ ? " (ignored in modes 2 and 3)" : "",
+                  query_flush_us_, query_timeout_us_, query_scale_);
+    if (query_mode_ == 3)
+      REXLOG_INFO("[native] occlusion queries, latency-1: max age {} Swaps, hidden after {} zero results, identity "
+                  "{} (flush and timeout unused)",
+                  query_max_age_, query_hidden_after_,
+                  query_history_key_ == 0   ? "address + box content"
+                  : query_history_key_ == 1 ? "box content"
+                                            : "address");
+    check_identity_ = check_pairing_ = check_raw_ = check_pm4_ = check_objects_ = check_load_memo_ =
         uint32_t(std::max<int32_t>(0, REXCVAR_GET(masseffect_native_verify_n)));
+    if (REXCVAR_GET(masseffect_native_load_memo)) {
+      load_memo_ = std::make_unique<ShaderLoadMemo>();
+      load_memo_generation_ = REXCVAR_GET(masseffect_native_load_memo_generation);
+      REXLOG_INFO("[native] ring CPU switch: shader load memo by address on ({} slots), identity generations "
+                  "restored on a hit {}", ShaderLoadMemo::kSlots, load_memo_generation_);
+    }
     if (identity_flat_ || pairing_fast_ || raw_microcode_ || pm4_fast_)
       REXLOG_INFO("[native] ring CPU switches: flat identity {}, fast pairing {}, raw microcode compare {}, fast PM4 "
                   "runs {}; self-check of the first {} uses of each", identity_flat_, pairing_fast_, raw_microcode_,
                   pm4_fast_, check_identity_);
+    effects_on_ = REXCVAR_GET(masseffect_native_effects_stats);
+    if (REXCVAR_GET(masseffect_native_split_lockstep)) {
+      // MMIO writes from game threads are not in the journal: they are flagged and re-journaled at the next sync.
+      mmio_touched_ = std::make_unique<std::atomic<uint8_t>[]>(kRegisterCount);
+      for (uint32_t i = 0; i < kRegisterCount; ++i) mmio_touched_[i].store(0, std::memory_order_relaxed);
+      split_on_ = true;
+      split_mmio_.store(true, std::memory_order_release);
+      split_verify_.first = uint64_t(REXCVAR_GET(masseffect_native_split_verify));
+      split_verify_.every = uint64_t(REXCVAR_GET(masseffect_native_split_verify_every));
+      REXLOG_INFO("[native] ring split: lockstep (journal + back mirror on the ring thread); verification of the first "
+                  "{} back operations, then 1 in {}", split_verify_.first, split_verify_.every);
+    }
+    if (effects_on_) REXLOG_INFO("[native] guest-visible effects statistics on (measurement): report every 10 s");
     g_native_active.store(true, std::memory_order_release);
     const char* lib = std::getenv("MASSEFFECT_SHADER_LIBRARY");
     const auto lib_path = lib && *lib ? std::filesystem::path(lib)
-                                      : rex::filesystem::GetExecutableFolder() / "masseffect_shaders.mesp";
+                                      : me::packaged::DataFile("masseffect_shaders.mesp");  // RomFS in an installed NSP
     if (shaders_.Load(lib_path, REXCVAR_GET(masseffect_shaders_index))) {
       masseffect::native::g_active_library = &shaders_;
       BuildLibraryCodeIndex(shaders_);
@@ -765,6 +983,15 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
     }
     if (r < kRegisterCount) registers_[r] = value;  // no side effects through MMIO
+    if (r == kRegCoherBaseHost) {  // masseffect_native_texture_coherency (not expected: D3D uses the ring)
+      me::native::texture_coherency::Mark(value, registers_[kRegCoherSizeHost],
+                                          me::native::texture_coherency::kSourceMmio);
+    }
+    if (r < kRegisterCount && r != kRegCpRbWptr && split_mmio_.load(std::memory_order_acquire)) {
+      // masseffect_native_split_lockstep: the ring re-journals this register's live value at its next sync.
+      if (!mmio_touched_[r].exchange(1, std::memory_order_relaxed)) mmio_distinct_.fetch_add(1, std::memory_order_relaxed);
+      mmio_epoch_.fetch_add(1, std::memory_order_release);
+    }
   }
 
   void NoteGammaRampWrite(uint32_t index, uint32_t value) {
@@ -813,11 +1040,22 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       NoteGammaRampWrite(index, value);
     }
     registers_[index] = value;
+    if (index == kRegCoherBaseHost) {
+      // masseffect_native_texture_coherency: D3D writes SIZE then BASE in one type-0 run (sub_82227210), so the
+      // size is already in place. The WAIT_REG_MEM on the status marks again with the final pair.
+      me::native::texture_coherency::Mark(value, registers_[kRegCoherSizeHost],
+                                          me::native::texture_coherency::kSourceBaseWrite);
+    }
+    if (split_on_) {  // masseffect_native_split_lockstep: journal (the gamma path also advances DC_LUT_RW_INDEX)
+      if (index >= kRegGammaFirst && index <= kRegGammaLast) journal_.Reg(kRegGammaIndex, registers_[kRegGammaIndex]);
+      journal_.Reg(index, value);
+    }
     if (index >= kRegScratch0 && index <= kRegScratch7) {
       const uint32_t n = index - kRegScratch0;
       if ((1u << n) & registers_[kRegScratchUmsk]) {
         rex::memory::store_and_swap<uint32_t>(
             memory_->TranslatePhysical(registers_[kRegScratchAddr] + n * 4), value);
+        if (effects_on_) effects_.Note(me::native::ring_split::kScratch);
       }
     }
   }
@@ -845,6 +1083,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     if (vs) ++gen_constants_vs_;
     if (ps) ++gen_constants_ps_;
     if (fetch) ++gen_fetch_;
+    if (split_on_) journal_.Regs(index, regs + index, count);
   }
 
   // The count guest words (big-endian, as the Reader sees them) at the reader position, if they are contiguous in
@@ -889,6 +1128,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         for (uint32_t k = 0; k < count; ++k) regs[index + k] = __builtin_bswap32(guest[k]);
       }
     }
+    if (split_on_) journal_.Regs(index, regs + index, count);
   }
 
   uint32_t ReadMemory(uint32_t address) const {
@@ -914,6 +1154,26 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     interrupts_.fetch_add(1, std::memory_order_relaxed);
   }
 
+  static uint64_t NowNs() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+  }
+  // masseffect_vblank_adaptive: called by the ring thread while a WAIT_REG_MEM on memory is not met.
+  void RequestEarlyVblank(Clock::time_point start_wait) {
+    const uint64_t interval = vblank_interval_ns_.load(std::memory_order_acquire);
+    const uint64_t last = last_swap_ns_.load(std::memory_order_acquire);
+    if (!interval || !last) return;
+    const uint64_t now = NowNs();
+    // Only for a frame that is already late, only once per Swap, and only after the wait is not trivially short.
+    if (now - last < 2 * interval - 500000 || early_requested_swap_ == swaps_) return;
+    if (Clock::now() - start_wait < std::chrono::microseconds(200)) return;
+    early_requested_swap_ = swaps_;
+    {
+      std::lock_guard<std::mutex> lock(vblank_mutex_);
+      vblank_early_.store(true, std::memory_order_release);
+    }
+    vblank_cv_.notify_one();
+  }
+
   int VblankLoop() {
     rex::system::X_VIDEO_MODE mode;
     rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
@@ -921,15 +1181,31 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     const auto interval =
         std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / hz));
     auto next = Clock::now() + interval;
+    vblank_interval_ns_.store(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count()),
+                              std::memory_order_release);
+    adaptive_vblank_.store(REXCVAR_GET(masseffect_vblank_adaptive), std::memory_order_release);
+    if (adaptive_vblank_.load()) REXLOG_INFO("[native] adaptive VBlank on: late frames fire the VBlank when the GPU waits for it");
     while (active_.load(std::memory_order_acquire)) {
       const auto now = Clock::now();
       if (now - next > std::chrono::milliseconds(250)) next = now;
+      if (vblank_early_.exchange(false, std::memory_order_acq_rel)) {
+        // masseffect_vblank_adaptive: the GPU waits for a late frame's VBlank; fire it now and restart the phase.
+        counter_.fetch_add(1, std::memory_order_relaxed);
+        Interrupt(0, 2);
+        ++vblanks_early_;
+        next = now + interval;
+      }
       while (now >= next) {
         counter_.fetch_add(1, std::memory_order_relaxed);
         Interrupt(0, 2);
         next += interval;
       }
-      if (REXCVAR_GET(masseffect_vblank_sleep_exact)) {
+      if (adaptive_vblank_.load(std::memory_order_relaxed)) {
+        std::unique_lock<std::mutex> lock(vblank_mutex_);
+        vblank_cv_.wait_until(lock, next, [this] {
+          return vblank_early_.load(std::memory_order_acquire) || !active_.load(std::memory_order_acquire);
+        });
+      } else if (REXCVAR_GET(masseffect_vblank_sleep_exact)) {
         // Sleep to the next vblank instead of waking up 1000 times a second (60 of them useful).
         const auto wait = std::chrono::duration_cast<std::chrono::microseconds>(next - Clock::now());
         rex::thread::Sleep(std::clamp(wait, std::chrono::microseconds(200), std::chrono::microseconds(50000)));
@@ -944,11 +1220,25 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   int RingLoop() {
     uint32_t read = 0;
     uint32_t generation = ring_generation_.load(std::memory_order_acquire);
+    namespace partition = me::native::ring_partition;
+    partition::BindThisThread(REXCVAR_GET(masseffect_native_ring_partition));
+    me::native::coherence::Configure(REXCVAR_GET(masseffect_native_coherence_stats),  // frame coherence (measurement)
+                                     uint32_t(REXCVAR_GET(masseffect_native_coherence_every)));
+    if (me::native::coherence::g.on)
+      REXLOG_INFO("[native] frame coherence on (measurement): frame pairs every {} frames, report every 10 s",
+                  me::native::coherence::g.every);
+    if (partition::g_state.on)
+      REXLOG_INFO("[native] ring partition on (measurement): phases every 10 s, ARM counter at {:.1f} MHz",
+                  partition::TicksPerSecond() / 1e6);
+    if (split_on_) SplitSeed();  // the back's copy starts equal to the live registers and microcode
     while (active_.load(std::memory_order_acquire)) {
       {
+        partition::Scope phase_wait(partition::kWait);
         std::unique_lock<std::mutex> lock(ring_mutex_);
         ring_waiting_.store(true, std::memory_order_seq_cst);
-        ring_cv_.wait_for(lock, std::chrono::milliseconds(5), [&] {
+        // Real occlusion queries pending: wake often enough to write their results and time them out.
+        const bool queries = query_mode_ == 2 && targets_ && targets_->QueriesPending();
+        ring_cv_.wait_for(lock, queries ? std::chrono::microseconds(250) : std::chrono::microseconds(5000), [&] {
           const uint32_t words = ring_words_.load(std::memory_order_acquire);
           return !active_.load(std::memory_order_acquire) ||
                  (words && (write_pointer_.load(std::memory_order_seq_cst) & (words - 1)) != read);
@@ -956,7 +1246,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         ring_waiting_.store(false, std::memory_order_relaxed);
       }
       if (!active_.load(std::memory_order_acquire)) break;
-      Report(false);
+      {
+        partition::Scope phase_report(partition::kReport);
+        Report(false);
+      }
+      ServiceQueries(read);
       const uint32_t gen = ring_generation_.load(std::memory_order_acquire);
       if (gen != generation) {
         generation = gen;
@@ -977,14 +1271,36 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         if (!Packet(reader, 0)) break;  // partial packet: the rest comes with the next WPTR
       }
       read = reader.pos;
+      partition::Scope phase_flush(partition::kFlush);
       const uint32_t writeback = read_writeback_.load(std::memory_order_acquire);
+      if (split_on_) SplitSync();  // end of segment: the journal never outgrows one segment
       if (writeback) {
         rex::memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(writeback), read);
+        if (effects_on_) effects_.Note(me::native::ring_split::kReadPointer);
       }
       NotifyRingProgress();
       masseffect::native::deferred::Flush();  // Batched mode: the worker must not wait for the next WPTR
+      ServiceQueries(read);
     }
     return 0;
+  }
+
+  // Real occlusion queries: results of finished submissions, an early submission when the ring is idle, and
+  // the timeout. Idle = everything the game has written to the ring is parsed.
+  void ServiceQueries(uint32_t read) {
+    if (query_mode_ < 2 || !targets_ || !targets_->QueriesPending()) return;
+    if (query_mode_ == 3) {
+      // Latency-1: only fold the results of finished submissions into the history (fence polls, no waiting, no
+      // early submission, no timeout), at most once per millisecond.
+      const auto now = std::chrono::steady_clock::now();
+      if (now - query_serviced_ < std::chrono::microseconds(1000)) return;
+      query_serviced_ = now;
+      targets_->QueryService(false, 0, 0);
+      return;
+    }
+    const uint32_t words = ring_words_.load(std::memory_order_acquire);
+    const bool idle = !words || (write_pointer_.load(std::memory_order_acquire) & (words - 1)) == read;
+    targets_->QueryService(idle && query_flush_us_ >= 0, uint32_t(std::max(0, query_flush_us_)), query_timeout_us_);
   }
 
   // --- PM4 ---
@@ -1015,6 +1331,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         ++type0_packets_;
         type0_words_ += count;
         type0_single_ += single;
+        me::native::ring_partition::Scope phase(me::native::ring_partition::kRegisters);
         if (single) {
           for (uint32_t i = 0; i < count; ++i) WriteRegister(index, data.Read());
         } else if (const uint32_t* words = pm4_fast_ ? ContiguousWords(data, count) : nullptr) {
@@ -1065,10 +1382,25 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
       return;
     }
+    namespace partition = me::native::ring_partition;
+    uint32_t phase = partition::kNone;
+    switch (opcode) {
+      case xenos::PM4_SET_CONSTANT:
+      case xenos::PM4_SET_CONSTANT2:
+      case xenos::PM4_SET_SHADER_CONSTANTS:
+      case xenos::PM4_LOAD_ALU_CONSTANT: phase = partition::kRegisters; break;
+      case xenos::PM4_IM_LOAD:
+      case xenos::PM4_IM_LOAD_IMMEDIATE: phase = partition::kShaderLoad; break;
+      case xenos::PM4_WAIT_REG_MEM: phase = partition::kWaitRegMem; break;
+      case xenos::PM4_XE_SWAP: phase = partition::kPresent; break;
+      default: break;
+    }
+    partition::Scope phase_packet(phase);
     switch (opcode) {
       case xenos::PM4_INTERRUPT: {
         if (words < 1) break;
         const uint32_t cpus = data.Read();
+        if (effects_on_) effects_.Note(me::native::ring_split::kInterrupt);
         for (uint32_t cpu = 0; cpu < 6; ++cpu) {
           if (cpus & (1u << cpu)) Interrupt(1, cpu);
         }
@@ -1082,7 +1414,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           swap_height_ = data.Read();
         }
         ++swaps_;
+        if (me::native::coherence::g.on) CoherenceEndFrame();  // frame coherence
         counter_.fetch_add(1, std::memory_order_relaxed);
+        last_swap_ns_.store(NowNs(), std::memory_order_release);
+        if (effects_on_) effects_.BackWork();
         Present();
         break;
       case xenos::PM4_INDIRECT_BUFFER:
@@ -1104,10 +1439,17 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       case xenos::PM4_WAIT_REG_MEM: {
         if (words < 5) break;
         const uint32_t info = data.Read(), poll = data.Read(), ref = data.Read(), mask = data.Read();
-        const auto limit = Clock::now() + kWaitRegMemMax;
+        const auto start_wait = Clock::now();
+        const auto limit = start_wait + kWaitRegMemMax;
+        const int32_t spin_us = REXCVAR_GET(masseffect_native_waitregmem_spin_us);
+        bool waited = false;
         for (;;) {
           if (!(info & 0x10) && poll == kRegCoherStatusHost && (registers_[poll] & 0x80000000u)) {
+            // masseffect_native_texture_coherency: the range the game declared changed (no-op when off).
+            me::native::texture_coherency::Mark(registers_[kRegCoherBaseHost], registers_[kRegCoherSizeHost],
+                                                me::native::texture_coherency::kSourceWait);
             registers_[poll] = 0;  // MakeCoherent: no shared memory to synchronize
+            if (split_on_) journal_.Reg(poll, 0);
           }
           const uint32_t value = (info & 0x10) ? ReadMemory(poll) : Register(poll);
           if (Compare(info, value & mask, ref)) break;
@@ -1118,7 +1460,19 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
             }
             break;
           }
-          rex::thread::Sleep(std::chrono::microseconds(50));
+          waited = true;
+          if ((info & 0x10) && adaptive_vblank_.load(std::memory_order_relaxed)) RequestEarlyVblank(start_wait);
+          if (spin_us > 0 && Clock::now() - start_wait < std::chrono::microseconds(spin_us)) {
+            std::this_thread::yield();
+          } else {
+            rex::thread::Sleep(std::chrono::microseconds(50));
+          }
+        }
+        if (effects_on_)
+          effects_.Note((info & 0x10) ? me::native::ring_split::kWaitMemory : me::native::ring_split::kWaitRegister);
+        if (REXCVAR_GET(masseffect_native_waitregmem_stats)) {
+          NoteWaitRegMem(info, poll, ref, mask, waited,
+                         uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start_wait).count()));
         }
         break;
       }
@@ -1134,12 +1488,14 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       case xenos::PM4_REG_TO_MEM: {
         if (words < 2) break;
         const uint32_t reg = data.Read(), address = data.Read();
+        if (effects_on_) effects_.Note(me::native::ring_split::kRegToMem);
         WriteMemory(address, Register(reg));
         break;
       }
       case xenos::PM4_MEM_WRITE: {
         if (words < 1) break;
         uint32_t address = data.Read();
+        if (effects_on_) effects_.Note(me::native::ring_split::kMemWrite);
         for (uint32_t i = 1; i < words; ++i, address += 4) WriteMemory(address, data.Read());
         break;
       }
@@ -1150,6 +1506,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         const uint32_t v = (info & 0x10) ? ReadMemory(poll) : Register(poll);
         if (Compare(info, v & mask, ref)) {
           if (info & 0x100) {
+            if (effects_on_) effects_.Note(me::native::ring_split::kCondWriteMemory);
             WriteMemory(dest, value);
           } else {
             WriteRegister(dest, value);
@@ -1165,6 +1522,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         if (words < 3) break;
         const uint32_t initiator = data.Read(), address = data.Read(), value = data.Read();
         WriteRegister(kRegVgtEventInitiator, initiator & 0x3F);
+        if (effects_on_) effects_.Note(me::native::ring_split::kFence);
         WriteMemory(address, ((initiator >> 31) & 0x1) ? counter_.load(std::memory_order_relaxed)
                                                        : value);
         // The D3D fence word the game's wait loop compares (sub_8222C768 / sub_8222FA98): wake it now, not
@@ -1176,6 +1534,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         if (words < 2) break;
         const uint32_t initiator = data.Read(), address = data.Read();
         WriteRegister(kRegVgtEventInitiator, initiator & 0x3F);
+        if (effects_on_) effects_.Note(me::native::ring_split::kEventWriteExt);
         const uint16_t extent[] = {0, kExtentMax, 0, kExtentMax, 0, 1};
         uint8_t* dest = memory_->TranslatePhysical(address & ~3u);
         for (size_t i = 0; i < std::size(extent); ++i) {
@@ -1189,21 +1548,34 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         // D3D9 occlusion queries on Xbox 360:
         // Issue(D3DISSUE_BEGIN): RB_SAMPLE_COUNT_ADDR points to query->begin (+0x20).
         // Issue(D3DISSUE_END):   RB_SAMPLE_COUNT_ADDR points to query->end   (+0x00).
-        // D3D places the byte-swapped sentinel 0xFFFFFEED in the end structure before EVENT_WRITE_ZPD.
+        // D3D places the byte-swapped sentinel 0xFFFFFEED in the end structure at Issue(BEGIN), on the CPU.
+        // GetData: not finished while end words 0..3 all hold it; result = end ZPass - begin ZPass.
         const uint32_t address = Register(kRegRbSampleCountAddr);
         if (address) {
           auto* counts =
               memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(address);
           const uint32_t finished = rex::byte_swap(uint32_t(0xFFFFFEED));
-          const bool end = counts->ZPass_A == finished || counts->ZPass_B == finished ||
-                           counts->ZFail_A == finished || counts->ZFail_B == finished;
-          std::memset(counts, 0, sizeof(*counts));
-          // SDK fallback: begin = 0, end = 1000 samples.
-          if (end) counts->Total_A = counts->ZPass_A = 1000;
+          bool end = counts->ZPass_A == finished || counts->ZPass_B == finished ||
+                     counts->ZFail_A == finished || counts->ZFail_B == finished ||
+                     counts->Total_A == finished || counts->Total_B == finished;
+          // D3D stores the sentinel at Issue(BEGIN) (sub_82228F58 in the English edition), on the CPU. If the game
+          // issues the same query object again before this thread has parsed the previous END, writing that
+          // result (modes 0, 1, 3) erases the new sentinel: the new END then looked like a BEGIN and its end
+          // structure was zeroed (GetData: 0 samples, UE3 culls the primitive or light). Pair by address instead:
+          // the open query's begin structure is its end + 0x20 (a BEGIN at that end address would need another
+          // query structure overlapping this one).
+          // Counted also with the pairing off (then they are the ENDs taken for BEGINs).
+          if (!end && query_open_ && address + 0x20 == query_open_begin_) {
+            ++query_end_by_address_;
+            end = query_pair_by_address_;
+          }
+          if (effects_on_) effects_.Note(end ? me::native::ring_split::kQueryEnd : me::native::ring_split::kQueryBegin);
+          ZpdQuery(address, end);
           static uint32_t query_reports = 0;
           if (query_reports++ < 30) {
-            REXLOG_INFO("[native] ZPD {} at {:08X}: {} samples", end ? "end" : "begin", address,
-                        uint32_t(counts->ZPass_A));
+            REXLOG_INFO("[native] ZPD {} at {:08X} (mode {}): {} samples{}", end ? "end" : "begin", address,
+                        query_mode_, uint32_t(counts->ZPass_A),
+                        end && counts->Total_A == finished ? " (pending)" : "");
           }
         }
         break;
@@ -1284,17 +1656,28 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         }
         if ((Register(kRegRbModeControl) & 0x7) == uint32_t(xenos::EdramMode::kCopy)) {
           ++copies_;
+          if (effects_on_) effects_.BackWork();
+          partition::Scope phase_copy(partition::kCopy);
           Copy();
         } else {
           ++draws_;
+          if (effects_on_) effects_.Draw();
           if (depth > 0) ++draws_indirect_;
-          PairDraw();
+          if (query_open_) ++query_draws_;
+          if (me::native::coherence::Recording()) me::native::coherence::BeginDraw();  // frame coherence
+          {
+            partition::Scope phase_pair(partition::kPair);
+            PairDraw();
+          }
           if (draw_vs_ && (draw_ps_ || (Register(kRegRbModeControl) & 0x7) == 5)) {
+            partition::Scope phase_draw(partition::kDrawFront);
             Draw();
           } else {
             ++draws_unidentified_;
             ++missing_draw_pairs_[{draw_vs_ ? 0 : current_vs_hash_, draw_ps_ ? 0 : current_ps_hash_}];
+            if (REXCVAR_GET(masseffect_diag_missing_shader_draws)) LogMissingShaderDraw();
           }
+          if (me::native::coherence::Recording()) CoherenceEndDraw();  // frame coherence
         }
         break;
       }
@@ -1306,11 +1689,24 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         const uint8_t* src = memory_->TranslatePhysical(address_type & ~3u);
         const uint32_t load_type = address_type & 0x3;
         if (raw_microcode_ && load_type <= 1 && ReloadsSameMicrocode(load_type, src, size)) break;
+        if (load_memo_ && load_type <= 1 && LoadFromMemo(load_type, src, size)) {
+          if (raw_microcode_) {  // as below: the stage's microcode equals this load
+            auto& raw = load_type == 1 ? raw_ps_ : raw_vs_;
+            raw.assign(reinterpret_cast<const uint32_t*>(src), reinterpret_cast<const uint32_t*>(src) + size);
+            (load_type == 1 ? raw_ps_valid_ : raw_vs_valid_) = true;
+          }
+          break;
+        }
         microcode_.resize(size);
         for (uint32_t i = 0; i < size; ++i) {
           microcode_[i] = rex::memory::load_and_swap<uint32_t>(src + size_t(i) * 4);
         }
+        identify_hashed_ = false;
         IdentifyShader(load_type);
+        if (load_memo_ && load_type <= 1 && identify_hashed_) {
+          load_memo_->Store(load_type, im_load_address_, microcode_, identify_hash_,
+                            load_type == 1 ? ps_identity_generation_ : vs_identity_generation_);
+        }
         if (raw_microcode_ && load_type <= 1) {
           // Every path of IdentifyShader leaves the stage's microcode equal to this load: keep its raw words.
           auto& raw = load_type == 1 ? raw_ps_ : raw_vs_;
@@ -1352,7 +1748,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   }
 
   bool ComputeVertexIdentity(const masseffect::native::ShaderEntry* candidate) const {
-    return VertexShaderIdentityMatches(
+    return VertexShaderProgramMatches(
         {ShaderIdentityStage::Vertex, vs_microcode_},
         {candidate->vertices ? ShaderIdentityStage::Vertex : ShaderIdentityStage::Pixel, candidate->microcode},
         candidate->elements, [](const auto& element) { return element.instruction; });
@@ -1429,7 +1825,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     auto& cached = vs_identity_cache_[candidate];
     if (cached.first != vs_identity_generation_) {
       cached.first = vs_identity_generation_;
-      cached.second = VertexShaderIdentityMatches(
+      cached.second = VertexShaderProgramMatches(
           {ShaderIdentityStage::Vertex, vs_microcode_},
           {candidate->vertices ? ShaderIdentityStage::Vertex : ShaderIdentityStage::Pixel,
            candidate->microcode}, candidate->elements,
@@ -1459,6 +1855,13 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                 current_vs_hash_, vs_microcode_.size(), candidate.number, count, declared, diffs);
   }
   std::unordered_set<uint64_t> vs_diff_logged_;
+
+  // masseffect_native_mismatch_log_info: the periodic mismatch lines (after the first 32) at info level, so they do
+  // not flush the log file to the SD card on the ring thread (the logger flushes on warn).
+  static spdlog::level::level_enum MismatchLevel(uint64_t mismatch) {
+    static const bool info = REXCVAR_GET(masseffect_native_mismatch_log_info);
+    return info && mismatch > 32 ? spdlog::level::info : spdlog::level::warn;
+  }
 
   bool AcceptVertexShaderIdentity(const masseffect::native::ShaderEntry* candidate,
                                   const char* provenance) {
@@ -1546,7 +1949,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     if (mismatch <= 32 || (mismatch & 255) == 0) {
       const uint64_t selected_hash = XXH3_64bits(candidate->microcode.data(),
                                                 candidate->microcode.size() * sizeof(uint32_t));
-      REXLOG_WARN("[native] VS identity mismatch {} draw={} packet={:08X} "
+      REX_LOG_IMPL(::rex::log::core(), MismatchLevel(mismatch), "[native] VS identity mismatch {} draw={} packet={:08X} "
                   "provenance={} loaded_host_hash={:016X} loaded_words={} selected_n={} "
                   "selected_stage={} selected_normalized_host_hash={:016X} selected_words={} "
                   "selected_container={:016X}",
@@ -1578,7 +1981,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     if (mismatch <= 32 || (mismatch & 255) == 0) {
       const uint64_t selected_hash = XXH3_64bits(candidate->microcode.data(),
                                                 candidate->microcode.size() * sizeof(uint32_t));
-      REXLOG_WARN("[native] PS identity mismatch {} draw={} packet={:08X} "
+      REX_LOG_IMPL(::rex::log::core(), MismatchLevel(mismatch), "[native] PS identity mismatch {} draw={} packet={:08X} "
                   "provenance={} loaded_host_hash={:016X} loaded_words={} selected_n={} "
                   "selected_stage={} selected_host_hash={:016X} selected_words={} "
                   "selected_container={:016X}",
@@ -1618,6 +2021,134 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     return true;
   }
 
+  // The identity memo hit of IdentifyShader: the stage takes these words, hash and entry.
+  // generation: 0 = a new one; otherwise the generation these exact words had when they were stored in the load
+  // memo (masseffect_native_load_memo_generation).
+  void ApplyMemoHit(uint32_t type, const std::vector<uint32_t>& words, uint64_t memo_hash,
+                    const masseffect::native::ShaderEntry* entry, uint64_t generation = 0) {
+    ++microcode_epoch_[type == 1 ? 1 : 0];  // masseffect_native_split_lockstep
+    if (type == 1) {
+      ps_microcode_ = words;
+      NewIdentityGeneration(ps_identity_generation_, generation);
+      current_ps_hash_ = memo_hash;
+      ps_ = entry;
+    } else {
+      vs_microcode_ = words;
+      current_vs_hash_ = memo_hash;
+      NewIdentityGeneration(vs_identity_generation_, generation);
+      vs_ = entry;
+      vs_patched_ = entry && !vs_patched_hashes_.empty() && vs_patched_hashes_.count(memo_hash) != 0;
+      gen_vs_ = ++gen_microcode_;
+    }
+    ++shaders_identified_;
+    ++identity_memo_hits_;
+  }
+
+  // masseffect_native_load_memo: IdentifyShader for a load whose raw words equal the last load from the same
+  // address and size (me_shader_load_memo.h), without the byte swap and the XXH3. It takes exactly the branches
+  // IdentifyShader would take (repeated identity, then the identity memo) and returns false, having changed
+  // nothing, when IdentifyShader would go further (memo miss): the caller then runs the usual path.
+  bool LoadFromMemo(uint32_t type, const uint8_t* src, uint32_t size) {
+    if (!im_load_address_) return false;  // address 0: never stored
+    const ShaderLoadMemo::Slot* slot = load_memo_->Find(type, im_load_address_, src, size);
+    if (!slot) return false;
+    if (check_load_memo_ > 0) {
+      --check_load_memo_;
+      bool equal = slot->swapped.size() == size;
+      for (uint32_t i = 0; equal && i < size; ++i)
+        equal = slot->swapped[i] == rex::memory::load_and_swap<uint32_t>(src + size_t(i) * 4);
+      if (!equal || XXH3_64bits(slot->swapped.data(), size_t(size) * sizeof(uint32_t)) != slot->memo_hash) {
+        REXLOG_ERROR("[native] DIFFERENCE: shader load memo ({} words, type {}, address {:08X}) does not match "
+                     "the swapped words or their hash; the old path from now on", size, type, im_load_address_);
+        load_memo_.reset();
+        return false;
+      }
+    }
+    if (REXCVAR_GET(masseffect_native_repeated_identity)) {
+      const auto& previous = type == 1 ? ps_microcode_ : vs_microcode_;
+      const auto* previous_entry = type == 1 ? ps_ : vs_;
+      if (previous_entry && previous.size() == size &&
+          (type == 1 ? last_ps_load_address_ : last_vs_load_address_) == im_load_address_ &&
+          std::memcmp(previous.data(), slot->swapped.data(), size_t(size) * sizeof(uint32_t)) == 0) {
+        ++shader_loads_reused_;
+        return true;
+      }
+    }
+    if (!REXCVAR_GET(masseffect_native_identity_memo)) return false;
+    const uint64_t memo_key = slot->memo_hash ^ (uint64_t(type) << 63) ^ (uint64_t(size) << 40);
+    const auto it = identity_memo_.find(memo_key);
+    if (it == identity_memo_.end()) return false;
+    (type == 1 ? last_ps_load_address_ : last_vs_load_address_) = im_load_address_;
+    ApplyMemoHit(type, slot->swapped, slot->memo_hash, it->second,
+                 load_memo_generation_ ? slot->generation : 0);
+    ++load_memo_hits_;
+    return true;
+  }
+
+  /*
+   * The identity cells (MatchesVertexShaderIdentity, MatchesPixelShaderIdentity, FetchCoherent) are memoized per
+   * stage "generation", and their results are pure functions of (candidate, stage microcode). By default every
+   * load that is not an identical reload takes a new generation, so a draw sequence A, B, A recomputes the word
+   * compares of A's candidates although A's words are back. masseffect_native_load_memo_generation: generations
+   * come from one counter (always fresh, never reused for other words), and a load memo hit restores the
+   * generation its words had when they were stored: the slot's words are, word for word, the words the stage held
+   * under that generation (Find compared them), so every cell computed under it is still right.
+   */
+  void NewIdentityGeneration(uint64_t& stage_generation, uint64_t restored) {
+    if (!load_memo_generation_) {
+      ++stage_generation;
+      return;
+    }
+    stage_generation = restored ? restored : ++identity_generation_counter_;
+  }
+
+  // masseffect_diag_missing_shader_draws: what a draw dropped for a missing VS/PS would have drawn, and the
+  // exact words of the missing program (host order, the same words MASSEFFECT_SHADER_DISCOVERY writes).
+  // Ring thread only; the sets are bounded by the two *_max cvars (0 = one entry per distinct state/program).
+  void LogMissingShaderDraw() {
+    namespace gr = rex::graphics;
+    const uint32_t initiator = Register(kRegVgtDrawInitiator);
+    const uint32_t* fetch = registers_.data() + kRegFetchFirst;  // texture fetch constant 0 (6 words)
+    const uint32_t color_info = Register(gr::XE_GPU_REG_RB_COLOR_INFO);
+    const uint32_t state[] = {
+        initiator & 0xFFFF, Register(kRegRbModeControl), Register(gr::XE_GPU_REG_RB_COLOR_MASK),
+        Register(gr::XE_GPU_REG_RB_BLENDCONTROL0), Register(gr::XE_GPU_REG_RB_COLORCONTROL),
+        Register(gr::XE_GPU_REG_RB_DEPTHCONTROL), Register(gr::XE_GPU_REG_RB_STENCILREFMASK), color_info,
+        Register(gr::XE_GPU_REG_RB_SURFACE_INFO), fetch[1] & 0x3F, fetch[2]};
+    const uint64_t key = XXH3_64bits(state, sizeof(state)) ^ current_vs_hash_ ^ (current_ps_hash_ << 1) ^
+                         (draw_vs_ ? 1 : 0) ^ (draw_ps_ ? 2 : 0);
+    static std::unordered_set<uint64_t> states_seen;
+    const size_t states_max = size_t(REXCVAR_GET(masseffect_diag_missing_shader_states_max));
+    if ((!states_max || states_seen.size() < states_max) && states_seen.insert(key).second) {
+      REXLOG_INFO("[native] missing shader draw: VS {:016X}{} ({} words) PS {:016X}{} ({} words) | prim {} count {} "
+                  "mode {} | color mask {:04X} blend0 {:08X} colorcontrol {:08X} alpha ref {:08X} | depthcontrol "
+                  "{:08X} stencil {:08X} | color info {:08X} surface {:08X} | tex0 format {} {}x{} base {:08X} "
+                  "words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} | draw {}",
+                  current_vs_hash_, draw_vs_ ? " found" : " MISSING", vs_microcode_.size(), current_ps_hash_,
+                  draw_ps_ ? " found" : " MISSING", ps_microcode_.size(), initiator & 0x3F, initiator >> 16,
+                  Register(kRegRbModeControl) & 7, Register(gr::XE_GPU_REG_RB_COLOR_MASK),
+                  Register(gr::XE_GPU_REG_RB_BLENDCONTROL0), Register(gr::XE_GPU_REG_RB_COLORCONTROL),
+                  Register(gr::XE_GPU_REG_RB_ALPHA_REF), Register(gr::XE_GPU_REG_RB_DEPTHCONTROL),
+                  Register(gr::XE_GPU_REG_RB_STENCILREFMASK), color_info, Register(gr::XE_GPU_REG_RB_SURFACE_INFO),
+                  fetch[1] & 0x3F, (fetch[2] & 0x1FFF) + 1, ((fetch[2] >> 13) & 0x1FFF) + 1,
+                  fetch[1] & 0xFFFFF000u, fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5], draws_);
+    }
+    static std::unordered_set<uint64_t> programs_seen;
+    auto dump = [&](bool vertex, uint64_t hash, const std::vector<uint32_t>& words) {
+      const size_t programs_max = size_t(REXCVAR_GET(masseffect_diag_missing_shader_programs_max));
+      if ((programs_max && programs_seen.size() >= programs_max) ||
+          !programs_seen.insert(hash ^ (vertex ? 1 : 0)).second) return;
+      for (size_t first = 0; first < words.size(); first += 16) {
+        std::string line;
+        for (size_t i = first; i < words.size() && i < first + 16; ++i) line += fmt::format(" {:08X}", words[i]);
+        REXLOG_INFO("[native] missing shader microcode {} {:016X} {} words [{}]:{}", vertex ? "VS" : "PS", hash,
+                    words.size(), first, line);
+      }
+    };
+    if (!draw_vs_) dump(true, current_vs_hash_, vs_microcode_);
+    if (!draw_ps_ && (Register(kRegRbModeControl) & 0x7) != 5) dump(false, current_ps_hash_, ps_microcode_);
+  }
+
   void IdentifyShader(uint32_t type) {
     if (type > 1) return;
     // The same program reloaded from the same address (D3D re-sends it for most draws): keep the identified
@@ -1636,36 +2167,26 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     // Memo by content (masseffect_native_identity_memo): the same program loaded again after others, from any
     // address, gets the entry identified before; the draw-time guard still checks it against this microcode.
     const uint64_t memo_hash = XXH3_64bits(microcode_.data(), microcode_.size() * sizeof(uint32_t));
+    identify_hashed_ = true;  // masseffect_native_load_memo: this load's hash may be kept by address
+    identify_hash_ = memo_hash;
     const uint64_t memo_key = memo_hash ^ (uint64_t(type) << 63) ^ (uint64_t(microcode_.size()) << 40);
     if (REXCVAR_GET(masseffect_native_identity_memo)) {
       const auto it = identity_memo_.find(memo_key);
       if (it != identity_memo_.end()) {
-        if (type == 1) {
-          ps_microcode_ = microcode_;
-          ++ps_identity_generation_;
-          current_ps_hash_ = memo_hash;
-          ps_ = it->second;
-        } else {
-          vs_microcode_ = microcode_;
-          current_vs_hash_ = memo_hash;
-          ++vs_identity_generation_;
-          vs_ = it->second;
-          gen_vs_ = ++gen_microcode_;
-        }
-        ++shaders_identified_;
-        ++identity_memo_hits_;
+        ApplyMemoHit(type, microcode_, memo_hash, it->second);
         return;
       }
     }
+    ++microcode_epoch_[type == 1 ? 1 : 0];  // masseffect_native_split_lockstep
     if (type == 1) {
       ps_microcode_ = microcode_;
-      ++ps_identity_generation_;
+      NewIdentityGeneration(ps_identity_generation_, 0);
       current_ps_hash_ = memo_hash;
     } else {
       // Identity checks below must see THIS IM_LOAD, not the previous VS load.
       vs_microcode_ = microcode_;
       current_vs_hash_ = memo_hash;
-      ++vs_identity_generation_;
+      NewIdentityGeneration(vs_identity_generation_, 0);
     }
     // A VS address identifies the object, not necessarily the variant currently in the ring: D3D
     // rewrites vertex fetches for each declaration. Prefer the actual loaded microcode (exact, then
@@ -1683,9 +2204,12 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
       // Guard OFF is permission for a last-resort legacy fallback, not for a
       // stale fast/address candidate to hide a proven current program.
+      const masseffect::native::ShaderEntry* patched_entry = nullptr;
       if (!MatchesVertexShaderIdentity(entry) && shaders_.loaded()) {
-        const auto* matched = shaders_.Identify(true, microcode_);
+        bool patched = false;
+        const auto* matched = shaders_.Identify(true, microcode_, &patched);
         entry = PreferVertexShaderCandidate(entry, matched, "identify-library");
+        if (patched && entry == matched) patched_entry = matched;
       }
       if (by_address && (!entry || (!MatchesVertexShaderIdentity(entry) &&
                                    MatchesVertexShaderIdentity(by_address))) &&
@@ -1695,6 +2219,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
       if (entry == by_address && entry) ++shaders_by_address_;
       else if (entry) ++shaders_by_code_;
+      // masseffect_native_vs_identify_patched: remember the programs only the second-stage lookup found, so the
+      // draws they draw are counted (identity memo hits take the flag from this set, ApplyMemoHit).
+      vs_patched_ = entry && entry == patched_entry;
+      if (vs_patched_ && vs_patched_hashes_.size() < 4096) vs_patched_hashes_.insert(memo_hash);
     } else {
       if (by_address &&
           AcceptPixelShaderIdentity(by_address, "identify-address")) {
@@ -2060,6 +2588,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       const int64_t area = int64_t(r[2] - r[0]) * (r[3] - r[1]);
       if (area > best_area) { best_area = area; best = r; }
       const auto& b = one.edram_bounds_rect ? *one.edram_bounds_rect : r;
+      request.edram_bounds_rects[k] = b;
       if (!bounds) bounds = b;
       else bounds = std::array<int32_t, 4>{std::min((*bounds)[0], b[0]), std::min((*bounds)[1], b[1]),
                                            std::max((*bounds)[2], b[2]), std::max((*bounds)[3], b[3])};
@@ -2226,7 +2755,136 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   }
 
   std::array<uint64_t, 6> overwrite_rejects_{};  // discard, sample mask, empty rect, depth/stencil, no slot, ok
+  // A draw inside an occlusion query that cannot change any pixel: no color writes (depth-only mode, or every
+  // render target masked off), no depth writes and no stencil test (a stencil test may write stencil).
+  bool QueryDrawInert() const {
+    const uint32_t mode = Register(rex::graphics::XE_GPU_REG_RB_MODECONTROL) & 0x7;
+    const bool color = mode == uint32_t(xenos::EdramMode::kColorDepth) &&
+                       (Register(rex::graphics::XE_GPU_REG_RB_COLOR_MASK) & 0xFFFF) != 0;
+    const uint32_t dc = Register(rex::graphics::XE_GPU_REG_RB_DEPTHCONTROL);
+    const bool depth_write = (dc & 0x2) && (dc & 0x4);
+    const bool stencil = dc & 0x1;
+    return (mode == uint32_t(xenos::EdramMode::kColorDepth) || mode == 5) && !color && !depth_write && !stencil;
+  }
+
+  // Query mode 3: folds this draw into the open query's identity. The identity is the content of the position
+  // stream (UE3 draws its query boxes from world-space corners: stable for a static primitive whatever the
+  // camera and whichever pooled query object carries it), the draw initiator, the vertex shader and the target.
+  // A draw whose position fetch cannot be read leaves the query without identity ("visible").
+  void QuerySignDraw() {
+    if (!query_sign_ok_) return;
+    query_sign_ok_ = false;
+    const masseffect::native::ShaderEntry* vs = draw_vs_;
+    if (!vs || vs->elements.empty()) return;
+    const masseffect::native::ElementVertex* position = &vs->elements.front();
+    for (const auto& element : vs->elements) {
+      if (element.usage == 0) {  // D3DDECLUSAGE_POSITION
+        position = &element;
+        break;
+      }
+    }
+    const size_t q = size_t(position->instruction) * 3;
+    if (q + 2 >= vs_microcode_.size()) return;
+    const uint32_t d0 = vs_microcode_[q], d1 = vs_microcode_[q + 1];
+    if ((d0 & 0x1F) != 0 || ((d1 >> 30) & 0x1)) return;  // not a full vertex fetch (mini fetches are skipped)
+    const uint32_t slot = ((d0 >> 20) & 0x1F) * 3 + ((d0 >> 25) & 0x3);
+    if (slot >= 96) return;
+    const uint32_t f0 = Register(kRegFetchFirst + slot * 2), f1 = Register(kRegFetchFirst + slot * 2 + 1);
+    if ((f0 & 0x3) != 3) return;  // FetchConstantType::kVertex
+    const uint32_t base = f0 & 0x1FFFFFFCu;
+    const uint32_t bytes = std::min<uint32_t>(((f1 >> 2) & 0xFFFFFF) * 4, kQuerySignBytes);
+    if (!base || !bytes || uint64_t(base) + bytes > 0x20000000ull) return;
+    const uint8_t* data = memory_ ? memory_->TranslatePhysical(base) : nullptr;
+    if (!data) return;
+    const uint64_t vertices = XXH3_64bits(data, bytes);
+    const uint64_t state[6] = {query_signature_,
+                               vertices,
+                               Register(kRegVgtDrawInitiator),
+                               vs->fingerprint,
+                               Register(rex::graphics::XE_GPU_REG_RB_DEPTH_INFO),
+                               Register(rex::graphics::XE_GPU_REG_RB_SURFACE_INFO)};
+    query_signature_ = XXH3_64bits(state, sizeof(state));
+    ++query_signed_;
+    query_sign_ok_ = true;
+    if (query_sign_logged_ < 16) {
+      ++query_sign_logged_;
+      REXLOG_INFO("[native] query box draw (mode 3): position fetch slot {} at {:08X}, {} bytes hashed, initiator "
+                  "{:08X}, VS n{}, content {:016X}",
+                  slot, base, bytes, Register(kRegVgtDrawInitiator), vs->number, vertices);
+    }
+  }
+
+  // EVENT_WRITE_ZPD of a D3D9 occlusion query (masseffect_native_query_mode).
+  void ZpdQuery(uint32_t address, bool end) {
+    uint8_t* guest = memory_->TranslatePhysical(address);
+    if (!end) {
+      // Begin structure: zero (the result is end - begin). A result still pending for the end structure of
+      // the same query object (begin = end + 0x20) must not land on the new issue.
+      std::memset(guest, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
+      if (targets_) targets_->QueryForget(address - 0x20);
+      if (query_open_) ++query_unended_;
+      query_open_ = true;
+      query_open_begin_ = address;
+      query_draws_ = 0;
+      query_signature_ = 0x6F63636C75736E31ull;  // seed
+      query_signed_ = 0;
+      query_sign_ok_ = true;
+      ++query_begun_;
+      if (query_mode_ >= 2 && targets_) targets_->QueryBegin();
+      return;
+    }
+    if (!query_open_) ++query_unbegun_;
+    query_open_ = false;
+    query_open_begin_ = 0;
+    ++query_ended_;
+    query_draws_total_ += query_draws_;
+    if (targets_) targets_->QueryForget(address);
+    if (query_mode_ == 1) {
+      masseffect::native::WriteOcclusionCounts(guest, 0);
+      return;
+    }
+    if (query_mode_ == 3) {
+      // Latency-1: answered now from the history of the same identity; the GPU measures this issue for the next.
+      uint64_t content = 0, key = 0;
+      if (query_sign_ok_ && query_draws_ && query_signed_ == query_draws_) {
+        content = query_signature_ | 1;  // 0 means "no identity"
+        if (query_history_key_ == 0) {
+          const uint64_t mixed[2] = {content, address};
+          key = XXH3_64bits(mixed, sizeof(mixed)) | 1;
+        } else if (query_history_key_ == 1) {
+          key = content;
+        }
+      }
+      if (query_history_key_ == 2) key = (uint64_t(1) << 32) | address;  // address only, even without content
+      const uint32_t answer =
+          targets_ ? targets_->QueryEndLatent(address, key, content, query_draws_, query_scale_, kQueryVisible,
+                                              query_max_age_, query_hidden_after_)
+                   : (query_draws_ ? kQueryVisible : 0u);
+      masseffect::native::WriteOcclusionCounts(guest, answer);
+      return;
+    }
+    if (query_mode_ == 2 && targets_ && targets_->QueryEnd(address, query_draws_, query_scale_, kQueryVisible)) {
+      return;  // the sentinel stays until the GPU result (or the timeout) is written
+    }
+    if (query_mode_ == 2) ++query_fallbacks_now_;
+    masseffect::native::WriteOcclusionCounts(guest, kQueryVisible);  // SDK fallback: 1000 samples
+  }
+
   void Draw() {
+    if (query_open_ && query_mode_ < 2 && query_skip_boxes_ && QueryDrawInert()) {
+      ++query_boxes_skipped_;
+      return;
+    }
+    if (query_open_ && query_logged_draws_ < 24) {
+      ++query_logged_draws_;
+      REXLOG_INFO("[native] draw inside an occlusion query: mode control {} color mask {:04X} depth control "
+                  "{:08X} surface {:08X} depth info {:08X} inert {}",
+                  Register(rex::graphics::XE_GPU_REG_RB_MODECONTROL) & 0x7,
+                  Register(rex::graphics::XE_GPU_REG_RB_COLOR_MASK) & 0xFFFF,
+                  Register(rex::graphics::XE_GPU_REG_RB_DEPTHCONTROL),
+                  Register(rex::graphics::XE_GPU_REG_RB_SURFACE_INFO),
+                  Register(rex::graphics::XE_GPU_REG_RB_DEPTH_INFO), QueryDrawInert());
+    }
     if (!MatchesVertexShaderIdentity(draw_vs_) && MatchesVertexShaderIdentity(vs_))
       draw_vs_ = PreferVertexShaderCandidate(draw_vs_, vs_, "draw-final-ring-preference");
     if (draw_vs_ && !AcceptVertexShaderIdentity(draw_vs_, "draw-final")) {
@@ -2234,7 +2892,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       draw_vs_ = vs_ && AcceptVertexShaderIdentity(vs_, "draw-final-ring") ? vs_ : nullptr;
       if (!draw_vs_) { ++draws_unidentified_; return; }
     }
+    if (query_open_ && query_mode_ == 3) QuerySignDraw();
     if (!EnsureTargets()) return;
+    if (vs_patched_ && draw_vs_ == vs_) ++draws_vs_patched_;
     // Candidate warnings include discarded object/queue alternatives. Count
     // the actual final selection separately, without changing rollout policy.
     if (!draw_vs_) {
@@ -2261,6 +2921,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     request.generation_constants_ps = gen_constants_ps_;
     request.generation_fetch = gen_fetch_;
     request.generation_framing = gen_viewport_;
+    request.occlusion_query = query_open_ && query_mode_ >= 2;
     if (memory_ &&
         ((Register(rex::graphics::XE_GPU_REG_PA_CL_CLIP_CNTL) & 0x10000u) ||
          REXCVAR_GET(masseffect_native_edram4_clip_inside)) &&
@@ -2354,7 +3015,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
     }
     ++native_draw_attempts_;
-    if (!targets_->Draw(request)) {
+    if (!BackDraw(request)) {
       if (++native_draw_failures_ <= 8)
         REXLOG_WARN("[native] draw rejected before completion; visual conformance is not established");
     }
@@ -2363,6 +3024,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   void Copy() {
     if (!EnsureTargets()) return;
     namespace g = rex::graphics;
+    // The back's registers (masseffect_native_split_lockstep: its mirror; otherwise the live file).
+    const uint32_t* back = BackRegisters("copy");
+    const auto Register = [back](uint32_t index) { return index < kRegisterCount ? back[index] : 0u; };
     masseffect::native::RegistersCopy r;
     r.rb_surface_info = Register(g::XE_GPU_REG_RB_SURFACE_INFO);
     r.rb_color_info[0] = Register(g::XE_GPU_REG_RB_COLOR_INFO);
@@ -2407,17 +3071,247 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
     }
     masseffect::native::TextureSwap texture;
+    const uint32_t* back = BackRegisters("present");  // masseffect_native_split_lockstep: the back's mirror
     for (uint32_t i = 0; i < 6; ++i) {
-      texture.dword[i] = Register(rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + i);
+      texture.dword[i] = back[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + i];
     }
     if (targets_->Present(presenter_.get(), texture, swap_width_, swap_height_)) {
       ++presented_;
     }
   }
 
+  // --- Front/back boundary (docs/multithread-translation.md, step 1: lockstep on the ring thread) ---
+  // Brings the back's mirror up to the front: MMIO registers written by game threads since the last sync and the
+  // stages' microcode (if it changed) are journaled, then the journal is applied in order.
+  // Start-up (and any resync): the mirror takes the full live register file and both stages' microcode; MMIO
+  // writes flagged before this point are covered by the copy (the epoch is read first).
+  void SplitSeed() {
+    mmio_seen_epoch_ = mmio_epoch_.load(std::memory_order_acquire);
+    journal_.Clear();
+    mirror_.Seed(registers_.data(), registers_.size(), vs_microcode_, ps_microcode_);
+    microcode_sent_ = microcode_epoch_;
+    REXLOG_INFO("[native] ring split: back mirror seeded ({} registers, VS {} words, PS {} words)", registers_.size(),
+                vs_microcode_.size(), ps_microcode_.size());
+  }
+
+  void SplitSync() {
+    namespace partition = me::native::ring_partition;
+    // CP_RB_WPTR is written by the game's MMIO kick (not flagged: one per kick); journal it when it moved.
+    me::native::ring_split::JournalIfChanged(journal_, mirror_, registers_.data(), kRegCpRbWptr);
+    const uint32_t epoch = mmio_epoch_.load(std::memory_order_acquire);
+    if (epoch != mmio_seen_epoch_) {
+      mmio_seen_epoch_ = epoch;
+      for (uint32_t r = 0; r < kRegisterCount; ++r)
+        if (mmio_touched_[r].load(std::memory_order_relaxed)) journal_.Reg(r, registers_[r]);
+      ++split_mmio_syncs_;
+    }
+    if (microcode_epoch_[0] != microcode_sent_[0]) {
+      microcode_sent_[0] = microcode_epoch_[0];
+      journal_.Microcode(0, vs_microcode_.data(), uint32_t(vs_microcode_.size()));
+    }
+    if (microcode_epoch_[1] != microcode_sent_[1]) {
+      microcode_sent_[1] = microcode_epoch_[1];
+      journal_.Microcode(1, ps_microcode_.data(), uint32_t(ps_microcode_.size()));
+    }
+    if (journal_.empty()) return;
+    const uint64_t t0 = partition::Now();
+    split_journal_words_ += journal_.size();
+    const bool ok = mirror_.Apply(journal_);
+    journal_.Clear();
+    split_apply_ticks_ += partition::Now() - t0;
+    ++split_syncs_;
+    if (!ok) SplitOff("malformed journal record", -1, 0, 0);
+  }
+
+  // The register file the back reads: the mirror (after a sync and, on schedule, a bit-exact check) or the live one.
+  const uint32_t* BackRegisters(const char* what) {
+    if (!split_on_) return registers_.data();
+    SplitSync();
+    if (split_on_ && split_verify_.Next()) SplitVerify(what);
+    return split_on_ ? mirror_.registers() : registers_.data();
+  }
+
+  bool BackDraw(masseffect::native::SubmissionDraw& request) {
+    if (!split_on_) return targets_->Draw(request);
+    const uint32_t* registers = BackRegisters("draw");
+    if (split_on_) {
+      request.registers = registers;
+      request.vs_microcode = mirror_.microcode(0);
+      request.ps_microcode = mirror_.microcode(1);
+    }
+    return targets_->Draw(request);
+  }
+
+  void SplitVerify(const char* what) {
+    namespace rs = me::native::ring_split;
+    namespace partition = me::native::ring_partition;
+    const uint64_t t0 = partition::Now();
+    ++split_verified_;
+    uint32_t* mirror = mirror_.registers_mutable();
+    int64_t first;
+    while ((first = rs::FirstDifference(mirror, registers_.data(), kRegisterCount)) >= 0) {
+      const uint32_t r = uint32_t(first);
+      if (mmio_touched_[r].load(std::memory_order_relaxed)) {
+        // A game thread wrote it through MMIO after the sync (an existing race with the ring, not a journal gap).
+        mirror[r] = registers_[r];
+        ++split_mmio_races_;
+        continue;
+      }
+      SplitOff(what, first, registers_[r], mirror[r]);
+      break;
+    }
+    if (split_on_ && (mirror_.microcode(0) != vs_microcode_ || mirror_.microcode(1) != ps_microcode_))
+      SplitOff(mirror_.microcode(0) != vs_microcode_ ? "VS microcode" : "PS microcode", -1, 0, 0);
+    split_verify_ticks_ += partition::Now() - t0;
+  }
+
+  void SplitOff(const char* what, int64_t reg, uint32_t front, uint32_t back) {
+    const uint32_t differ = reg >= 0 ? me::native::ring_split::CountDifferences(
+                                           mirror_.registers(), registers_.data(), kRegisterCount, 1u << 20) : 0;
+    REXLOG_ERROR("[native] DIFFERENCE: ring split journal ({}: register {:04X} front {:08X} back {:08X}, {} registers "
+                 "differ; draw {}, packet {:08X}, verified back operations {}); the back reads the live registers "
+                 "from now on", what, reg >= 0 ? uint32_t(reg) : 0xFFFFu, front, back, differ, draws_, packet_address_,
+                 split_verified_);
+    split_on_ = false;
+    split_mmio_.store(false, std::memory_order_release);
+    journal_.Clear();
+  }
+
+  void ReportSplit(double secs, uint64_t ring_draws, uint64_t swaps) {
+    if (!split_on_) {  // never on, or one last line after a DIFFERENCE
+      if (!mmio_touched_ || split_reported_off_) return;
+      split_reported_off_ = true;
+    }
+    const double ms_per_tick = 1000.0 / me::native::ring_partition::TicksPerSecond();
+    const uint64_t records = journal_.records() - split_reported_records_;
+    const uint64_t reg_words = journal_.register_words() - split_reported_reg_words_;
+    const uint64_t ucode_words = journal_.microcode_words() - split_reported_ucode_words_;
+    const double apply_ms = double(split_apply_ticks_) * ms_per_tick, verify_ms = double(split_verify_ticks_) * ms_per_tick;
+    REXLOG_INFO("[native] ring split (lockstep, {}) {:.1f} s, {} Swaps, {} ring draws: {} syncs, {} records, {} register "
+                "words ({:.1f} per ring draw), {} microcode words, {} journal words; apply {:.2f} ms ({:.2f} us per "
+                "ring draw, {:.2f} ms per Swap); verified {} back operations (cumulative), {:.2f} ms; MMIO registers "
+                "{} distinct, {} re-journals, {} races",
+                split_on_ ? "on" : "OFF after a DIFFERENCE", secs, swaps, ring_draws, split_syncs_, records, reg_words,
+                ring_draws ? double(reg_words) / double(ring_draws) : 0.0, ucode_words, split_journal_words_, apply_ms,
+                ring_draws ? apply_ms * 1000.0 / double(ring_draws) : 0.0, swaps ? apply_ms / double(swaps) : 0.0,
+                split_verified_, verify_ms, mmio_distinct_.load(std::memory_order_relaxed), split_mmio_syncs_,
+                split_mmio_races_);
+    split_reported_records_ = journal_.records();
+    split_reported_reg_words_ = journal_.register_words();
+    split_reported_ucode_words_ = journal_.microcode_words();
+    split_syncs_ = split_journal_words_ = split_apply_ticks_ = split_verify_ticks_ = 0;
+  }
+
+  // masseffect_native_effects_stats (step 0): guest-visible effects of this interval, per Swap.
+  void ReportEffects(double secs, uint64_t swaps) {
+    if (!effects_on_) return;
+    namespace rs = me::native::ring_split;
+    const double per = double(std::max<uint64_t>(1, swaps));
+    std::string kinds, gaps;
+    for (uint32_t k = 0; k < rs::kEffectCount; ++k)
+      kinds += fmt::format("{}{} {} ({:.1f}/Swap)", k ? ", " : "", rs::kEffectNames[k], effects_.effects[k],
+                           double(effects_.effects[k]) / per);
+    for (uint32_t b = 0; b < rs::kGapBuckets; ++b)
+      gaps += fmt::format("{}{}: {}", b ? ", " : "", rs::kGapNames[b], effects_.gaps[b]);
+    const uint64_t total = effects_.Total();
+    REXLOG_INFO("[native] guest-visible effects ({:.1f} s, {} Swaps): {} total ({:.1f}/Swap), {} after back work "
+                "= step-2 barriers ({:.1f}/Swap); {}; ring draws between consecutive effects: {}; max {}",
+                secs, swaps, total, double(total) / per, effects_.barriers, double(effects_.barriers) / per, kinds,
+                gaps, effects_.max_gap);
+    effects_.ResetInterval();
+  }
+
+  // masseffect_native_coherence_stats (me_frame_coherence.h): keys of the draw that just ended.
+  void CoherenceEndDraw() {
+    namespace co = me::native::coherence;
+    co::Inputs in;
+    in.registers = registers_.data();
+    in.vs = draw_vs_;
+    in.ps = draw_ps_;
+    in.vs_hash = current_vs_hash_;
+    in.ps_hash = current_ps_hash_;
+    in.vs_constant_words = draw_vs_ ? draw_vs_->constants_bytes / 4 : 0;
+    in.ps_constant_words = draw_ps_ ? draw_ps_->constants_bytes / 4 : 0;
+    in.generation_constants_vs = gen_constants_vs_;
+    in.generation_constants_ps = gen_constants_ps_;
+    in.initiator = Register(kRegVgtDrawInitiator);
+    in.dma_base = Register(kRegVgtDmaBase);
+    in.dma_size = Register(kRegVgtDmaSize);
+    uint8_t slots[32];
+    uint32_t n = 0;
+    for (const masseffect::native::ShaderEntry* entry : {draw_vs_, draw_ps_})
+      if (entry)
+        for (const auto& sampler : entry->samplers)
+          if (n < 32) slots[n++] = uint8_t(sampler.register_value & 31);
+    in.texture_slots = slots;
+    in.texture_slot_count = n;
+    co::EndDraw(in);
+  }
+  void CoherenceEndFrame() {
+    std::string line1, line2;
+    if (me::native::coherence::EndFrame(line1, line2)) {
+      REXLOG_INFO("{}", line1);
+      REXLOG_INFO("{}", line2);
+    }
+  }
+
+  // masseffect_native_ring_partition: where the ring thread's time went since the previous report.
+  void ReportRingPartition(double secs, uint64_t ring_draws, uint64_t swaps, uint64_t vulkan_draws) {
+    namespace partition = me::native::ring_partition;
+    if (!partition::Active()) return;
+    std::array<uint64_t, partition::kCount> ticks{}, entries{};
+    partition::Take(ticks, entries);
+    const double ms_per_tick = 1000.0 / partition::TicksPerSecond();
+    uint64_t busy = 0;
+    for (uint32_t k = 0; k < partition::kCount; ++k)
+      if (k != partition::kWait) busy += ticks[k];
+    const double per_draw = ring_draws ? 1000.0 / double(ring_draws) : 0.0;  // ms -> us per ring draw
+    std::string parts;
+    for (uint32_t k = 0; k < partition::kCount; ++k) {
+      const double ms = double(ticks[k]) * ms_per_tick;
+      parts += fmt::format(" | {} {:.1f} ms ({:.2f} us/draw, {} entries)", partition::kNames[k], ms, ms * per_draw,
+                           entries[k]);
+    }
+    REXLOG_INFO("[native] ring partition ({:.1f} s, {} Swaps, {} ring draws, {} Vulkan draws): busy {:.1f} ms = "
+                "{:.1f} % of the interval, {:.2f} us per ring draw{}",
+                secs, swaps, ring_draws, vulkan_draws, double(busy) * ms_per_tick,
+                secs > 0 ? double(busy) * ms_per_tick / (secs * 10.0) : 0.0, double(busy) * ms_per_tick * per_draw,
+                parts);
+  }
+  uint64_t partition_drawn_ = 0;
+
+  // masseffect_native_waitregmem_stats: per condition (memory/register, address, reference, mask).
+  struct WaitRegMemStat {
+    uint64_t calls = 0, waited = 0, ns = 0, max_ns = 0;
+  };
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, WaitRegMemStat> waitregmem_stats_;
+  void NoteWaitRegMem(uint32_t info, uint32_t poll, uint32_t ref, uint32_t mask, bool waited, uint64_t ns) {
+    auto& e = waitregmem_stats_[{info & 0x17u, poll, ref, mask}];
+    ++e.calls;
+    if (waited) ++e.waited;
+    e.ns += ns;
+    if (ns > e.max_ns) e.max_ns = ns;
+  }
+  void ReportWaitRegMem() {
+    if (waitregmem_stats_.empty()) return;
+    std::vector<std::pair<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, WaitRegMemStat>> v(
+        waitregmem_stats_.begin(), waitregmem_stats_.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    std::string text;
+    for (size_t i = 0; i < v.size() && i < 8; ++i) {
+      const auto& [k, e] = v[i];
+      text += fmt::format(" [{} {:08X} fn {} ref {:08X} mask {:08X}: {} calls, {} waited, {:.1f} ms, max {:.2f} ms]",
+                          (std::get<0>(k) & 0x10) ? "mem" : "reg", std::get<1>(k), std::get<0>(k) & 7, std::get<2>(k),
+                          std::get<3>(k), e.calls, e.waited, e.ns / 1e6, e.max_ns / 1e6);
+    }
+    REXLOG_INFO("[native] WAIT_REG_MEM since last report:{}; early VBlanks (cumulative) {}", text, vblanks_early_.load());
+    waitregmem_stats_.clear();
+  }
+
   void Report(bool force) {
     const auto now = Clock::now();
     if (!force && now - last_report_ < std::chrono::seconds(10)) return;
+    ReportWaitRegMem();
     const double secs = std::chrono::duration<double>(now - last_report_).count();
     last_report_ = now;
     // GPU time per category, real milliseconds per Swap of this interval: raw NVK timestamps x 1.627 on the Switch.
@@ -2430,7 +3324,8 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       if (swaps) {
         static constexpr const char* kNames[masseffect::native::kGpuCategories] = {
             "other",  "shadows",    "scene",        "640",         "320",         "smaller",     "copies",
-            "clears", "scene_no_z", "gap",         "edram_import", "edram_export", "edram_alias", "edram_import9"};
+            "clears", "scene_no_z", "gap",         "edram_import", "edram_export", "edram_alias", "edram_import9",
+            "occlusion_depth"};
         std::string t;
         double total = 0;
         for (uint32_t i = 0; i < masseffect::native::kGpuCategories; ++i) {
@@ -2464,6 +3359,12 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                 shader_loads_reused_,
                 multi_rect_proven_, multi_rect_rejects_[0], multi_rect_rejects_[1], multi_rect_rejects_[2],
                 exact_edges_, identity_memo_hits_);
+    if (load_memo_) {
+      REXLOG_INFO("[native] shader load memo: {} memo hits without swap and XXH3; table {} lookups, {} equal, {} "
+                  "with changed words (cumulative)", load_memo_hits_, load_memo_->lookups(), load_memo_->hits(),
+                  load_memo_->changed());
+    }
+    load_memo_hits_ = 0;
     identity_memo_hits_ = 0;
     multi_rect_proven_ = 0;
     exact_edges_ = 0;
@@ -2476,6 +3377,16 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     REXLOG_INFO("[native] FINAL VS selection audit: {} proven, {} unproven, {} missing "
                 "(cumulative attempted draws; not GPU/DEF/ABI equivalence proof)",
                 vs_final_proven_, vs_final_unproven_, vs_final_missing_);
+    if (shaders_.loaded()) {
+      const masseffect::native::StatsShaders shader_stats = shaders_.Stats();
+      if (shader_stats.patched || draws_vs_patched_) {
+        REXLOG_INFO("[native] VS patched-fetch lookup: {} draws rescued (drawn with a VS only that lookup found; "
+                    "cumulative); {} distinct programs found ({} with same-register fetches reordered, {} with "
+                    "several candidates)",
+                    draws_vs_patched_, shader_stats.patched, shader_stats.patched_permuted,
+                    shader_stats.patched_ambiguous);
+      }
+    }
     uint64_t copies = 0, clears = 0, presented = 0, rejected = 0;
     if (targets_) targets_->Stats(copies, clears, presented, rejected);
     const auto st = targets_ ? targets_->StatsOfDraws() : masseffect::native::StatsDraws{};
@@ -2491,6 +3402,67 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                 shaders_by_address_, shaders_unidentified_, st.drawn, st.rejected, st.pipelines, st.textures,
                 presented);
     HangWatchdogInterval(swaps_ - reported_swaps_, draws_ - reported_draws_);
+    ReportRingPartition(secs, draws_ - reported_draws_, swaps_ - reported_swaps_, st.drawn - partition_drawn_);
+    ReportEffects(secs, swaps_ - reported_swaps_);
+    ReportSplit(secs, draws_ - reported_draws_, swaps_ - reported_swaps_);
+    partition_drawn_ = st.drawn;
+    if (query_begun_ != reported_query_begun_ || query_ended_ != reported_query_ended_) {
+      const uint64_t swaps = std::max<uint64_t>(1, swaps_ - reported_query_swaps_);
+      const uint64_t ended = query_ended_ - reported_query_ended_;
+      std::string real;
+      if (query_mode_ == 3 && targets_) {
+        const auto q = targets_->StatsOfQueries();
+        const auto& o = reported_queries_;
+        const uint64_t resolved = q.resolved - o.resolved;
+        real = fmt::format("; latency-1: {} answered from history ({} hidden), {} unknown, {} stale; {} measured, {} "
+                           "not measured; {} folded ({} with 0 samples, avg {:.0f} samples, avg age {:.2f} frames / "
+                           "{:.2f} ms), {} read failures; table {} entries; box content at another address {}; {} "
+                           "empty, {} Vulkan queries",
+                           q.answered_history - o.answered_history, q.answered_hidden - o.answered_hidden,
+                           q.answered_unknown - o.answered_unknown, q.answered_stale - o.answered_stale,
+                           q.latent_measured - o.latent_measured, q.latent_unmeasured - o.latent_unmeasured, resolved,
+                           q.resolved_zero - o.resolved_zero,
+                           resolved ? double(q.samples - o.samples) / double(resolved) : 0.0,
+                           resolved ? double(q.latency_frames - o.latency_frames) / double(resolved) : 0.0,
+                           resolved ? double(q.latency_us - o.latency_us) / 1000.0 / double(resolved) : 0.0,
+                           q.fallback_read - o.fallback_read, q.history_size, q.content_moved - o.content_moved,
+                           q.empty - o.empty, q.vulkan_queries - o.vulkan_queries);
+        reported_queries_ = q;
+      }
+      if (query_mode_ == 2 && targets_) {
+        const auto q = targets_->StatsOfQueries();
+        const auto& o = reported_queries_;
+        const uint64_t resolved = q.resolved - o.resolved;
+        real = fmt::format("; real: {} resolved ({} with 0 samples, avg {:.0f} samples), latency avg {:.2f} frames / "
+                           "{:.2f} ms; fallbacks to visible: {} unmeasured, {} split, {} timeout, {} read, {} no "
+                           "targets; {} empty, {} superseded, {} Vulkan queries, {} early submissions",
+                           resolved, q.resolved_zero - o.resolved_zero,
+                           resolved ? double(q.samples - o.samples) / double(resolved) : 0.0,
+                           resolved ? double(q.latency_frames - o.latency_frames) / double(resolved) : 0.0,
+                           resolved ? double(q.latency_us - o.latency_us) / 1000.0 / double(resolved) : 0.0,
+                           q.fallback_unmeasured - o.fallback_unmeasured, q.fallback_split - o.fallback_split,
+                           q.fallback_timeout - o.fallback_timeout, q.fallback_read - o.fallback_read,
+                           (query_fallbacks_now_ - reported_query_fallbacks_now_) -
+                               ((q.fallback_unmeasured - o.fallback_unmeasured) + (q.fallback_split - o.fallback_split)),
+                           q.empty - o.empty, q.superseded - o.superseded, q.vulkan_queries - o.vulkan_queries,
+                           q.flushes - o.flushes);
+        reported_queries_ = q;
+      }
+      REXLOG_INFO("[native] occlusion queries (mode {}): {} begun, {} ended ({:.1f} per Swap), {} draws inside, {} "
+                  "boxes skipped; unpaired: {} begins without end, {} ends without begin (cumulative); {} ends "
+                  "whose sentinel was already erased{}{}",
+                  query_mode_, query_begun_ - reported_query_begun_, ended, double(ended) / double(swaps),
+                  query_draws_total_ - reported_query_draws_, query_boxes_skipped_ - reported_query_boxes_,
+                  query_unended_, query_unbegun_, query_end_by_address_ - reported_query_end_by_address_,
+                  query_pair_by_address_ ? " (paired by address)" : " (pairing off: taken for begins and zeroed)", real);
+      reported_query_end_by_address_ = query_end_by_address_;
+      reported_query_begun_ = query_begun_;
+      reported_query_ended_ = query_ended_;
+      reported_query_draws_ = query_draws_total_;
+      reported_query_boxes_ = query_boxes_skipped_;
+      reported_query_fallbacks_now_ = query_fallbacks_now_;
+      reported_query_swaps_ = swaps_;
+    }
     std::string causes;
     for (size_t i = 0; i < st.causes.size() && i < 6; ++i) {
       causes += fmt::format(" {}x{}", st.causes[i].first, st.causes[i].second);
@@ -2558,6 +3530,34 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t report_gpu_swaps_ = 0;
   std::unordered_set<uint64_t> dumped_vertex_variants_;
   uint64_t draws_indirect_ = 0, draws_replayed_ = 0, draws_predicated_ = 0;
+  // D3D9 occlusion queries (masseffect_native_query_mode, docs/occlusion-queries.md).
+  static constexpr uint32_t kQueryVisible = 1000;  // the SDK's fake count (query_occlusion_fake_sample_count)
+  int32_t query_mode_ = 0;
+  bool query_skip_boxes_ = false;
+  int32_t query_flush_us_ = 500;
+  uint32_t query_timeout_us_ = 50000;
+  // Query mode 3 (latency-1): history rules, identity of the open query, fence poll pacing.
+  static constexpr uint32_t kQuerySignBytes = 4096;  // position data hashed per draw (a box batch is ~1 KB)
+  uint32_t query_max_age_ = 4;
+  uint32_t query_hidden_after_ = 2;
+  int32_t query_history_key_ = 0;
+  uint64_t query_signature_ = 0;
+  uint32_t query_signed_ = 0;
+  bool query_sign_ok_ = false;
+  uint32_t query_sign_logged_ = 0;
+  std::chrono::steady_clock::time_point query_serviced_{};
+  double query_scale_ = 1.0;  // internal resolution -> 1280x720 sample counts
+  bool query_open_ = false;
+  bool query_pair_by_address_ = true;
+  uint32_t query_open_begin_ = 0;  // RB_SAMPLE_COUNT_ADDR of the open query's BEGIN (its end structure + 0x20)
+  uint64_t query_end_by_address_ = 0, reported_query_end_by_address_ = 0;
+  uint32_t query_draws_ = 0;
+  uint32_t query_logged_draws_ = 0;
+  uint64_t query_begun_ = 0, query_ended_ = 0, query_unended_ = 0, query_unbegun_ = 0, query_draws_total_ = 0,
+           query_boxes_skipped_ = 0, query_fallbacks_now_ = 0;
+  uint64_t reported_query_begun_ = 0, reported_query_ended_ = 0, reported_query_draws_ = 0,
+           reported_query_boxes_ = 0, reported_query_fallbacks_now_ = 0, reported_query_swaps_ = 0;
+  masseffect::native::StatsQueries reported_queries_{};
   uint32_t packet_address_ = 0;
   struct PairedPacket {
     uint64_t frame;
@@ -2576,6 +3576,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t ps_identity_mismatches_ = 0;
   uint64_t vs_identity_mismatches_ = 0;
   uint64_t vs_final_proven_ = 0, vs_final_unproven_ = 0, vs_final_missing_ = 0;
+  // masseffect_native_vs_identify_patched: the current VS was found only by the second-stage lookup; the hashes of
+  // such programs (for identity memo hits); draws drawn with them.
+  bool vs_patched_ = false;
+  std::unordered_set<uint64_t> vs_patched_hashes_;
+  uint64_t draws_vs_patched_ = 0;
   uint64_t vs_identity_generation_ = 1;
   uint64_t ps_identity_generation_ = 1;
   std::unordered_map<const masseffect::native::ShaderEntry*, std::pair<uint64_t, bool>> vs_identity_cache_;
@@ -2585,6 +3590,14 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   bool identity_flat_ = false, pairing_fast_ = false, raw_microcode_ = false, pm4_fast_ = false;
   uint32_t check_identity_ = 0, check_pairing_ = 0, check_raw_ = 0, check_pm4_ = 0, check_objects_ = 0;
   std::vector<uint32_t> raw_vs_, raw_ps_;  // the guest words of the last IM_LOAD of each stage (raw_microcode_)
+  // masseffect_native_load_memo (me_shader_load_memo.h); null when off or after a self-check DIFFERENCE.
+  std::unique_ptr<ShaderLoadMemo> load_memo_;
+  uint32_t check_load_memo_ = 0;
+  bool load_memo_generation_ = false;  // masseffect_native_load_memo_generation (needs the load memo)
+  uint64_t identity_generation_counter_ = 1;
+  uint64_t load_memo_hits_ = 0;
+  bool identify_hashed_ = false;  // IdentifyShader computed identify_hash_ (XXH3 of microcode_) for this load
+  uint64_t identify_hash_ = 0;
   bool raw_vs_valid_ = false, raw_ps_valid_ = false;
   std::map<std::pair<uint64_t, uint64_t>, uint64_t> missing_draw_pairs_;
   rex::ui::WindowedAppContext* app_context_ = nullptr;
@@ -2616,12 +3629,35 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t bin_mask_ = ~0ull, bin_select_ = ~0ull;
   // Ring-thread counters.
   uint64_t packets_ = 0, draws_ = 0, copies_ = 0, swaps_ = 0, waits_timed_out_ = 0;
+  // masseffect_vblank_adaptive
+  std::atomic<bool> adaptive_vblank_{false};
+  std::atomic<uint64_t> last_swap_ns_{0}, vblank_interval_ns_{0};
+  std::atomic<bool> vblank_early_{false};
+  std::mutex vblank_mutex_;
+  std::condition_variable vblank_cv_;
+  uint64_t early_requested_swap_ = UINT64_MAX;
+  std::atomic<uint64_t> vblanks_early_{0};
   uint64_t opcodes_[128] = {};
   uint64_t opcode_words_[128] = {}, type0_packets_ = 0, type0_words_ = 0, type0_single_ = 0;  // PM4 mix report
   std::atomic<uint64_t> interrupts_{0};
   uint64_t reported_swaps_ = 0, reported_draws_ = 0, reported_copies_ = 0, reported_packets_ = 0,
            reported_interrupts_ = 0;
   Clock::time_point start_, last_report_;
+  // masseffect_native_effects_stats (step 0) and masseffect_native_split_lockstep (step 1), me_ring_split.h.
+  bool effects_on_ = false;
+  me::native::ring_split::EffectStats effects_;
+  bool split_on_ = false, split_reported_off_ = false;
+  me::native::ring_split::Journal journal_;
+  me::native::ring_split::Mirror mirror_;
+  me::native::ring_split::VerifySchedule split_verify_;
+  std::array<uint64_t, 2> microcode_epoch_{}, microcode_sent_{~0ull, ~0ull};
+  std::atomic<bool> split_mmio_{false};
+  std::unique_ptr<std::atomic<uint8_t>[]> mmio_touched_;  // registers written through MMIO by game threads
+  std::atomic<uint32_t> mmio_epoch_{0}, mmio_distinct_{0};
+  uint32_t mmio_seen_epoch_ = 0;
+  uint64_t split_syncs_ = 0, split_journal_words_ = 0, split_apply_ticks_ = 0, split_verify_ticks_ = 0,
+           split_verified_ = 0, split_mmio_syncs_ = 0, split_mmio_races_ = 0;
+  uint64_t split_reported_records_ = 0, split_reported_reg_words_ = 0, split_reported_ucode_words_ = 0;
 };
 
 }  // namespace

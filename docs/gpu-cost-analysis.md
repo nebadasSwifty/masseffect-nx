@@ -195,3 +195,126 @@ proofs), G3 (conversions as fragment passes).
 - G6 (estimator for VS9737) and G7 (resolve from the f3 view). These are proposals 2 and 1 above.
 - FSR1 and dynamic resolution. The `and_u_*` runs did **not** test them; see section 0.
 - Skipping the stencil fetch for inert-stencil draws.
+
+## 5. Eden Prime after the Saren/Nihlus cutscene (2026-10-08)
+
+Sources: `mass-effect-recomp/run/me1/prof_eden/masseffect_382.log` and `prof_eden2/game.log` (RU, 960x544, build
+ru_glob19). Offline analysis; nothing was run on the console for this section. Raw `GPU time by pass` values are
+converted with x1.627 / Swaps (measuring.md); `GPU per Swap` is already in ms.
+
+### 5.1 Where the GPU time goes
+
+| window (prof_eden) | Swaps / 10 s | total | gap (GPU idle) | busy | "640" (scene + post) | edram_alias | copies |
+|---|---|---|---|---|---|---|---|
+| 04:36:51 | 291 | 34.4 | 7.0 | 27.4 | 17.6 | 5.0 | 2.4 |
+| 04:37:11 | 266 | 37.7 | 6.1 | 31.6 | 21.3 | 5.3 | 2.7 |
+| 04:37:21 (heaviest) | 175 | 57.4 | 20.5 | 36.9 | 27.8 | 4.7 | 2.2 |
+
+The heavy windows have a large gap: the frame there is limited by the CPU (ring and game thread, see best-config.md
+"Eden Prime"), so a GPU saving shows up in fps only in the windows where the gap is small.
+
+Labels per frame (window ending 04:37:01, 294 Swaps; raw ms x 1.627 / 294):
+
+| label | what | per frame | ms per frame |
+|---|---|---|---|
+| cat 3 VS20772/PS9551 (and PS21081 in the heavy window) | scene base pass | | 7.7 (heavy window: 10.6) |
+| cat 12 VS41 | exponent-bias resolves into `15214000` (960x544 RGBA16F) | 5.7 (1671 / 294) | **3.3** (0.58 each) |
+| cat 6 | copies (all non-EDRAM resolves) | | 2.1 |
+| cat 4 VS26396/PS25414 | quarter-res DOF/bloom gather and blurs | | 1.4 |
+| cat 12 VS40 | 7e3 -> UNORM10 resolves (compute) | 1.3 (380 / 294) | 0.9 |
+| cat 12 VS0 | small conversions (C5A0 2x -> 1x border tiles) | 8 | 0.3 |
+| cat 0 VS43 | f0 -> f4 word copy (`conversion_copy_32`) | 1 | 0.4 |
+| cat 10 / 11 / 13 | depth imports / exports / 9-pass stencil imports, all at 0x5A0 | 43 / 10 / 8.5 | 0.3 / 0.2 / 0.0 |
+
+The 1.9 ms quoted for VS41 in the task was the raw value: with the timestamp factor it is 3.1 to 3.3 ms per frame,
+the largest single EDRAM item in this scene.
+
+### 5.2 The shadow-map traffic at 0x5A0
+
+The shadow map is D5A0 (D24S8, pitch 880, 1x, 864x864 used: four 432x432 slots; the shadow draws use a 422x422 scissor
+at 5,5 inside a slot). The game clears a slot through the 4x alias of the same EDRAM (`D5A0 440x720 mx1my1`, a collapsed
+single-sample host image) and also keeps its quarter-res DOF buffer at the same base (`C5A0/f7`, k_16_16_16_16_FLOAT,
+pitch 320, 64bpp: EDRAM tiles 0x5A0..0x5E8). Per frame (pairs and decline reasons, both logs):
+
+| pair or event | per frame | triggered by |
+|---|---|---|
+| `D5A0 4x -> D5A0 1x` (depth-repr-switch) | 27 ops, 136 tiles | the shadow draws VS16864/PS6118, PS24934, PS13880 (stencil off) pulling tiles the 4x view owns |
+| 9-pass imports `D5A0 4x -> 5A0 1x` | 8.5 ops, 26 tiles | late stencil fetches before the D5A0 -> C5A0 exports (bits skipped: the 4x stencil bits are 0) |
+| `D5A0 1x -> C5A0/f7` (depth->color) | 10 ops | the quarter-buffer rect clear VS10373/PS10803 (`ow 0,128-240,138`) |
+| `C5A0/f7 -> D5A0 1x` (color->depth) | 6-8 ops of 1 tile | the 1x strip clears VS10373/PS10803 mode 5 (`ow 400,0-432,432`): partial tiles over C5A0 |
+| `C5A0/f7 2x -> 1x` | 8 ops, 13 tiles | the DOF gather VS26396/PS25414 (border tiles) |
+| depth clear redirect declined: `target C5A0/f7 ... (clear of 5A0/f0 mx1my1 depth 1 stencil -1)` | 1 | a depth-only clear (to 1.0) of a slot drawn through the 4x alias: some of its whole tiles are owned by the 64bpp C5A0 view |
+| declined: `partial tile: owner unsupported` | 1 | the 1x strip clears above (their partial tile column 5 is owned by C5A0) |
+| declined: `depth not proven constant (depth info 000005A0)` | 1-4 | not a constant-z draw (no change possible without a trace of that draw) |
+
+Mechanism of the 27 repr switches: the redirect of the 4x clear (E4/E5: clear the tiles in the 1x alias, which becomes
+their owner) refuses the whole clear as soon as one tile is owned by a 64bpp color view, because a 64bpp view is not a
+lazy stencil source. The clear is then drawn on the 4x view, which becomes the owner of the whole slot, and every
+shadow draw of the next light pulls its rows back 4x -> 1x (one import run per tile row; backlog E39).
+
+### 5.3 Implemented: `masseffect_native_edram4_clear_alias_raw64` (default false)
+
+In `RedirectClearDepthEDRAM4` (`masseffect_native_targets.cpp`): for a **depth-only** clear (no stencil write) drawn
+through a **collapsed single-sample 4x view** that has a known 1x alias, a whole tile owned by a 64bpp color view is
+now handed to the 1x alias like the tiles the 4x view owns itself: the depth of the tile is cleared in the alias, and
+the alias becomes the owner. Partial tiles are not touched (still declined as before).
+
+Why the picture cannot change: the redirect reproduces what the literal path leaves behind, tile by tile.
+
+- Depth: the literal path clears the whole tile in the 4x view (one collapsed value per pixel, the constant) and the
+  next 1x draw imports it; the redirect writes the same constant into the 1x alias directly. This is the existing
+  E4/E5 redirect, unchanged; only the owner test is wider.
+- Stencil: the literal clear does not write stencil. Its publish (`PublishEDRAM4`) never takes a 64bpp previous owner as
+  a lazy stencil source, so the 4x view's own host stencil counts as real for those tiles, and the 4x -> 1x import
+  records "stencil in the 4x view, same tile". The redirect records exactly that source for the alias tile
+  (`edram4_stencil_source_[alias][tile] = {4x view, tile}`) and marks the 4x view's stencil of that tile as real.
+  Every later stencil user (the late fetch before the D5A0 -> C5A0 export, a stencil-testing draw) fetches the same
+  bits from the same image as before. The 4x view is not written in between (nothing else draws through it; a later
+  4x draw first imports the tile back from the alias, and that import keeps the 4x stencil because the record points
+  at the destination itself).
+- Ownership and versions follow the existing reassign path (new tile version, epoch bump, stamps for the learned
+  consumer), so every other view syncs from the alias exactly as from any redirected tile.
+
+Fallbacks (the old path runs): the cvar off, `edram4_clear_alias` or `edram4_stencil_lazy` off, a clear that writes
+stencil, a drawn view that is not a collapsed 4x view, a drawn view not prepared or swapped away (its stencil must stay
+fetchable), no known 1x alias yet (the first frames), any other decline reason of the same clear (a partial tile, a
+non-constant z): the whole clear is drawn as before.
+
+Proof that it fires, every 10 s while the cvar is on:
+
+    [native] EDRAM mode4 clear alias raw64, 10 s: N depth clears drawn through a 4x alias were redirected although a 64bpp color view owned some of their tiles; T such tiles cleared in the 1x alias (stencil kept in the 4x view, as the drawn clear leaves it)
+
+What to compare against `prof_eden2` (same route): N about one per frame (about 290 per 10 s at 29 fps); the
+`target C5A0/f7 ... (clear of 5A0/f0 mx1my1 ...)` decline reason gone; the `D5A0/f0:440x720:mx1my1g0->D5A0/f0:880x880`
+pair (27 ops per frame) gone or much smaller; `redirected depth clears` up by about one per frame; the 9-pass import
+line now names `D5A0:440x720:mx1my1->5A0:880x880` only through deferred records (same count as before).
+
+Expected saving: small in GPU time, 0.2-0.5 ms per frame (the 27 import runs are cheap per pixel, cat 10 is 0.3 ms;
+the rest is the literal 4x clear pass and up to 27 breaks of the shadow render pass, each a reload of the depth
+attachment), plus ring CPU (27 synchronizations and pass restarts per frame), which matters more in the CPU-bound
+heavy windows. Risk: low; the image is the same by construction. Screenshot check: shadows of the characters and the
+bloom edge (the quarter buffer shares the tiles).
+
+### 5.4 Resolves straight from the host image (item 2 of the task): nothing left in this scene
+
+`transfer causes` in both logs list only `draw/*` and `depth-resolve/color->depth` (54 single tiles per 10 s): no
+resolve converts EDRAM ownership any more. The scene-colour round trip of section 2 is already gone here: the raw
+resolves read the 7e3 owner (`resolve_7e3_direct`, VS40, shipped) and the restore draw renders into the 7e3 image
+(`restore_into_7e3`, shipped; `380 draws ... drawn into the 7e3 image` per 10 s). The remaining colour aliases are the
+f0 -> f4 velocity copy (VS43, one word copy per frame, 0.4 ms) and the DOF border tiles (`C5A0 2x -> 1x`, 0.3 ms), both
+real data dependencies (post-chain.md options B and the velocity buffer). Existing exact options for the VS40 part
+that have not been measured at 960 in this scene: `masseffect_native_resolve_7e3_frag` + `masseffect_native_resolve_7e3_pack = 2`
+(vulkan-frame-time.md section 11, 0.3-0.8 ms there).
+
+### 5.5 VS41 exponent-bias resolves (item 3): no exact cut without the probe
+
+5.7 full-screen bias resolves per frame (960x544, read 4.2 MB of the 7e3 image, write 4.2 MB, about 0.58 ms each including
+the barrier). The pass is a plain `texelFetch x 2^bias` into a color attachment (`me_resolve_exp_bias_frag.frag`); on
+an immediate-mode GPU the load op costs nothing, so the shader cannot be made cheaper and only fewer resolves help.
+vulkan-frame-time.md section 12 shows why neither a hand-off nor a second output is exact in general (blended sources,
+readers that write the source, FP16 denormal rounding below 2^-11), and dirty rectangles do not help because the
+publish area of an ordinary draw is its scissor, the whole screen. Post-chain plan C (host-side post targets) is a
+multi-day change with fallbacks per pass and is only exact per proven hand-off. The decision data is one console
+run with the existing probe (`masseffect_native_bias_life_probe = true`, `masseffect_native_bias_life_dump_s` at the
+heavy window): it counts `strict`/`chain` producers (dual output, ~0.6 ms each here), `round trips` (skip, ~0.6 ms
+each) and `unread` resolves. Nothing was implemented for VS41 in this round.

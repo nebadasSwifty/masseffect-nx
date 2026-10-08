@@ -18,11 +18,20 @@ layout(push_constant) uniform Constants {
   uint source_format;  // color class: 0 RGBA8, 2 UNORM10, 3 7e3
 } c;
 
-// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
-// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
-// floors to the exact integer one.
+// EDRAM address math without IMUL (docs/edram-shader-imul.md; exactness: tests/cpu/test_native_edram_imul_free.cpp).
+// NAK on SM50 emits the microcoded, variable-latency IMUL for every 32-bit multiply that is not by a power of two,
+// IMUL.HI for a division by a constant and a long IMUL sequence for a division by a register. Integers below 2^24
+// are exact in float, so these use FMUL/FFMA and conversions instead:
+// - DivPitch: tile < 2^16, 1 <= pitch <= 2048; the fraction of (tile + 0.5) / pitch is at least 0.5 / pitch away
+//   from an integer, far more than the error of the reciprocal, so the float quotient floors to the integer one;
+// - MulSmall: a * b < 2^24 (row * pitch, quotient * pitch);
+// - Div80 / Mod80: x < 2^20; Mul80 is two shifts and an add.
 uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
-uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+uint MulSmall(uint a, uint b) { return uint(float(a) * float(b)); }
+uint ModPitch(uint tile, uint pitch) { return tile - MulSmall(DivPitch(tile, pitch), pitch); }
+uint Div80(uint x) { return uint(fma(float(x), 0.0125, 0.00625)); }
+uint Mul80(uint x) { return (x << 6u) + (x << 4u); }
+uint Mod80(uint x) { return x - Mul80(Div80(x)); }
 
 uint A7e3(float value) {
   uint bits = floatBitsToUint(clamp(value, 0.0, 31.875));
@@ -46,12 +55,12 @@ uint Pack(vec4 value) {
 }
 
 uint Stencil(uvec2 pixel) {
-  uint tile = (pixel.y / 16u) * c.pitch_tiles_target + pixel.x / 80u;
+  uint tile = MulSmall(pixel.y >> 4u, c.pitch_tiles_target) + Div80(pixel.x);
   if (tile < c.tile_target_start || tile - c.tile_target_start >= c.tiles_count) return 0u;
   uint source_tile = c.tile_source_start + tile - c.tile_target_start;
-  uint word_x = pixel.x % 80u;
+  uint word_x = Mod80(pixel.x);
   word_x = word_x < 40u ? word_x + 40u : word_x - 40u;
-  uvec2 source_pixel = uvec2(ModPitch(source_tile, c.pitch_tiles_source) * 80u + word_x,
+  uvec2 source_pixel = uvec2(Mul80(ModPitch(source_tile, c.pitch_tiles_source)) + word_x,
                             DivPitch(source_tile, c.pitch_tiles_source) * 16u + pixel.y % 16u) >>
                        uvec2(c.source_msaa_x, c.source_msaa_y);
   if (any(greaterThanEqual(source_pixel, c.source_size))) return 0u;
@@ -63,6 +72,6 @@ void main() {
   uint words_per_row = c.rect_w / 4u;
   if (id.x >= words_per_row || id.y >= c.rect_h) return;
   uvec2 pixel = uvec2(c.rect_x + id.x * 4u, c.rect_y + id.y);
-  words[id.y * words_per_row + id.x] = Stencil(pixel) | (Stencil(pixel + uvec2(1u, 0u)) << 8u) |
+  words[MulSmall(id.y, words_per_row) + id.x] = Stencil(pixel) | (Stencil(pixel + uvec2(1u, 0u)) << 8u) |
       (Stencil(pixel + uvec2(2u, 0u)) << 16u) | (Stencil(pixel + uvec2(3u, 0u)) << 24u);
 }

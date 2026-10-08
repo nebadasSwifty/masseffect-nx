@@ -139,15 +139,27 @@ bool build_dcbf(BuilderContext& ctx) {
   return true;
 }
 
+// dcbt / dcbtst: hints without a semantic effect. With dcbt_prefetch they become a host prefetch of the same
+// effective address ((ra|0) + rb, 32-bit wrap; REX_DCBT / REX_DCBTST in the pch). AArch64 PRFM never faults.
+static void emitPrefetch(BuilderContext& ctx, const char* macro) {
+  if (!ctx.config().dcbtPrefetch)
+    return;
+  // RA/RB from the X-form fields: the decoder lists the optional CT/TH field first when it is not zero.
+  uint32_t ra = (ctx.insn.instruction >> 16) & 0x1F;
+  uint32_t rb = (ctx.insn.instruction >> 11) & 0x1F;
+  if (ra != 0)
+    ctx.println("\t{}((uint32_t)({}.u32 + {}.u32));", macro, ctx.r(ra), ctx.r(rb));
+  else
+    ctx.println("\t{}({}.u32);", macro, ctx.r(rb));
+}
+
 bool build_dcbt(BuilderContext& ctx) {
-  // Hint instruction, prefetch has no semantic effect
-  (void)ctx;
+  emitPrefetch(ctx, "REX_DCBT");
   return true;
 }
 
 bool build_dcbtst(BuilderContext& ctx) {
-  // Hint instruction, prefetch-for-store has no semantic effect
-  (void)ctx;
+  emitPrefetch(ctx, "REX_DCBTST");
   return true;
 }
 

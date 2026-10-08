@@ -35,6 +35,11 @@ lr_keep_returns = [0x826E62B4, 0x826E62E4, 0x8223CE7C, 0x826E84E0]
 dform_disp_split = true
 # fctiwz as fcvtzs + NaN select.
 fctiwz_inline = true
+# dcbt / dcbtst as a host prefetch of the same address (REX_DCBT / REX_DCBTST, __builtin_prefetch; PRFM never faults).
+# Needs a generator built from this SDK (tools/build_host.sh). On since 2026-10-08: part of the RU console builds
+# ru_glob2..ru_glob8 (Feros, Citadel; no regression), docs/cpu-cost-analysis.md "Guest cache hints";
+# REX_DCBT_PREFETCH=0 at compile time drops them without regenerating.
+dcbt_prefetch = true
 
 # share_registers is NOT needed for ordinary functions in this game. Check after every codegen with
 #   python3 tools/read_before_write.py generated/default --noreturn=82ACA550

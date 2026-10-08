@@ -28,9 +28,15 @@ void RexSwitchApmCpuBoost(int mode);
 #endif
 #endif
 
+#include "me_packaged.h"
 #include "native/me_native_system.h"
 
 extern "C" bool g_me_lockfree_atomics;  // src/native/me_ring_wait.cpp: guest atomics without the global lock
+
+// src/me_usb_files.cpp: developer USB file channel, nothing unless dev_usb_files = true (docs/usb-files.md).
+namespace me::usb_files {
+void Start();
+}  // namespace me::usb_files
 
 class MassEffectApp : public rex::ReXApp {
  public:
@@ -43,6 +49,8 @@ class MassEffectApp : public rex::ReXApp {
   }
 
   void OnPostInitLogging() override {
+    me::packaged::LogStatus();
+    me::usb_files::Start();  // developer USB file channel, off unless dev_usb_files = true
     // The runtime defaults to no GPU plugin: select ReXGlue's Xenos implementation (the native renderer replaces
     // it in OnPreSetup), preserving an explicit command-line or config-file choice.
     if (!rex::cvar::HasNonDefaultValue("gpu_plugin")) {
@@ -54,15 +62,17 @@ class MassEffectApp : public rex::ReXApp {
   // game_root/ folder next to the executable (sdmc:/switch/masseffect-nx/game_root
   // on the SD card). An explicit path always wins.
   void OnConfigurePaths(rex::PathConfig& paths) override {
-    if (!paths.game_data_root.empty()) {
-      return;
+    // Installed full NSP: game data, shaders and toml come from the RomFS (no-op for the NRO; me_packaged.h).
+    me::packaged::ConfigurePaths(paths);
+    if (paths.game_data_root.empty()) {
+      std::error_code ec;
+      const auto folder = rex::filesystem::GetExecutableFolder();
+      const auto extracted = folder / "game_root";
+      if (!folder.empty() && std::filesystem::is_directory(extracted, ec)) {
+        paths.game_data_root = extracted;
+      }
     }
-    std::error_code ec;
-    const auto folder = rex::filesystem::GetExecutableFolder();
-    const auto extracted = folder / "game_root";
-    if (!folder.empty() && std::filesystem::is_directory(extracted, ec)) {
-      paths.game_data_root = extracted;
-    }
+    me::packaged::ReportPaths(paths);  // one line in rex_stderr.log: what was chosen and why
   }
 
   // Analysis aid: with MASSEFFECT_DUMP_IMAGE=<file>, write the loaded guest image

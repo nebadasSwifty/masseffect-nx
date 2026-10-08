@@ -26,16 +26,37 @@ are in [building.md](building.md), step 5. In short, `mesa/build_mesa_docker.sh`
 1. clones mesa-switch, checks out the pinned commit (`d4a00ea0ab3f59afb967cc5d779e4263d237bd77`) and applies the patch;
 2. runs the upstream `build-switch.sh`: builds the image `devkitpro-mesa-rust` (devkitA64, SPIRV-Tools, Rust nightly with
    `rust-src`, `bindgen-cli`, `cbindgen`), the host tools `mesa_clc` and `vtn_bindgen2`, and then the cross build for the
-   Switch (`-Dvulkan-drivers=nouveau -Dplatforms=switch -Dllvm=disabled`, release, `-Db_lto=false`);
+   Switch (`-Dvulkan-drivers=nouveau -Dplatforms=switch -Dllvm=disabled`, release, `-Doptimization=2`, `-Db_lto=false`).
+   Upstream `build-switch.sh` says `-Doptimization=1`; the script rewrites that line to `MESA_OPT` (default 2) before
+   building (see "Optimization level" below);
 3. merges the Rust runtime of the shader compiler (`libnak_rs.a`) into `libvulkan.a`, which alone does not contain it, and
    puts the result in `<OUT>/opt/devkitpro/portlibs/switch/lib/libvulkan.a` (about 122 MB).
 
-It takes an hour or more and about 15 GB the first time. Ninja does not track the driver archive: after a driver change,
-**delete the NRO build folder**, or the old driver stays linked. If you change NAK, raise the shader cache revision in
+It takes an hour or more and about 15 GB the first time. The NRO link depends on the driver archive
+(`LINK_DEPENDS` in `sdk/cmake/rexglue_switch.cmake`, since 2026-10-07), so a rebuilt or swapped `libvulkan.a` is relinked
+by the next `tools/build_nro.sh`; older build folders that were configured before that change should be deleted once. If you change NAK, raise the shader cache revision in
 `nvk_shader.c`, because on Horizon the cache's build id is the package version and shaders compiled by an older NAK would
 be reused. The Docker image takes the latest Rust nightly; the reference build used `rustc 1.101.0-nightly (2026-09-26)`,
 and if a newer nightly breaks the NAK build, install that one. `build_mesa_msys2.sh` (Windows) was not tested with this
 patch.
+
+### Optimization level: -O2 by default
+
+Since 2026-10-07 the driver is built with `-Doptimization=2` (`-O2` for the C code, `opt-level=2` for the NAK Rust
+compiler). Before, it was `-O1`, upstream `build-switch.sh`'s value. Measured on the Switch (RU edition, CPU 1785 /
+GPU 768 MHz, the Normandy route, same toml, only the driver changed): **+5 % draw throughput** in the heavy scenes,
+15.7k -> 16.6k draws/s, 25.8 -> 26.4 fps, frames over 60 ms 160 -> 108 per route. Same source, so the image is the
+same. The analysis is in [nvk-per-draw.md](nvk-per-draw.md).
+
+| Driver | How to build it | How to link it |
+|---|---|---|
+| -O2 (default) | `mesa/build_mesa_docker.sh` (`MESA_OPT=2`), or `OPT=2 OUT=out/mesa-sdk mesa/build_mesa_opt.sh` from an existing tree (about 1 minute) | `tools/build_nro.sh` / `tools/edition.sh` as usual (`out/mesa-sdk`) |
+| -O1 (fallback) | `OPT=1 mesa/build_mesa_opt.sh` (writes `out/mesa-sdk-o1`), or `MESA_OPT=1 OUT=.../mesa-sdk-o1 mesa/build_mesa_docker.sh` | `MESA_OPT=O1 tools/build_nro.sh` or `MESA_OPT=O1 tools/edition.sh ru all` (uses `out/mesa-sdk-o1`, then `../mesa-sdk-o1`) |
+
+`SOURCE.txt` in the SDK folder records the level, `tools/build_nro.sh` prints it before building, and the release
+workflow warns when its `MESA_SDK` is not recorded as `-Doptimization=2`. `--incremental` uses the build folder of
+the requested level (`builddir-switch`, or `builddir-switch-o<N>` of `build_mesa_opt.sh`) and refuses to merge an
+archive of another level.
 
 ## ZCULL: skipping hidden pixels
 

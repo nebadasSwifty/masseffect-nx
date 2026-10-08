@@ -1,11 +1,13 @@
 // Optional: runs only when you point it at your own copy of the game. Read-only.
 //   MASSEFFECT_TEST_ISO=/path/game.iso  MASSEFFECT_TEST_DISC=/path/extracted-disc  node --test test/
+//   MASSEFFECT_TEST_RU_DISC1=/path/Disc1.iso  MASSEFFECT_TEST_RU_DISC2=/path/Disc2.iso  (RU two-disc merge)
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, statSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { openXdvdfs } from '../js/xdvdfs.js';
+import { mergeDiscFiles, auditPackages } from '../js/source.js';
 
 // Node's fs.openAsBlob reports sizes modulo 2^32 for files over 4 GiB, so use a tiny Blob-like adapter
 // (what the parser needs: size, slice(a, b), arrayBuffer()).
@@ -50,4 +52,20 @@ test('XDVDFS listing and file bytes of a real image match the extracted disc', {
     const b = readFileSync(join(disc, f.path)).subarray(0, a.length);
     assert.deepEqual(a, new Uint8Array(b), f.path);
   }
+});
+
+const ru1 = process.env.MASSEFFECT_TEST_RU_DISC1;
+const ru2 = process.env.MASSEFFECT_TEST_RU_DISC2;
+test('RU two-disc merge takes Feros WAR00 from Disc 1 and Ilos LOS00 from Disc 2, result passes the package check', { skip: !ru1 || !ru2 }, async () => {
+  const images = [new FileBlob(ru1), new FileBlob(ru2)];
+  after(() => images.forEach((i) => closeSync(i.fd)));
+  const discs = [];
+  for (const [i, image] of images.entries()) discs.push({ name: `Disc${i + 1}.iso`, files: (await openXdvdfs(image)).files });
+  const { files, decisions, checks } = await mergeDiscFiles(discs);
+  const from = (path) => decisions.find((d) => d.startsWith(`${path}: `))?.split(': ')[1].split(' ')[0];
+  assert.equal(from('Layer0/Maps/BIOA_WAR00.xxx'), 'Disc1.iso');
+  assert.equal(from('Layer0/Maps/BIOA_LOS00.xxx'), 'Disc2.iso');
+  const audit = await auditPackages(files, { cache: checks });
+  assert.deepEqual(audit.bad, []);
+  assert.deepEqual(audit.duplicates, []);
 });

@@ -10,6 +10,7 @@ Usage:
     python3 tools/extract_iso.py "path/to/Mass Effect.iso" --list          list the files, extract nothing
     python3 tools/extract_iso.py "path/to/Mass Effect.iso" --xex-only      extract only default.xex
     python3 tools/extract_iso.py assets/game_root/default.xex --info       print the XEX header of an extracted game
+    python3 tools/extract_iso.py assets/game_root --check-packages         find packages cut shorter than their data
 
 What it does:
   1. Finds where the game partition starts (XGD1, XGD2, XGD3 or a raw partition image).
@@ -249,6 +250,61 @@ def print_xex_info(path):
 # Command line
 # ---------------------------------------------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------------------------------------------
+# Package check
+# ---------------------------------------------------------------------------------------------------------------
+def compressed_package_end(path):
+    """Bytes a compressed UE3 package (.xxx) needs according to its chunk table, or None (not compressed / unknown).
+
+    The header's CompressionFlags and chunk count are followed by (UncompressedOffset, UncompressedSize,
+    CompressedOffset, CompressedSize) per chunk; the chunks are stored back to back right after the header."""
+    with open(path, "rb") as fh:
+        head = fh.read(0x2000)
+    if head[:4] != b"\x9e\x2a\x83\xc1":
+        return None
+    for off in range(0x20, min(0x400, len(head) - 24)):
+        flags, count = struct.unpack_from(">II", head, off)
+        if flags not in (1, 2, 4) or not 1 <= count <= 200 or off + 8 + 16 * count > len(head):
+            continue
+        table = off + 8
+        first = struct.unpack_from(">I", head, table + 8)[0]
+        if not table + 16 * count <= first <= table + 16 * count + 64:
+            continue
+        end = first
+        for i in range(count):
+            _, _, comp_off, comp_size = struct.unpack_from(">IIII", head, table + 16 * i)
+            if comp_off != end:
+                break
+            end = comp_off + comp_size
+        else:
+            return end
+    return None
+
+
+def check_packages(folder):
+    """Lists compressed packages whose chunk table points past the end of the file. Returns their number.
+
+    Example: the Russian two-disc release has the Ilos map, cut short, as Layer0/Maps/BIOA_WAR00.xxx on Disc 2;
+    loading Feros then reads past the end of the file and never finishes (docs/location-tests.md, 1.5)."""
+    checked = bad = 0
+    for dirpath, _, names in os.walk(folder):
+        for name in sorted(names):
+            if not name.lower().endswith(".xxx"):
+                continue
+            path = os.path.join(dirpath, name)
+            end = compressed_package_end(path)
+            if end is None:
+                continue
+            checked += 1
+            size = os.path.getsize(path)
+            if end > size:
+                bad += 1
+                print("  CUT  %s: %s bytes, its chunk table needs %s"
+                      % (os.path.relpath(path, folder), f"{size:,}", f"{end:,}"))
+    print("%d compressed packages checked, %d cut short" % (checked, bad))
+    return bad
+
+
 def default_output():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(root, "assets", "game_root")
@@ -302,11 +358,15 @@ def main(argv=None):
     parser.add_argument("--list", action="store_true", help="list the contents, extract nothing")
     parser.add_argument("--xex-only", action="store_true", help="extract only default.xex (and .xexp patches)")
     parser.add_argument("--info", action="store_true", help="the input is a .xex: print its header and exit")
+    parser.add_argument("--check-packages", action="store_true",
+                        help="the input is an extracted game folder: list packages cut shorter than their data")
     args = parser.parse_args(argv)
 
     try:
         if not os.path.exists(args.input):
             raise ExtractError("File not found: %s" % args.input)
+        if args.check_packages:
+            return 1 if check_packages(args.input) else 0
         if args.info or args.input.lower().endswith(".xex"):
             print_xex_info(args.input)
             return 0

@@ -1,5 +1,6 @@
 // Deferred Vulkan command recording: see masseffect_deferred_recording.h.
 #include "masseffect_deferred_recording.h"
+#include "masseffect_deferred_ring.h"
 
 #include <atomic>
 #include <chrono>
@@ -43,6 +44,11 @@ REXCVAR_DEFINE_INT32(masseffect_deferred_native_batch, 16, "Mass Effect",
                      "published before the ring thread waits, drains or idles)")
     .range(1, 256)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_deferred_native_compact, false, "Mass Effect",
+                    "Queue: each call is packed as a 16-byte header plus its arguments (rounded to 16 bytes) in a "
+                    "64-byte aligned byte ring of the same size, instead of a 128-byte slot per call (a draw's ~8.6 "
+                    "calls write about half the cache lines). Same commands, same order; false = fixed slots")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(masseffect_deferred_native_update, false, "Mass Effect",
                     "vkUpdateDescriptorSets is queued too (its write arrays deep-copied into the arena) instead of "
                     "draining the worker (~70 drains per frame, each a spin-yield of the ring thread). The update runs "
@@ -72,6 +78,14 @@ uint64_t g_read_view = 0;
 bool g_fast = false;
 uint32_t g_batch = 1;
 uint64_t g_batches = 0, g_updates = 0, g_direct_updates = 0;
+// masseffect_deferred_native_compact: the byte ring (positions g_written / g_read count bytes, not slots) and the
+// records queued since the last publication (the batch counts calls, as in the slot queue).
+constexpr size_t kRingBytes = kSlots * sizeof(Slot);
+static_assert((kRingBytes & (kRingBytes - 1)) == 0, "the byte ring must be a power of two");
+bool g_compact = false;
+uint8_t* g_ring = nullptr;
+uint32_t g_unpublished = 0;
+uint64_t g_ring_bytes = 0, g_ring_skips = 0;
 std::atomic<bool> g_sleeping{false};
 std::mutex g_mutex;
 std::condition_variable g_cv;
@@ -103,6 +117,7 @@ void Wake() {
 // Tells the worker about everything queued so far (the batched mode may hold a few commands back).
 void PublishAlready() {
   g_published = g_written_producer;
+  g_unpublished = 0;
   ++g_batches;
   g_written.store(g_written_producer, std::memory_order_seq_cst);
   Wake();
@@ -139,6 +154,44 @@ void Publish() {
   Wake();
 }
 
+// masseffect_deferred_native_compact: room for a record of `bytes` (and the skip record of the ring's tail when it
+// does not fit before the end), with the same full-queue protocol as Reserve. Returns where the record goes.
+uint8_t* ReserveCompact(uint32_t bytes) {
+  uint32_t skip = 0;
+  const uint64_t needed = ring::Needed(g_written_producer, kRingBytes, bytes, skip);
+  if (g_fast) {
+    if (!ring::Fits(g_written_producer, g_read_view, kRingBytes, needed)) {
+      if (g_published != g_written_producer) PublishAlready();  // the worker cannot free bytes it was not told about
+      for (;;) {
+        g_read_view = g_read.load(std::memory_order_acquire);
+        if (ring::Fits(g_written_producer, g_read_view, kRingBytes, needed)) break;
+        Wake();
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+      }
+    }
+  } else {
+    while (!ring::Fits(g_written_producer, g_read.load(std::memory_order_acquire), kRingBytes, needed)) {
+      Wake();
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+  }
+  if (skip) ++g_ring_skips;
+  // The skip record is published together with the record that follows it.
+  return ring::Place(g_ring, kRingBytes, g_written_producer, skip);
+}
+
+void PublishCompact(uint32_t bytes) {
+  g_written_producer += bytes;
+  g_ring_bytes += bytes;
+  ++g_queued;
+  if (g_fast) {
+    if (++g_unpublished >= g_batch) PublishAlready();
+    return;
+  }
+  g_written.store(g_written_producer, std::memory_order_seq_cst);
+  Wake();
+}
+
 int32_t g_priority_producer = -1;
 
 void Worker() {
@@ -147,6 +200,17 @@ void Worker() {
   const bool fast = g_fast;
   for (;;) {
     const uint64_t written = g_written.load(std::memory_order_acquire);
+    if (read < written && g_compact) {
+      // Byte ring: the same protocol, positions in bytes; the read index is stored every 16 records.
+      uint32_t records = 0;
+      do {
+        read = ring::RunOne(g_ring, kRingBytes, read);
+        if (!fast || (++records & 15) == 0) g_read.store(read, std::memory_order_release);
+      } while (read < written);
+      g_read.store(read, std::memory_order_release);
+      empty = 0;
+      continue;
+    }
     if (read < written) {
       if (fast) {
         // The producer only needs the read index when the queue is full or to drain: every 16 commands and at the
@@ -217,6 +281,12 @@ void DrainInternal() {
                 "{} queued, {} direct",
                 g_queued, g_direct, g_drains, g_drains_with_wait, double(g_ns_wait) / 1e6, g_batches,
                 g_updates, g_direct_updates);
+    if (g_compact) {
+      REXLOG_INFO("[native] deferred recording compact queue (10 s): {:.1f} bytes per call ({} slot bytes "
+                  "before), {} ring wraps",
+                  g_queued ? double(g_ring_bytes) / double(g_queued) : 0.0, sizeof(Slot), g_ring_skips);
+    }
+    g_ring_bytes = g_ring_skips = 0;
     g_queued = g_direct = g_drains = g_drains_with_wait = g_ns_wait = 0;
     g_batches = g_updates = g_direct_updates = 0;
   }
@@ -263,6 +333,20 @@ void Enqueue(F f, A... a) {
     std::tuple<A...> args;
   };
   static_assert(sizeof(Package) <= kLoad && alignof(Package) <= 16, "call too large for the queue");
+  if (g_compact) {
+    constexpr uint32_t kBytes = ring::RecordBytes(sizeof(Package));
+    uint8_t* record = ReserveCompact(kBytes);
+    auto* header = reinterpret_cast<ring::Header*>(record);
+    new (record + sizeof(ring::Header)) Package{f, std::tuple<A...>(a...)};
+    header->run = [](void* c) {
+      Package* p = static_cast<Package*>(c);
+      std::apply(p->f, p->args);
+      p->~Package();
+    };
+    header->bytes = kBytes;
+    PublishCompact(kBytes);
+    return;
+  }
   Slot& r = Reserve();
   new (r.load) Package{f, std::tuple<A...>(a...)};
   r.run = [](void* c) {
@@ -645,16 +729,27 @@ const Functions& Table(const Functions& real_fns) {
     }
     g_fast = REXCVAR_GET(masseffect_deferred_native_fast);
     g_batch = g_fast ? uint32_t(REXCVAR_GET(masseffect_deferred_native_batch)) : 1;
-    g_queue = new (std::nothrow) Slot[kSlots];
+    g_compact = REXCVAR_GET(masseffect_deferred_native_compact);
+    if (g_compact) {
+      // 64-byte aligned (one cache line per 64 bytes of records); the slot array is not allocated.
+      g_ring = static_cast<uint8_t*>(::operator new(kRingBytes, std::align_val_t(64), std::nothrow));
+    } else {
+      g_queue = new (std::nothrow) Slot[kSlots];
+    }
     g_arena = new (std::nothrow) uint8_t[kArena];
-    if (!g_queue || !g_arena) {
+    if ((!g_compact && !g_queue) || (g_compact && !g_ring) || !g_arena) {
       REXLOG_ERROR("[native] deferred recording DISABLED: out of memory for the queue ({} KB)",
                    (sizeof(Slot) * kSlots + kArena) / 1024);
       return false;
     }
     g_active.store(true, std::memory_order_release);
-    REXLOG_INFO("[native] deferred recording ready: {} queue slots, {} MB arena", kSlots,
-                kArena >> 20);
+    if (g_compact) {
+      REXLOG_INFO("[native] deferred recording ready: compact queue of {} KB (64-byte aligned), {} KB arena",
+                  kRingBytes >> 10, kArena >> 10);
+    } else {
+      REXLOG_INFO("[native] deferred recording ready: {} queue slots, {} MB arena", kSlots,
+                  kArena >> 20);
+    }
     return true;
   }();
   return built && (REXCVAR_GET(masseffect_native_deferred_recording_parts) & 1) ? g_proxy : real_fns;

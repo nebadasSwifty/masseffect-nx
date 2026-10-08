@@ -83,6 +83,62 @@ int main() {
       accepted += representable;
     }
   }
+  // Second-stage lookup: ALU tolerance passed explicitly. A W=1 position patch matches with tolerance 0,
+  // and an ALU change is never accepted with tolerance 0, whatever the cvar holds.
+  {
+    auto p = default_one; p[4] &= ~0x80000000u;
+    assert(VertexShaderIdentityMatches({V, p}, {V, position}, fetches, index, 0));
+    p[6] ^= 1;
+    g_vs_identity_alu_tolerance.store(4);
+    assert(!VertexShaderIdentityMatches({V, p}, {V, position}, fetches, index, 0));
+    assert(VertexShaderIdentityMatches({V, p}, {V, position}, fetches, index));
+    g_vs_identity_alu_tolerance.store(0);
+  }
+  // Same-register fetch reorder (VS CD057930742AFE84: instructions 11 and 12 write r3.xy and r3.zw; Direct3D
+  // swaps them). CF word: one exec clause at address 3, count 2, both fetches (sequence 0b0101).
+  {
+    std::array<uint32_t, 18> lib{};
+    const uint64_t exec = uint64_t(3) | (uint64_t(2) << 12) | (uint64_t(0x5) << 16) | (uint64_t(1) << 44);
+    lib[0] = uint32_t(exec); lib[1] = uint32_t(exec >> 32) & 0xFFFF;
+    lib[9] = 0x00003000; lib[10] = 0x23F;  // r3.zw
+    lib[12] = 0x00003000; lib[13] = 0xFC8; // r3.xy
+    lib[15] = 0xC80F0001;                  // ALU
+    const std::array<uint32_t, 2> run{3, 4};
+    auto swapped = lib;
+    swapped[9] = 0x05F83000; swapped[10] = 0x40253FC8; swapped[11] = 0x0000090D;
+    swapped[12] = 0x05F83000; swapped[13] = 0x4025323F; swapped[14] = 0x00000B0D;
+    assert(InstructionsInOneExecClause(lib, 3, 4));
+    assert(!InstructionsInOneExecClause(lib, 3, 5));
+    assert(!VertexShaderIdentityMatches({V, swapped}, {V, lib}, run, index, 0));
+    assert(VertexShaderFetchPermutationMatches({V, swapped}, {V, lib}, run, index));
+    g_vs_identity_fetch_permutation.store(false);
+    assert(!VertexShaderProgramMatches({V, swapped}, {V, lib}, run, index));
+    g_vs_identity_fetch_permutation.store(true);
+    assert(VertexShaderProgramMatches({V, swapped}, {V, lib}, run, index));
+    // Not permuted at all: the ordered compare decides, the permutation test says no.
+    assert(!VertexShaderFetchPermutationMatches({V, lib}, {V, lib}, run, index));
+    auto bad = swapped;
+    bad[15] ^= 1; assert(!VertexShaderFetchPermutationMatches({V, bad}, {V, lib}, run, index));  // ALU differs
+    bad = swapped; bad[12] ^= 0x1000;                                                       // other TEMP
+    assert(!VertexShaderFetchPermutationMatches({V, bad}, {V, lib}, run, index));
+    bad = swapped; bad[13] = 0x40253FCF;                                                    // masks overlap
+    assert(!VertexShaderFetchPermutationMatches({V, bad}, {V, lib}, run, index));
+    bad = swapped; bad[1] = 0; bad[0] = 0;                                                  // no exec clause
+    auto lib_no_cf = lib; lib_no_cf[0] = 0; lib_no_cf[1] = 0;
+    assert(!VertexShaderFetchPermutationMatches({V, bad}, {V, lib_no_cf}, run, index));
+    // Two clauses: instruction 3 alone, then 4 alone. Something may run between them: refused.
+    auto split = lib;
+    const uint64_t e1 = uint64_t(3) | (uint64_t(1) << 12) | (uint64_t(0x1) << 16) | (uint64_t(1) << 44);
+    const uint64_t e2 = uint64_t(4) | (uint64_t(1) << 12) | (uint64_t(0x1) << 16) | (uint64_t(1) << 44);
+    split[0] = uint32_t(e1); split[1] = (uint32_t(e1 >> 32) & 0xFFFF) | (uint32_t(e2) << 16);
+    split[2] = uint32_t(e2 >> 16);
+    auto split_loaded = swapped; split_loaded[0] = split[0]; split_loaded[1] = split[1]; split_loaded[2] = split[2];
+    assert(!InstructionsInOneExecClause(split, 3, 4));
+    assert(!VertexShaderFetchPermutationMatches({V, split_loaded}, {V, split}, run, index));
+    // Declared fetches that are not adjacent are no run.
+    const std::array<uint32_t, 1> alone{3};
+    assert(!VertexShaderFetchPermutationMatches({V, swapped}, {V, lib}, alone, index));
+  }
   std::printf("native swizzle exhaustive: %llu / 16777216 accepted\n",
               static_cast<unsigned long long>(accepted));
   std::puts("native shader identity: PASS");

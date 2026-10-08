@@ -1,13 +1,24 @@
 // The installer's work, start to finish. Runs in the page's main thread and drives Web Workers; it never touches the
 // DOM, so the Node tests run it with in-process workers.
 //
-//   download  the build (NRO) and masseffect.toml from the site, checked against manifest.json
+//   download  the build (NRO), masseffect.toml and the edition's prewarm list (optional) from the site, checked
+//             against manifest.json
 //   scan      read the disc's Unreal packages and find the shader containers          (workers: scan.mjs)
 //   translate every container: Xbox 360 microcode -> HLSL -> SPIR-V                   (workers: hlsl.mjs + dxc_web.mjs)
 //   pack      make masseffect_shaders.mesp and its .idx                               (worker: pack.mjs)
-//   zip       stream the zip: nro, toml, shader package, then the disc files (full mode)
+//   zip       stream the zip: nro, toml, prewarm list, shader package, then the disc files (full mode), then the DLC
+//             packages
+//
+// Or, with output 'nsp' (js/nsp.js, docs/full-nsp.md), an installable NSP instead of the zip:
+//   full                       download, scan, translate, pack, nsp_hash (pass 1), nsp_write (pass 2)
+//   update with game data      download, nsp_base (base metadata), scan, translate, pack, nsp_hash, nsp_write
+//   program-only update        download, nsp_base, nsp_write (no shaders, no disc reads)
+//
+// Optional DLC (js/stfs.js packages): their *.xxx files are scanned together with the disc's, their trees and .header
+// files go to the content folder of the runtime, and masseffect.toml gets dlc_enable = true. See docs/dlc.md.
 import { ZipWriter } from './zip.js';
 import { planGameFiles, scanCandidates, sha256Hex } from './plan.js';
+import { buildNsp, metadataFromNsp, PartsReader, sourceFromBytes, PackError, checkUpdateTitle } from './nsp.js';
 
 export class Cancelled extends Error {
   constructor() { super('Cancelled'); this.name = 'Cancelled'; }
@@ -19,6 +30,81 @@ export class UserError extends Error {
 
 const stageIds = ['download', 'scan', 'translate', 'pack', 'zip'];
 export { stageIds };
+
+/** The stages of a run: the zip, or an NSP (options.nsp: { kind: 'full' | 'update', programOnly }). */
+export function stagesFor(output = 'zip', nsp = null) {
+  if (output !== 'nsp') return stageIds;
+  if (nsp?.kind === 'update' && nsp.programOnly) return ['download', 'nsp_base', 'nsp_write'];
+  if (nsp?.kind === 'update') return ['download', 'nsp_base', 'scan', 'translate', 'pack', 'nsp_hash', 'nsp_write'];
+  return ['download', 'scan', 'translate', 'pack', 'nsp_hash', 'nsp_write'];
+}
+
+/** The base of an update: the parsed .basemeta.json, or computed from the base NSP's parts (needs the keys). */
+async function resolveBase(base, keys, { signal, progress, log }) {
+  if (base?.meta) {
+    progress({ done: 1, total: 1, label: 'Base metadata loaded' });
+    return base.meta;
+  }
+  if (!base?.parts?.length) throw new UserError('Choose the base: its .basemeta.json, or the base NSP itself.', 'nsp-base');
+  const reader = new PartsReader(base.parts);
+  progress({ done: 0, total: 1, label: 'Reading the base NSP' });
+  const meta = await metadataFromNsp(reader, keys, {
+    signal, log: (t) => log(t, 'info'),
+    progress: (done, total) => progress({ done, total, label: 'Reading the base NSP (its RomFS is decrypted and hashed, nothing is kept)' }),
+  });
+  progress({ done: 1, total: 1, label: 'Base read' });
+  return meta;
+}
+
+function nspError(e) {
+  if (e instanceof PackError) return new UserError(e.message, 'nsp');
+  if (e?.name === 'Cancelled') return new Cancelled();
+  return e;
+}
+
+/** { titleIdHex: edition name } of every edition with an NSP identity (for checkUpdateTitle). */
+export function knownNspTitles(config) {
+  const out = {};
+  for (const ed of config?.editions ?? []) if (ed.nsp?.titleId) out[ed.nsp.titleId.toLowerCase()] = ed.name;
+  return out;
+}
+
+/**
+ * The NSP identity of a run: the title ID and data folder the page passed (nsp.titleId / nsp.dataDir), else the
+ * edition's (config.js editions[].nsp). Updates keep the base's title ID and, when it recorded one, its data folder.
+ */
+export function nspIdentity(nspOptions, edition) {
+  return {
+    titleId: nspOptions?.titleId ?? edition?.nsp?.titleId ?? null,
+    dataDir: nspOptions?.dataDir ?? edition?.nsp?.dataDir ?? null,
+  };
+}
+
+/** Runs js/nsp.js buildNsp with the page's progress stages; returns its result. */
+async function writeNspStage({ nspOptions, identity, build, entries, baseMeta, sink, signal, stage, log }) {
+  const o = nspOptions;
+  const labels = { hash: 'Pass 1 of 2: hashing the package', write: o.programOnly ? 'Encrypting and writing the update' : 'Pass 2 of 2: encrypting and writing the NSP' };
+  try {
+    return await buildNsp({
+      keys: o.keys,
+      nro: build.nro,
+      entries,
+      update: o.kind === 'update' ? { baseMeta, programOnly: !!o.programOnly } : null,
+      version: o.version ?? 0,
+      // Full: the edition's title ID and folder. Update: buildNsp takes the base's title ID (checked against the
+      // edition's in run() before any work) and the base's folder when the base recorded one.
+      titleId: o.kind === 'update' ? undefined : identity.titleId ?? undefined,
+      dataDir: (o.kind === 'update' ? baseMeta.data_dir || identity.dataDir : identity.dataDir) || undefined,
+      displayVersion: o.displayVersion ?? null,
+      signer: o.signer, aesKeyFor: o.aesKeyFor, createdUtc: o.createdUtc, chunkBytes: o.chunkBytes,
+      sink, signal,
+      log: (t, level) => log(t, level ?? 'info'),
+      onProgress: (phase, done, total) => stage(phase === 'hash' ? 'nsp_hash' : 'nsp_write')({ done, total, label: labels[phase] }),
+    });
+  } catch (e) {
+    throw nspError(e);
+  }
+}
 
 function abs(rel, baseUrl) {
   return new URL(rel, baseUrl).href;
@@ -91,7 +177,14 @@ async function fetchWithProgress(url, fetchImpl, signal, onBytes) {
   return out;
 }
 
-/** Fetches the NRO of the edition and masseffect.toml; verifies both against releases/manifest.json when present. */
+/** "NFPL": the first four bytes of a pipeline prewarm list (tools/extract_prewarm_list.py). */
+const PREWARM_LIST_MAGIC = [0x4E, 0x46, 0x50, 0x4C];
+
+/**
+ * Fetches the NRO of the edition, masseffect.toml and the edition's prewarm list (editions[].prewarmList); verifies
+ * them against releases/manifest.json when present. The list is optional: when the release does not have it (not in
+ * the manifest, or not on the site) the build continues without it and only the log says so.
+ */
 export async function fetchBuild(config, edition, { baseUrl, fetchImpl = fetch, signal, progress, log }) {
   let manifest = null;
   try {
@@ -104,14 +197,30 @@ export async function fetchBuild(config, edition, { baseUrl, fetchImpl = fetch, 
     { key: 'nro', label: edition.nro, url: abs(config.build.siteDir + edition.nro, baseUrl), manifestName: edition.nro },
     { key: 'toml', label: config.files.toml, url: abs(config.build.toml, baseUrl), manifestName: config.files.toml },
   ];
+  const list = edition.prewarmList;
+  if (!list || !config.files.prewarmList) {
+    log?.('This edition has no shipped pipeline prewarm list: the first start compiles more pipelines during play.', 'warn');
+  } else if (manifest && !manifest.assets?.[list]) {
+    log?.(`The release has no ${list} (shipped pipeline prewarm list); installing without it: the first start compiles more pipelines during play.`, 'warn');
+  } else {
+    files.push({ key: 'prewarmList', label: list, url: abs(config.build.siteDir + list, baseUrl), manifestName: list, optional: true });
+  }
   const out = {};
   let doneBytes = 0;
   const totalBytes = files.reduce((a, f) => a + (manifest?.assets?.[f.manifestName]?.size ?? 0), 0) || 0;
   for (const f of files) {
     const base = doneBytes;
-    const data = await fetchWithProgress(f.url, fetchImpl, signal, (got, total) => {
-      progress({ done: base + got, total: totalBytes || base + (total || got), label: `Downloading ${f.label}` });
-    });
+    let data;
+    try {
+      data = await fetchWithProgress(f.url, fetchImpl, signal, (got, total) => {
+        progress({ done: base + got, total: totalBytes || base + (total || got), label: `Downloading ${f.label}` });
+      });
+    } catch (e) {
+      // Without a manifest entry nothing says the release has the list: a failed download only means it has none.
+      if (!f.optional || e instanceof Cancelled || manifest?.assets?.[f.manifestName]) throw e;
+      log?.(`${f.label} (shipped pipeline prewarm list) could not be downloaded (${e.message}); installing without it.`, 'warn');
+      continue;
+    }
     const entry = manifest?.assets?.[f.manifestName];
     if (entry) {
       if (entry.size !== data.length) throw new UserError(`${f.label} has the wrong size (${data.length}, expected ${entry.size}). Try again in a minute; the site may be updating.`, 'integrity');
@@ -120,6 +229,10 @@ export async function fetchBuild(config, edition, { baseUrl, fetchImpl = fetch, 
       }
     } else if (f.key === 'nro') {
       log?.('No manifest.json on the site: the build could not be verified against a checksum.', 'warn');
+    }
+    if (f.key === 'prewarmList' && (data.length < 16 || PREWARM_LIST_MAGIC.some((b, i) => data[i] !== b))) {
+      log?.(`${f.label} is not a pipeline prewarm list; installing without it.`, 'warn');
+      continue;
     }
     out[f.key] = data;
     doneBytes += data.length;
@@ -286,6 +399,64 @@ async function* readChunks(blob, chunkBytes, signal) {
 
 async function* bytesOnce(bytes) { if (bytes.length) yield bytes; }
 
+/**
+ * Sets `key = true` in a masseffect.toml (bytes in, bytes out). An existing top-level assignment of the key (commented
+ * out or not) is replaced in place; otherwise the line is appended, before the first [table] if the file has one, so
+ * it stays a top-level key.
+ */
+export function enableTomlFlag(bytes, key) {
+  const text = new TextDecoder().decode(bytes);
+  const lines = text.split('\n');
+  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const assignment = new RegExp(`^\\s*#?\\s*${esc}\\s*=`);
+  const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
+  const topLevel = firstTable < 0 ? lines.length : firstTable;
+  const line = `${key} = true`;
+  let at = lines.findIndex((l, i) => i < topLevel && assignment.test(l) && !/^\s*#/.test(l));
+  if (at < 0) at = lines.findIndex((l, i) => i < topLevel && assignment.test(l));
+  if (at >= 0) {
+    lines[at] = line;
+  } else {
+    const block = ['', '# Downloadable content added by the installer (see docs/dlc.md).', line];
+    if (firstTable < 0) {
+      if (lines.length && lines[lines.length - 1] === '') lines.splice(lines.length - 1, 0, ...block);
+      else lines.push(...block, '');
+    } else {
+      lines.splice(firstTable, 0, ...block.slice(1), '');
+    }
+  }
+  return new TextEncoder().encode(lines.join('\n'));
+}
+
+/**
+ * The zip entries of the DLC packages: every file under <root>/<dlc.contentDir>/<folder>/ and one
+ * <root>/<dlc.headersDir>/<folder>.header per package. Returns [{name, size, blob | bytes}].
+ */
+export function dlcZipEntries(config, packages) {
+  const root = config.zip.root;
+  const out = [];
+  const seen = new Set();
+  for (const pkg of packages ?? []) {
+    const folder = pkg.folderName;
+    if (seen.has(folder.toLowerCase())) throw new UserError(`Two DLC packages would use the same folder name ${folder}.`, 'dlc');
+    seen.add(folder.toLowerCase());
+    for (const f of pkg.files) {
+      out.push({ name: `${root}/${config.dlc.contentDir}/${folder}/${f.path}`, size: f.size, blob: f.blob });
+    }
+    out.push({ name: `${root}/${config.dlc.headersDir}/${folder}.header`, size: pkg.header.length, bytes: pkg.header });
+  }
+  return out;
+}
+
+/** The DLC files that go into the shader scan, with a path that names the package (for the log). */
+export function dlcScanFiles(packages) {
+  const out = [];
+  for (const pkg of packages ?? []) {
+    for (const f of pkg.files) out.push({ path: `DLC/${pkg.folderName}/${f.path}`, size: f.size, blob: f.blob });
+  }
+  return out;
+}
+
 async function* packageChunks(packRemote, file, size, chunkBytes, signal) {
   for (let offset = 0; offset < size; offset += chunkBytes) {
     throwIfCancelled(signal);
@@ -298,11 +469,17 @@ async function* packageChunks(packRemote, file, size, chunkBytes, signal) {
 /**
  * Runs the whole thing.
  * options: { config, edition, files (disc files, re-rooted), mode: 'full'|'update', sink, createWorker(kind),
+ *            dlc (optional: packages from js/stfs.js openStfs()),
+ *            output: 'zip' (default) | 'nsp', nsp (with output 'nsp'): { keys, kind: 'full'|'update', programOnly,
+ *              base: { meta } | { parts: [File] } (updates), version, titleId, dataDir (default: the edition's nsp),
+ *              displayVersion } and a sink from
+ *              js/nsp_sink.js,
  *            baseUrl, fetchImpl, signal, onProgress(stageId, {done,total,label}), onLog(text, level) }
- * Returns { zipBytes, shaders: {ok, failures, total}, sinkResult }.
+ * Returns { zipBytes, shaders: {ok, failures, total}, sinkResult } (zip) or { nspBytes, nsp, baseMeta, shaders, sinkResult } (NSP).
  */
 export async function run(options) {
   const { config, edition, files, mode, sink, createWorker, baseUrl, signal } = options;
+  const dlc = options.dlc ?? [];
   const fetchImpl = options.fetchImpl ?? fetch;
   const log = options.onLog ?? (() => {});
   const stage = (id) => (p) => options.onProgress?.(id, p);
@@ -312,21 +489,55 @@ export async function run(options) {
   signal?.addEventListener('abort', onAbort);
   const names = config.files;
   const root = config.zip.root;
+  const nspOptions = options.output === 'nsp' ? options.nsp : null;
+  const programOnly = nspOptions?.kind === 'update' && !!nspOptions.programOnly;
   try {
+    if (options.output === 'nsp' && !nspOptions?.keys) throw new UserError('Choose your prod.keys first.', 'nsp-keys');
     if (names.shadersIndex !== `${names.shaders}.idx`) {
       throw new UserError('config.js: files.shadersIndex must be files.shaders + ".idx" (the packer derives the index name).', 'config');
     }
     throwIfCancelled(signal);
-    const missing = await checkToolchain(config, baseUrl, fetchImpl);
+    const missing = programOnly ? [] : await checkToolchain(config, baseUrl, fetchImpl);
     if (missing.length) {
       throw new UserError(`The shader tools are not on this site: missing ${missing.join(', ')}. ` +
         'The site build did not include the WebAssembly tools (see installer/README.md); the shaders cannot be made in the browser until it does.', 'wasm-missing');
     }
     const build = await fetchBuild(config, edition, { baseUrl, fetchImpl, signal, progress: stage('download'), log });
     log(build.tag ? `Build ${build.tag} downloaded.` : 'Build downloaded.', 'info');
+    if (build.prewarmList) log(`Shipped pipeline prewarm list: ${build.prewarmList.length.toLocaleString('en-US')} bytes, installed as ${names.prewarmList}.`, 'info');
+    if (dlc.length) {
+      build.toml = enableTomlFlag(build.toml, config.dlc.tomlKey);
+      log(`DLC: ${dlc.map((p) => `${p.meta?.displayName || p.folderName} (${p.files.length} files)`).join(', ')}; ${config.files.toml} gets ${config.dlc.tomlKey} = true.`, 'info');
+    }
+
+    const identity = nspIdentity(nspOptions, edition);
+    const knownTitleIds = knownNspTitles(config);
+    let baseMeta = null;
+    if (nspOptions?.kind === 'update') {
+      throwIfCancelled(signal);
+      try {
+        baseMeta = await resolveBase(nspOptions.base, nspOptions.keys, { signal, progress: stage('nsp_base'), log });
+      } catch (e) { throw nspError(e); }
+      log(`Base: title ${baseMeta.title_id}, ${Object.keys(baseMeta.files).length} files, Program NCA ${baseMeta.program_nca}.`, 'info');
+      // Before any shader work: an update for another edition's base is refused here (buildNsp checks again).
+      if (identity.titleId) {
+        try {
+          const warning = checkUpdateTitle(baseMeta.title_id, identity.titleId, knownTitleIds);
+          if (warning) log(warning, 'warn');
+        } catch (e) { throw nspError(e); }
+      }
+    } else if (nspOptions) {
+      log(`NSP: title ${identity.titleId ?? '(default)'}, data folder ${identity.dataDir ?? '(default)'}.`, 'info');
+    }
+    if (programOnly) {
+      const nsp = await writeNspStage({ nspOptions, identity, build, entries: null, baseMeta, sink, signal, stage, log });
+      const sinkResult = await sink.close();
+      return { nspBytes: nsp.size, nsp, baseMeta, shaders: null, sinkResult, tag: build.tag };
+    }
 
     throwIfCancelled(signal);
-    const containers = await scanStage({ workers, urls, files, config, signal, progress: stage('scan'), log });
+    const scanFiles = dlc.length ? [...files, ...dlcScanFiles(dlc)] : files;
+    const containers = await scanStage({ workers, urls, files: scanFiles, config, signal, progress: stage('scan'), log });
 
     // Inject supplemental runtime/UI containers (Direct3D immediate mode and Scaleform UI shaders).
     if (urls.runtimeContainers) {
@@ -372,10 +583,36 @@ export async function run(options) {
     if (!packed.ok) {
       throw new UserError(packed.memory
         ? `Packing the shaders ran out of memory (${packed.error}). Close other tabs and programs and try again in a desktop browser with at least 8 GB of RAM.`
-        : `Packing the shaders failed: ${packed.error}`, 'pack');
+        : `Packing the shaders failed: ${packed.error}${dlc.length ? ' (with DLC the package is larger; the game accepts at most 1 GiB)' : ''}`, 'pack');
+    }
+    const cap = config.limits.maxShaderPackageBytes;
+    if (cap && packed.sizes.package > cap) {
+      throw new UserError(`The shader package is ${packed.sizes.package.toLocaleString('en-US')} bytes, more than the ${cap.toLocaleString('en-US')} bytes (1 GiB) the game can load` +
+        `${dlc.length ? '. Try again with fewer DLC packages' : ''}.`, 'shader-cap');
     }
     stage('pack')({ done: 1, total: 1, label: `Shader library packed: ${packed.sizes.package.toLocaleString('en-US')} bytes + ${packed.sizes.index.toLocaleString('en-US')} index` });
     log(packed.summary || 'Packed.', 'info');
+
+    if (nspOptions) {
+      // ---- the NSP: the same files as the full zip, as RomFS entries (paths relative to the zip's root folder) ----
+      throwIfCancelled(signal);
+      const gamePlan = planGameFiles(files, config.disc);
+      const entries = [
+        { path: names.toml, ...sourceFromBytes(build.toml) },
+        ...(build.prewarmList ? [{ path: names.prewarmList, ...sourceFromBytes(build.prewarmList) }] : []),
+        { path: names.shaders, size: packed.sizes.package, chunks: () => packageChunks(packRemote, names.shaders, packed.sizes.package, 8 * 1024 * 1024, signal) },
+        { path: names.shadersIndex, size: packed.sizes.index, chunks: () => packageChunks(packRemote, names.shadersIndex, packed.sizes.index, 8 * 1024 * 1024, signal) },
+      ];
+      for (const f of gamePlan.copy) {
+        entries.push({ path: `${config.zip.gameRootDir}/${f.path}`, size: f.size, chunks: () => readChunks(f.blob, config.limits.copyChunkBytes, signal) });
+      }
+      for (const e of dlcZipEntries(config, dlc)) {
+        entries.push({ path: e.name.slice(root.length + 1), size: e.size, chunks: () => (e.bytes ? bytesOnce(e.bytes) : readChunks(e.blob, config.limits.copyChunkBytes, signal)) });
+      }
+      const nsp = await writeNspStage({ nspOptions, identity, build, entries, baseMeta, sink, signal, stage, log });
+      const sinkResult = await sink.close();
+      return { nspBytes: nsp.size, nsp, baseMeta, shaders, sinkResult, tag: build.tag };
+    }
 
     // ---- the zip ----
     throwIfCancelled(signal);
@@ -383,6 +620,7 @@ export async function run(options) {
     const entries = [
       { name: `${root}/${names.nro}`, size: build.nro.length, chunks: () => bytesOnce(build.nro) },
       { name: `${root}/${names.toml}`, size: build.toml.length, chunks: () => bytesOnce(build.toml) },
+      ...(build.prewarmList ? [{ name: `${root}/${names.prewarmList}`, size: build.prewarmList.length, chunks: () => bytesOnce(build.prewarmList) }] : []),
       { name: `${root}/${names.shaders}`, size: packed.sizes.package, chunks: () => packageChunks(packRemote, names.shaders, packed.sizes.package, 8 * 1024 * 1024, signal) },
       { name: `${root}/${names.shadersIndex}`, size: packed.sizes.index, chunks: () => packageChunks(packRemote, names.shadersIndex, packed.sizes.index, 8 * 1024 * 1024, signal) },
     ];
@@ -390,6 +628,10 @@ export async function run(options) {
       for (const f of plan.copy) {
         entries.push({ name: `${root}/${config.zip.gameRootDir}/${f.path}`, size: f.size, chunks: () => readChunks(f.blob, config.limits.copyChunkBytes, signal) });
       }
+    }
+    // DLC in both modes: an update may be the run that adds DLC to an existing install.
+    for (const e of dlcZipEntries(config, dlc)) {
+      entries.push({ name: e.name, size: e.size, chunks: () => (e.bytes ? bytesOnce(e.bytes) : readChunks(e.blob, config.limits.copyChunkBytes, signal)) });
     }
     const totalBytes = entries.reduce((a, e) => a + e.size, 0);
     let written = 0;

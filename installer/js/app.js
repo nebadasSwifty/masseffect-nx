@@ -1,10 +1,16 @@
 // The page: picks the source, shows the detected edition, runs the pipeline with progress.
-import { CONFIG } from '../config.js?v=0.1.4';
-import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc } from './source.js';
-import { planGameFiles, formatBytes, formatDuration } from './plan.js';
+import { CONFIG } from '../config.js?v=0.3.1';
+import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc, auditPackages } from './source.js';
+import { planGameFiles, formatBytes } from './plan.js';
 import { openSink, describeSinkSupport, cleanStaleTemporaryFiles } from './sink.js';
-import { run, Cancelled, UserError, stageIds } from './pipeline.js';
-import { initLanguage, getLanguage, setLanguage, t } from './i18n.js';
+import { run, Cancelled, UserError, stageIds, stagesFor } from './pipeline.js';
+import { initLanguage, getLanguage, setLanguage, t } from './i18n.js?v=0.3.1';
+import {
+  parseProdKeys, forgetKeys, estimateNspBytes, estimateProgramUpdateBytes, parseBaseMetadata, nextUpdateVersion,
+  withLastUpdateVersion, pythonJson, inspectBaseNsp, PartsReader,
+} from './nsp.js';
+import { openNspSink, nspSinkSupport, saveTextFile } from './nsp_sink.js';
+import { openStfs, verifyStfs } from './stfs.js';
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => {
@@ -19,9 +25,28 @@ const STAGE_KEYS = {
   translate: 'stage_translate',
   pack: 'stage_pack',
   zip: 'stage_zip',
+  nsp_base: 'stage_nsp_base',
+  nsp_hash: 'stage_nsp_hash',
+  nsp_write: 'stage_nsp_write',
 };
 
-const state = { format: 'iso', disc: null, running: false, abort: null };
+// outcome: null | 'ok' | 'err' | 'cancelled' (last run of step 4, drives the step indicator).
+const state = {
+  format: 'iso', disc: null, running: false, abort: null, dlc: [], dlcBusy: false, outcome: null, stages: stageIds,
+  // Installable NSP: keys (only the two the package needs, in memory, dropped on pagehide), the kind, the output
+  // form, and the base of an update ({ meta, name, metaName } or { parts, name, metaName, info }).
+  nsp: { keys: null, kind: 'full', out: 'file', base: null },
+};
+
+/** Localized duration for the page (same rounding as formatDuration in plan.js). */
+function duration(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return '';
+  const s = Math.round(seconds);
+  if (s < 60) return t('dur_s', { s });
+  const m = Math.floor(s / 60);
+  if (m < 60) return t('dur_min', { m, s: String(s % 60).padStart(2, '0') });
+  return t('dur_h', { h: Math.floor(m / 60), m: String(m % 60).padStart(2, '0') });
+}
 
 // ---- i18n & language toggle ------------------------------------------------------------------------------------
 function updateFormatTexts() {
@@ -46,11 +71,46 @@ function applyLanguage() {
     if (isHtml) elem.innerHTML = t(key);
     else elem.textContent = t(key);
   }
+  for (const elem of document.querySelectorAll('[data-i18n-alt]')) elem.alt = t(elem.getAttribute('data-i18n-alt'));
+  for (const elem of document.querySelectorAll('[data-i18n-aria]')) elem.setAttribute('aria-label', t(elem.getAttribute('data-i18n-aria')));
 
   updateFormatTexts();
   if (state.disc) {
     showEdition();
   }
+  renderDlc();
+  renderNsp();
+  updateWizard();
+  if (state.running) for (const id of state.stages) if (rows[id]) rows[id].name.textContent = t(STAGE_KEYS[id] || id);
+}
+
+// ---- step indicator --------------------------------------------------------------------------------------------
+/** Sets pending / active / done / error / optional on the four step columns from the page state. */
+function updateWizard() {
+  const items = document.querySelectorAll('#wizard .wstep');
+  if (!items.length) return;
+  const sourceError = $('source-status').classList.contains('err');
+  const dlcError = $('dlc-status').classList.contains('err');
+  const d = state.disc;
+  let s1, s2, s3, s4;
+  if (!d) {
+    s1 = sourceError ? 'error' : 'active';
+    s2 = s3 = s4 = 'pending';
+  } else {
+    s1 = 'done';
+    s2 = 'done';
+    s3 = state.dlcBusy ? 'active' : dlcError ? 'error' : state.dlc.length ? 'done' : 'optional';
+    s4 = state.running ? 'active' : state.outcome === 'ok' ? 'done' : state.outcome === 'err' ? 'error' : 'active';
+    if (state.dlcBusy && s4 === 'active') s4 = 'pending';
+  }
+  [s1, s2, s3, s4].forEach((st, i) => {
+    const li = items[i];
+    li.className = `wstep ${st}`;
+    if (st === 'active') li.setAttribute('aria-current', 'step');
+    else li.removeAttribute('aria-current');
+    const sr = li.querySelector('.wstate');
+    if (sr) sr.textContent = ` (${t(`step_state_${st}`)})`;
+  });
 }
 
 initLanguage();
@@ -116,9 +176,12 @@ function resetDisc() {
   if (state.running) return;
   state.disc = null;
   $('step-edition').hidden = true;
+  $('step-dlc').hidden = true;
   $('step-create').hidden = true;
   $('source-status').textContent = '';
   $('source-status').className = 'status';
+  state.outcome = null;
+  updateWizard();
 }
 
 for (const r of document.querySelectorAll('input[name=format]')) r.addEventListener('change', () => r.checked && setFormat(r.value));
@@ -127,6 +190,7 @@ function status(text, isError = false) {
   const s = $('source-status');
   s.textContent = text;
   s.className = isError ? 'status err' : 'status';
+  updateWizard();
 }
 
 $('pick').addEventListener('click', async () => {
@@ -135,7 +199,7 @@ $('pick').addEventListener('click', async () => {
       const handle = await showDirectoryPicker({ mode: 'read' });
       await load(async () => sourceFromDirectoryHandle(handle, (n) => status(t('status_folder_listing', { count: n }))));
     } catch (e) {
-      if (e?.name !== 'AbortError') status(`Could not open the folder: ${e.message}`, true);
+      if (e?.name !== 'AbortError') status(t('err_open_folder', { error: e.message }), true);
     }
     return;
   }
@@ -145,7 +209,7 @@ $('pick').addEventListener('click', async () => {
 $('file-iso').addEventListener('change', (e) => {
   const files = [...e.target.files];
   e.target.value = '';
-  if (files.length) load(() => sourceFromIso(files));
+  if (files.length) load(() => sourceFromIso(files, isoOptions()));
 });
 
 $('file-folder').addEventListener('change', (e) => {
@@ -164,15 +228,15 @@ drop.addEventListener('drop', async (e) => {
     const dropped = await sourceFromDataTransfer(e.dataTransfer, (n) => status(t('status_folder_listing', { count: n })));
     if (dropped.files?.length) {
       setRadio('iso');
-      load(() => sourceFromIso(dropped.files));
+      load(() => sourceFromIso(dropped.files, isoOptions()));
     } else if (dropped.file) {
       setRadio(dropped.file.name.toLowerCase().endsWith('.iso') || dropped.file.size > 100e6 ? 'iso' : state.format);
-      load(() => sourceFromIso(dropped.file));
+      load(() => sourceFromIso(dropped.file, isoOptions()));
     } else {
       setRadio('folder');
       load(async () => dropped.source);
     }
-  } catch (err) { status(`Could not read what was dropped: ${err.message}`, true); }
+  } catch (err) { status(t('err_drop', { error: err.message }), true); }
 });
 
 function setRadio(v) {
@@ -180,6 +244,10 @@ function setRadio(v) {
   if (state.format !== v) {
     setFormat(v);
   }
+}
+
+function isoOptions() {
+  return { onProgress: (done, total) => status(t('status_merging', { done, total })) };
 }
 
 async function load(makeSource) {
@@ -190,7 +258,11 @@ async function load(makeSource) {
     const source = await makeSource();
     status(t('status_checking'));
     const info = await inspectDisc(source, CONFIG);
-    state.disc = { source, ...info };
+    const check = CONFIG.disc.packageCheck ?? { scope: 'all', block: false };
+    const packages = await auditPackages(info.files, {
+      scope: check.scope, cache: source.checks, onProgress: (done, total) => status(t('status_packages', { done, total })),
+    });
+    state.disc = { source, ...info, packages };
     status(`${source.label}: ${info.files.length.toLocaleString('en-US')} files (${source.detail}).`);
     showEdition();
   } catch (e) {
@@ -214,10 +286,7 @@ function showEdition() {
     ? el('span', { className: 'badge warn', textContent: t('badge_unverified') })
     : el('span', { className: 'badge ok', textContent: t('badge_supported') });
 
-  const editionSelect = el('select', {
-    className: 'edition-picker',
-    style: 'display: block; margin-top: 6px; font: inherit; font-size: 0.9rem; background: var(--bg2); color: var(--text); border: 1px solid var(--card-border); border-radius: 6px; padding: 4px 8px; cursor: pointer;'
-  });
+  const editionSelect = el('select', { className: 'edition-picker', id: 'edition-picker' });
   for (const ed of CONFIG.editions) {
     const opt = el('option', { value: ed.id, textContent: ed.name });
     if (ed.id === d.edition.id) opt.selected = true;
@@ -240,8 +309,8 @@ function showEdition() {
       el('dt', { textContent: t('edition_label') }),
       el('dd', {},
         el('strong', { textContent: d.edition.name }), ' ', badge,
-        el('div', { style: 'margin-top: 8px;' },
-          el('span', { style: 'font-size: 0.85em; color: var(--muted); display: block; margin-bottom: 2px;', textContent: t('override_edition_label') }),
+        el('div', { className: 'edition-picker-wrap' },
+          el('label', { className: 'edition-picker-label', htmlFor: 'edition-picker', textContent: t('override_edition_label') }),
           editionSelect,
         ),
       ),
@@ -258,17 +327,155 @@ function showEdition() {
       ),
     );
   }
+  const blocked = packageWarning(d, elements);
   body.replaceChildren(...elements);
+  if (blocked) {
+    $('step-dlc').hidden = true;
+    $('step-create').hidden = true;
+    updateWizard();
+    return;
+  }
+  $('step-dlc').hidden = false;
+  renderDlc();
   showCreate();
 }
 
+/** Adds the warning about bad or swapped packages (if any) to `elements`. Returns true when creating is blocked. */
+function packageWarning(d, elements) {
+  const p = d.packages;
+  if (!p || (!p.bad.length && !p.duplicates.length)) return false;
+  const items = [];
+  for (const b of p.bad) items.push(`${b.path}: ${b.problems[0]}`);
+  for (const g of p.duplicates) {
+    for (const path of g) {
+      const name = (x) => x.slice(x.lastIndexOf('/') + 1);
+      const others = g.filter((x) => name(x).toLowerCase() !== name(path).toLowerCase()).map(name).join(', ');
+      items.push(`${path}: ${t('pkg_warn_dup', { others })}`);
+    }
+  }
+  const shown = items.slice(0, 12);
+  const advice = d.source.kind === 'folder' ? 'pkg_warn_advice_folder'
+    : (d.source.discCount ?? 1) > 1 ? 'pkg_warn_advice_merged' : 'pkg_warn_advice_iso';
+  const blocked = Boolean(CONFIG.disc.packageCheck?.block);
+  elements.push(
+    el('div', { className: 'notice warn' },
+      el('p', {}, el('strong', { textContent: t('pkg_warn_title', { count: items.length }) })),
+      el('p', { textContent: t('pkg_warn_body') }),
+      el('ul', {}, ...shown.map((text) => el('li', {}, el('code', { textContent: text })))),
+      ...(items.length > shown.length ? [el('p', { textContent: t('pkg_warn_more', { count: items.length - shown.length }) })] : []),
+      el('p', { textContent: t(advice) }),
+      el('p', { textContent: t(blocked ? 'pkg_warn_blocked' : 'pkg_warn_continue') }),
+    ),
+  );
+  return blocked;
+}
+
+// ---- step 3: optional DLC packages ------------------------------------------------------------------------------
+function dlcBytes() {
+  return state.dlc.reduce((a, p) => a + p.payloadBytes + p.header.length, 0);
+}
+
+function dlcExtraBytes() {
+  return state.dlc.length ? dlcBytes() + CONFIG.limits.expectedDlcShaderBytes : 0;
+}
+
+function dlcStatus(text, isError = false) {
+  const s = $('dlc-status');
+  s.textContent = text;
+  s.className = isError ? 'status err' : 'status';
+  updateWizard();
+}
+
+function renderDlc() {
+  const list = $('dlc-list');
+  if (!list) return;
+  list.replaceChildren(...state.dlc.map((p, i) => {
+    const remove = el('button', { className: 'btn small', type: 'button', textContent: t('dlc_remove') });
+    remove.disabled = state.running || state.dlcBusy;
+    remove.addEventListener('click', () => {
+      if (state.running || state.dlcBusy) return;
+      state.dlc.splice(i, 1);
+      renderDlc();
+      dlcStatus(state.dlc.length ? t('dlc_added', { count: state.dlc.length, bytes: formatBytes(dlcBytes()) }) : t('dlc_none'));
+      if (state.disc) showCreate();
+    });
+    return el('li', {},
+      el('div', { className: 'meta' },
+        el('strong', { textContent: p.meta.displayName || p.folderName }),
+        el('span', { className: 'muted', textContent: t('dlc_item_detail', { file: p.fileName, files: p.files.length.toLocaleString('en-US'), bytes: formatBytes(p.meta.fileSize) }) })),
+      remove);
+  }));
+  $('dlc-pick').disabled = state.running || state.dlcBusy || envProblems().problems.length > 0;
+}
+
+/** Opens, validates and SHA-1 checks each picked file; adds the good ones to state.dlc, reports the others. */
+async function addDlc(fileList) {
+  if (state.running || state.dlcBusy) return;
+  state.dlcBusy = true;
+  setButtons(false);
+  renderDlc();
+  const errors = [];
+  try {
+    for (const file of fileList) {
+      dlcStatus(t('dlc_reading', { name: file.name }));
+      try {
+        const pkg = await openStfs(file, {
+          fileName: file.name,
+          expect: { titleId: CONFIG.dlc.titleId, contentType: CONFIG.dlc.contentType },
+          licenseMask: CONFIG.dlc.licenseMask,
+        });
+        if (state.dlc.some((p) => p.meta.contentId === pkg.meta.contentId || p.folderName.toLowerCase() === pkg.folderName.toLowerCase())) {
+          errors.push(t('dlc_rejected', { name: file.name, reason: t('dlc_duplicate') }));
+          continue;
+        }
+        await verifyStfs(pkg, {
+          onProgress: (done, total) => dlcStatus(t('dlc_verifying', { name: pkg.meta.displayName || file.name, percent: total ? Math.floor((done / total) * 100) : 100 })),
+        });
+        pkg.fileName = file.name;
+        state.dlc.push(pkg);
+        renderDlc();
+      } catch (e) {
+        errors.push(t('dlc_rejected', { name: file.name, reason: e?.message ?? String(e) }));
+      }
+    }
+  } finally {
+    state.dlcBusy = false;
+    renderDlc();
+    const summary = state.dlc.length ? t('dlc_added', { count: state.dlc.length, bytes: formatBytes(dlcBytes()) }) : t('dlc_none');
+    dlcStatus(errors.length ? `${errors.join('\n')}\n${summary}` : summary, errors.length > 0);
+    if (state.disc) showCreate();
+  }
+}
+
+$('dlc-pick').addEventListener('click', () => $('file-dlc').click());
+$('file-dlc').addEventListener('change', (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (files.length) addDlc(files);
+});
+const dlcDrop = $('dlc-drop');
+for (const ev of ['dragenter', 'dragover']) dlcDrop.addEventListener(ev, (e) => { e.preventDefault(); dlcDrop.classList.add('over'); });
+for (const ev of ['dragleave', 'drop']) dlcDrop.addEventListener(ev, () => dlcDrop.classList.remove('over'));
+dlcDrop.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const files = [...(e.dataTransfer?.files ?? [])].filter((f) => f.size > 0);
+  if (files.length) addDlc(files);
+});
+
 function showCreate() {
   const d = state.disc;
-  const fullBytes = d.plan.copyBytes + CONFIG.limits.expectedShaderBytes + CONFIG.limits.expectedNroBytes;
-  const updBytes = CONFIG.limits.expectedShaderBytes + CONFIG.limits.expectedNroBytes;
+  const extra = dlcExtraBytes();
+  const fullBytes = d.plan.copyBytes + CONFIG.limits.expectedShaderBytes + CONFIG.limits.expectedNroBytes + extra;
+  const updBytes = CONFIG.limits.expectedShaderBytes + CONFIG.limits.expectedNroBytes + extra;
   const info = $('create-info');
+  const card = (label, value) => el('div', { className: 'info-card' }, el('span', { textContent: label }), el('b', { textContent: value }));
   const lines = [
-    el('p', { innerHTML: t('create_estimate', { full: formatBytes(fullBytes), upd: formatBytes(updBytes) }) }),
+    el('div', { className: 'info-cards' },
+      card(t('card_game_files'), `${d.plan.copy.length.toLocaleString('en-US')} · ${formatBytes(d.plan.copyBytes)}`),
+      card(t('card_dlc'), state.dlc.length ? t('card_dlc_value', { count: state.dlc.length, bytes: formatBytes(dlcBytes()) }) : t('card_dlc_none')),
+      card(t('card_full_zip'), `~${formatBytes(fullBytes)}`),
+      card(t('card_update_zip'), `~${formatBytes(updBytes)}`)),
+    el('p', { className: 'muted', textContent: t('create_note') }),
   ];
   const sink = describeSinkSupport();
   if (sink === 'memory' && fullBytes > CONFIG.limits.blobWarnBytes) {
@@ -277,12 +484,254 @@ function showCreate() {
   info.replaceChildren(...lines);
   $('step-create').hidden = false;
   setButtons(true);
+  updateWizard();
 }
 
 function setButtons(enabled) {
-  const ok = enabled && !envProblems().problems.length;
+  const ok = enabled && !state.running && !state.dlcBusy && !envProblems().problems.length;
   $('create-full').disabled = !ok;
   $('create-update').disabled = !ok;
+  const n = state.nsp;
+  const support = nspSinkSupport();
+  const canFull = n.out === 'split' ? support.split : support.file;
+  $('create-nsp').disabled = !(ok && n.keys && canFull);
+  $('create-nsp-update').disabled = !(ok && n.keys && n.base && updateVersion());
+  for (const id of ['nsp-keys-pick', 'nsp-base-pick', 'nsp-update-data', 'nsp-update-version']) $(id).disabled = state.running;
+  for (const r of document.querySelectorAll('input[name=nsp-kind], input[name=nsp-out]')) r.disabled = state.running;
+}
+
+// ---- installable NSP (experimental; docs/full-nsp.md) -------------------------------------------------------------
+// The keys are read with the browser's file access, never uploaded, stored or logged; only header_key and
+// key_area_key_application_00 are kept, in memory, and overwritten on pagehide.
+const LAST_UPDATE_KEY = 'masseffect_nsp_last_update';
+
+function setText(id, text, isError = false) {
+  const s = $(id);
+  s.textContent = text;
+  s.classList.toggle('err', isError);
+}
+
+/** The last update number made in this browser for a base (title + Program NCA); not sensitive. */
+function rememberedUpdate(title, programNca) {
+  try { return Number(JSON.parse(localStorage.getItem(LAST_UPDATE_KEY) || '{}')[`${title}:${programNca}`]) || 0; } catch { return 0; }
+}
+function rememberUpdate(title, programNca, n) {
+  try {
+    const all = JSON.parse(localStorage.getItem(LAST_UPDATE_KEY) || '{}');
+    all[`${title}:${programNca}`] = Math.max(n, Number(all[`${title}:${programNca}`]) || 0);
+    localStorage.setItem(LAST_UPDATE_KEY, JSON.stringify(all));
+  } catch { /* storage unavailable: the number input still works */ }
+}
+
+function nspEstimate() {
+  const d = state.disc;
+  if (!d?.plan) return null;
+  const payload = d.plan.copyBytes + CONFIG.limits.expectedShaderBytes + (state.dlc.length ? dlcBytes() : 0);
+  const files = d.plan.copy.length + 4 + state.dlc.reduce((a, p) => a + p.files.length + 1, 0);
+  return estimateNspBytes({ payloadBytes: payload, fileCount: files, nroBytes: CONFIG.limits.expectedNroBytes });
+}
+
+function updateVersion() {
+  const v = Number($('nsp-update-version').value);
+  return Number.isInteger(v) && v >= 1 && v <= 0xFFFF ? v : null;
+}
+function setUpdateVersion(v) { $('nsp-update-version').value = String(Math.min(Math.max(1, v), 0xFFFF)); }
+function updateName(v) { return CONFIG.nsp.updateName.replace('{n}', String(v)); }
+
+function renderNsp() {
+  if (!$('nsp-full-panel')) return;
+  const n = state.nsp;
+  const support = nspSinkSupport();
+  $('nsp-full-panel').hidden = n.kind !== 'full';
+  $('nsp-update-panel').hidden = n.kind !== 'update';
+  const canFull = n.out === 'split' ? support.split : support.file;
+  const est = nspEstimate();
+  setText('nsp-full-info', canFull ? (est ? t('nsp_full_estimate', { size: formatBytes(est) }) : '') : t('nsp_browser_full'), !canFull);
+  const v = updateVersion();
+  $('create-nsp').textContent = t('create_nsp_btn');
+  $('create-nsp-update').textContent = t('create_nsp_update_btn', { name: v ? updateName(v) : updateName('N') });
+  const lines = [$('nsp-update-data').checked
+    ? t('nsp_update_estimate_data')
+    : t('nsp_update_estimate', { size: formatBytes(estimateProgramUpdateBytes(CONFIG.limits.expectedNroBytes)) })];
+  if (!support.file) lines.push(t('nsp_update_memory'));
+  setText('nsp-update-info', lines.join('\n'));
+  setButtons(!$('step-create').hidden);
+}
+
+for (const r of document.querySelectorAll('input[name=nsp-kind]')) {
+  r.addEventListener('change', () => { if (r.checked) { state.nsp.kind = r.value; setText('nsp-status', ''); renderNsp(); } });
+}
+for (const r of document.querySelectorAll('input[name=nsp-out]')) {
+  r.addEventListener('change', () => { if (r.checked) { state.nsp.out = r.value; renderNsp(); } });
+}
+$('nsp-update-data').addEventListener('change', renderNsp);
+$('nsp-update-version').addEventListener('input', renderNsp);
+
+/** For a base NSP: its title and Program NCA (from the NCA headers, with the keys) give the next update number. */
+async function refreshBaseVersion() {
+  const base = state.nsp.base;
+  if (!base?.parts || !state.nsp.keys) return;
+  try {
+    base.info = await inspectBaseNsp(new PartsReader(base.parts), state.nsp.keys);
+    setUpdateVersion(nextUpdateVersion(null, rememberedUpdate(base.info.titleId, base.info.programNca)));
+  } catch (err) {
+    setText('nsp-base-status', t('nsp_base_bad', { file: base.name, reason: err?.message ?? String(err) }), true);
+  }
+  renderNsp();
+}
+
+$('nsp-keys-pick').addEventListener('click', () => $('file-keys').click());
+$('file-keys').addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = '';
+  if (!file) return;
+  forgetKeys(state.nsp.keys);
+  state.nsp.keys = null;
+  try {
+    if (file.size > 1 << 20) throw new Error('not a key file (too large)');
+    state.nsp.keys = parseProdKeys(await file.text());
+    setText('nsp-keys-status', t('nsp_keys_ok', { file: file.name }));
+    await refreshBaseVersion();
+  } catch (err) {
+    setText('nsp-keys-status', t('nsp_keys_bad', { file: file.name, reason: err?.message ?? String(err) }), true);
+  }
+  renderNsp();
+});
+
+$('nsp-base-pick').addEventListener('click', () => $('file-base').click());
+$('file-base').addEventListener('change', async (e) => {
+  const files = [...e.target.files].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  e.target.value = '';
+  if (!files.length) return;
+  state.nsp.base = null;
+  const label = files.map((f) => f.name).join(', ');
+  try {
+    const json = files.filter((f) => f.name.toLowerCase().endsWith('.json'));
+    if (json.length) {
+      if (files.length !== 1) throw new Error(t('nsp_base_mixed'));
+      if (json[0].size > 256 << 20) throw new Error('too large for a base metadata file');
+      const meta = parseBaseMetadata(await json[0].text());
+      state.nsp.base = { meta, name: json[0].name, metaName: json[0].name };
+      const last = Number(meta.last_update_version) || 0;
+      setText('nsp-base-status', t('nsp_base_meta_ok', {
+        file: json[0].name, title: meta.title_id, count: Object.keys(meta.files).length.toLocaleString('en-US'),
+        last: last ? t('nsp_base_last', { n: last }) : '',
+      }));
+      setUpdateVersion(nextUpdateVersion(meta, rememberedUpdate(meta.title_id, meta.program_nca)));
+    } else {
+      if (files.length > 1 && !files.every((f) => /^\d{2}$/.test(f.name))) throw new Error(t('nsp_base_mixed'));
+      const head = new Uint8Array(await files[0].slice(0, 4).arrayBuffer());
+      if (new TextDecoder().decode(head) !== 'PFS0') throw new Error('not an NSP (no PFS0 header)');
+      const name = files.length > 1 ? CONFIG.nsp.fullName : files[0].name;
+      state.nsp.base = { parts: files, name, metaName: `${name}.basemeta.json` };
+      const size = files.reduce((a, f) => a + f.size, 0);
+      setText('nsp-base-status', t('nsp_base_nsp_ok', { file: label, size: formatBytes(size) }));
+      setUpdateVersion(1);
+      await refreshBaseVersion();
+    }
+  } catch (err) {
+    state.nsp.base = null;
+    setText('nsp-base-status', t('nsp_base_bad', { file: label, reason: err?.message ?? String(err) }), true);
+  }
+  renderNsp();
+});
+
+/** The NSP identity of the selected edition (config.js editions[].nsp): { titleId, dataDir }, or {} without one. */
+function editionNsp() {
+  const nsp = state.disc?.edition?.nsp;
+  return nsp ? { titleId: nsp.titleId, dataDir: nsp.dataDir } : {};
+}
+
+$('create-nsp').addEventListener('click', async () => {
+  const n = state.nsp;
+  if (!n.keys) { setText('nsp-status', t('nsp_need_keys'), true); return; }
+  let sink;
+  try {
+    sink = await openNspSink(n.out, CONFIG.nsp.fullName);
+  } catch (err) {
+    setText('nsp-status', err?.message ?? String(err), true);
+    return;
+  }
+  if (!sink) return;
+  setText('nsp-status', '');
+  startRun({ output: 'nsp', mode: 'full', sink, name: sink.name || CONFIG.nsp.fullName, nsp: { kind: 'full', keys: n.keys, ...editionNsp() } });
+});
+
+$('create-nsp-update').addEventListener('click', async () => {
+  const n = state.nsp;
+  if (!n.keys) { setText('nsp-status', t('nsp_need_keys'), true); return; }
+  if (!n.base) { setText('nsp-status', t('nsp_need_base'), true); return; }
+  const v = updateVersion();
+  if (!v) { setText('nsp-status', t('nsp_bad_version'), true); return; }
+  const name = updateName(v);
+  let sink;
+  try {
+    sink = await openNspSink(nspSinkSupport().file ? 'file' : 'memory', name);
+  } catch (err) {
+    setText('nsp-status', err?.message ?? String(err), true);
+    return;
+  }
+  if (!sink) return;
+  setText('nsp-status', '');
+  const base = n.base;
+  startRun({
+    output: 'nsp', mode: 'full', sink, name: sink.name || name, base,
+    // titleId: the selected edition's, checked against the base's own (which the update keeps); dataDir: used only
+    // when the base recorded none.
+    nsp: { kind: 'update', keys: n.keys, programOnly: !$('nsp-update-data').checked, version: v, base: base.meta ? { meta: base.meta } : { parts: base.parts }, ...editionNsp() },
+  });
+});
+
+window.addEventListener('pagehide', () => { forgetKeys(state.nsp.keys); state.nsp.keys = null; });
+
+/** The result notice of an NSP run: install notes and the base metadata to keep. */
+async function nspResultKids(job, result) {
+  const kids = [
+    el('p', {}, el('strong', { textContent: t('result_ready', { name: job.name }) }), ' ', t('result_size', { size: formatBytes(result.nspBytes) })),
+    el('p', { textContent: job.sink.kind === 'split' ? t('result_nsp_split', { name: job.name }) : result.sinkResult === 'saved' ? t('result_saved_file') : t('result_saved_download') }),
+  ];
+  const offerSave = (metaName, text, note) => {
+    const btn = el('button', { className: 'btn small', type: 'button', textContent: t('nsp_meta_save_btn', { name: metaName }) });
+    const status = el('span', { className: 'muted' });
+    btn.addEventListener('click', async () => {
+      try {
+        const r = await saveTextFile(metaName, text);
+        if (r) status.textContent = ` ${t('nsp_meta_saved', { name: metaName })}`;
+      } catch (err) {
+        status.textContent = ` ${err?.message ?? String(err)}`;
+      }
+    });
+    kids.push(el('p', { textContent: note }), el('p', { className: 'result-actions' }, btn, status));
+  };
+  if (job.nsp.kind === 'full') {
+    kids.push(el('p', { textContent: t('result_nsp_install') }));
+    const metaName = `${job.name}.basemeta.json`;
+    const text = pythonJson(result.nsp.baseMeta);
+    let saved = false;
+    if (job.sink.kind === 'split' && job.sink.dir) {
+      try { await saveTextFile(metaName, text, { dir: job.sink.dir }); saved = true; } catch { /* offer the button instead */ }
+    }
+    if (saved) kids.push(el('p', { textContent: `${t('nsp_meta_saved_split', { name: metaName })} ${t('nsp_meta_note')}` }));
+    else offerSave(metaName, text, t('nsp_meta_note'));
+  } else {
+    const v = job.nsp.version;
+    const meta = result.baseMeta;
+    kids.push(el('p', { textContent: t('result_nsp_update', { n: v, version: `0x${(v * 0x10000).toString(16)}`, title: meta.title_id }) }));
+    kids.push(el('p', { textContent: t('result_nsp_install') }));
+    rememberUpdate(meta.title_id, meta.program_nca, v);
+    const updated = withLastUpdateVersion(meta, v);
+    if (state.nsp.base === job.base) {
+      state.nsp.base = { meta: updated, name: job.base.name, metaName: job.base.metaName };
+      setUpdateVersion(v + 1);
+    }
+    offerSave(job.base.metaName, pythonJson(updated), t('nsp_meta_update_note', { n: v, next: v + 1 }));
+  }
+  if (result.shaders) {
+    kids.push(result.shaders.failures.length
+      ? el('p', { className: 'muted', textContent: t('result_shaders_skipped', { ok: result.shaders.ok.toLocaleString('en-US'), skipped: result.shaders.failures.length }) })
+      : el('p', { className: 'muted', textContent: t('result_shaders', { ok: result.shaders.ok.toLocaleString('en-US') }) }));
+  }
+  return kids;
 }
 
 // ---- running ---------------------------------------------------------------------------------------------------
@@ -290,36 +739,81 @@ const rows = {};
 function buildStages() {
   const list = $('stages');
   list.replaceChildren();
-  for (const id of stageIds) {
+  for (const k of Object.keys(rows)) delete rows[k];
+  for (const id of state.stages) {
     const bar = el('i');
+    const barBox = el('div', { className: 'bar' }, bar);
+    barBox.setAttribute('role', 'progressbar');
+    barBox.setAttribute('aria-valuemin', '0');
+    barBox.setAttribute('aria-valuemax', '100');
+    const name = el('span', { className: 'name', textContent: t(STAGE_KEYS[id] || id) });
+    barBox.setAttribute('aria-label', name.textContent);
+    const pct = el('span', { className: 'pct' });
     const label = el('span', { className: 'label' });
-    const stageName = t(STAGE_KEYS[id] || id);
+    const eta = el('span', { className: 'eta' });
     const li = el('li', { className: 'stage pending' },
-      el('div', { className: 'top' }, el('span', { className: 'name', textContent: stageName }), label),
-      el('div', { className: 'bar' }, bar));
-    rows[id] = { li, bar, label };
+      el('div', { className: 'top' }, name, pct),
+      barBox,
+      el('div', { className: 'bottom' }, label, eta));
+    rows[id] = { li, bar, barBox, name, pct, label, eta, t0: 0, f0: 0 };
     list.append(li);
   }
 }
 
+function markDone(r) {
+  r.li.className = 'stage done';
+  r.bar.style.width = '100%';
+  r.barBox.classList.remove('indeterminate');
+  r.barBox.setAttribute('aria-valuenow', '100');
+  r.pct.textContent = '100 %';
+  r.eta.textContent = '';
+}
+
+/**
+ * Remaining time from the progress rate of this stage since its first report:
+ * elapsed / (fraction gained) * (fraction left). Shown after 3 s and 1 % of progress.
+ */
+function etaText(r, f) {
+  const now = performance.now();
+  if (!r.t0) { r.t0 = now; r.f0 = f; return t('eta_estimating'); }
+  const dt = (now - r.t0) / 1000;
+  const df = f - r.f0;
+  if (dt < 3 || df < 0.01) return t('eta_estimating');
+  return t('eta_left', { time: duration((dt / df) * (1 - f)) });
+}
+
 function onProgress(id, p) {
-  const idx = stageIds.indexOf(id);
-  stageIds.forEach((sid, i) => {
-    const r = rows[sid];
-    if (i < idx) { r.li.className = 'stage done'; r.bar.style.width = '100%'; }
+  const idx = state.stages.indexOf(id);
+  if (idx < 0 || !rows[id]) return;
+  state.stages.forEach((sid, i) => {
+    if (i < idx && !rows[sid].li.classList.contains('done')) markDone(rows[sid]);
   });
   const r = rows[id];
-  const finished = p.total > 0 && p.done >= p.total;
-  r.li.className = `stage ${finished ? 'done' : 'active'}`;
-  r.bar.style.width = `${p.total > 0 ? Math.min(100, (p.done / p.total) * 100) : 0}%`;
   r.label.textContent = p.label ?? '';
+  const finished = p.total > 0 && p.done >= p.total;
+  if (finished) { markDone(r); return; }
+  r.li.className = 'stage active';
+  // A stage that only reports 0 of 1 (packing) has no measurable progress: animated bar, no percent.
+  if (!(p.total > 1)) {
+    r.barBox.classList.add('indeterminate');
+    r.barBox.removeAttribute('aria-valuenow');
+    r.pct.textContent = t('progress_working');
+    r.eta.textContent = '';
+    return;
+  }
+  const f = Math.min(1, Math.max(0, p.done / p.total));
+  r.barBox.classList.remove('indeterminate');
+  r.bar.style.width = `${f * 100}%`;
+  r.barBox.setAttribute('aria-valuenow', String(Math.floor(f * 100)));
+  r.pct.textContent = `${Math.floor(f * 100)} %`;
+  r.eta.textContent = etaText(r, f);
 }
 
 const logLines = [];
 function log(text, level = 'info') {
   logLines.push(`${level === 'info' ? '' : `[${level}] `}${text}`);
   $('log').textContent = logLines.join('\n');
-  $('log-count').textContent = `(${logLines.length} lines)`;
+  $('log-count').textContent = t('log_lines', { count: logLines.length });
   const wrap = $('log');
   wrap.scrollTop = wrap.scrollHeight;
 }
@@ -330,57 +824,89 @@ function createWorker(kind) {
 }
 
 async function start(mode) {
-  if (state.running || !state.disc?.edition) return;
+  if (state.running || state.dlcBusy || !state.disc?.edition) return;
   const name = mode === 'full' ? CONFIG.zip.fullName : CONFIG.zip.updateName;
   const d = state.disc;
-  const expected = (mode === 'full' ? d.plan.copyBytes : 0) + CONFIG.limits.expectedShaderBytes + CONFIG.limits.expectedNroBytes;
+  const expected = (mode === 'full' ? d.plan.copyBytes : 0) + CONFIG.limits.expectedShaderBytes + CONFIG.limits.expectedNroBytes + dlcExtraBytes();
   const sink = await openSink(name, expected);
   if (!sink) return;
+  await startRun({ output: 'zip', mode, sink, name });
+}
+
+/** job: { output: 'zip' | 'nsp', mode, sink, name, nsp (NSP options for run()), base (the picked base, updates) }. */
+async function startRun(job) {
+  const { output, mode, sink, name } = job;
+  if (state.running || state.dlcBusy || !state.disc?.edition) { await sink.abort?.(); return; }
+  const d = state.disc;
+  state.stages = stagesFor(output, job.nsp);
 
   state.running = true;
   state.abort = new AbortController();
   setButtons(false);
-  for (const id of ['pick', 'create-full', 'create-update']) $(id).disabled = true;
+  renderDlc();
+  for (const id of ['pick', 'create-full', 'create-update', 'dlc-pick', 'create-nsp', 'create-nsp-update']) $(id).disabled = true;
   document.querySelectorAll('input[name=format]').forEach((r) => (r.disabled = true));
   $('result').hidden = true;
+  state.outcome = null;
   $('progress').hidden = false;
   $('cancel').disabled = false;
   logLines.length = 0;
   $('log').textContent = '';
   buildStages();
+  updateWizard();
   const t0 = Date.now();
-  const timer = setInterval(() => { $('elapsed').textContent = `Elapsed: ${formatDuration((Date.now() - t0) / 1000)}`; }, 1000);
+  const tick = () => { $('elapsed').textContent = t('elapsed', { time: duration((Date.now() - t0) / 1000) }); };
+  tick();
+  const timer = setInterval(tick, 1000);
   const block = (e) => { e.preventDefault(); e.returnValue = ''; };
   window.addEventListener('beforeunload', block);
   let wake = null;
   try { wake = await navigator.wakeLock?.request('screen'); } catch { /* not available or denied */ }
-  log(`Mode: ${mode === 'full' ? 'full install' : 'update'}; edition ${d.edition.name}; saving as ${name} (${sink.kind === 'file' ? 'straight to the chosen file' : sink.kind === 'opfs' ? 'temporary storage, then download' : 'in memory'}).`);
+  const dlc = [...state.dlc];
+  const what = output === 'nsp'
+    ? (job.nsp.kind === 'full' ? 'full NSP' : job.nsp.programOnly ? `NSP update ${job.nsp.version} (program only)` : `NSP update ${job.nsp.version} with game data`)
+    : (mode === 'full' ? 'full install' : 'update');
+  const where = { file: 'straight to the chosen file', split: 'a FAT32 split folder', opfs: 'temporary storage, then download' }[sink.kind] ?? 'in memory';
+  log(`Mode: ${what}; edition ${d.edition.name}; ${dlc.length ? `${dlc.length} DLC package(s)` : 'no DLC'}; saving as ${name} (${where}).`);
+  log(`Source: ${d.source.label} (${d.source.detail}).`);
+  for (const line of d.source.log ?? []) log(line);
+  for (const line of d.packages?.log ?? []) log(line, d.packages.bad.length || d.packages.duplicates.length ? 'warn' : 'info');
 
   try {
     const result = await run({
-      config: CONFIG, edition: d.edition, files: d.files, mode, sink, createWorker,
+      config: CONFIG, edition: d.edition, files: d.files, dlc, mode, sink, createWorker, output, nsp: job.nsp,
       baseUrl: new URL('.', location.href).href, signal: state.abort.signal, onProgress, onLog: log,
     });
-    stageIds.forEach((id) => { rows[id].li.className = 'stage done'; rows[id].bar.style.width = '100%'; });
+    state.stages.forEach((id) => markDone(rows[id]));
+    state.outcome = 'ok';
+    if (output === 'nsp') {
+      showResult(true, await nspResultKids(job, result));
+      return;
+    }
     showResult(true, [
-      el('p', {}, el('strong', { textContent: `${name} is ready` }), ` (${formatBytes(result.zipBytes)}).`),
-      el('p', { textContent: result.sinkResult === 'saved' ? 'It was saved to the file you chose.' : 'Your browser is saving it to your Downloads folder.' }),
-      el('p', {}, 'Extract it into ', el('code', { textContent: 'sdmc:/switch/' }), ' on the SD card.'),
+      el('p', {}, el('strong', { textContent: t('result_ready', { name }) }), ' ', t('result_size', { size: formatBytes(result.zipBytes) })),
+      el('p', { textContent: result.sinkResult === 'saved' ? t('result_saved_file') : t('result_saved_download') }),
+      el('p', { innerHTML: t('result_extract') }),
+      ...(dlc.length ? [el('p', { textContent: t('result_dlc', { count: dlc.length }) })] : []),
       result.shaders.failures.length
-        ? el('p', { className: 'muted', textContent: `${result.shaders.ok.toLocaleString('en-US')} shaders were made; ${result.shaders.failures.length} containers were skipped, which is expected (see Details).` })
-        : el('p', { className: 'muted', textContent: `${result.shaders.ok.toLocaleString('en-US')} shaders were made.` }),
+        ? el('p', { className: 'muted', textContent: t('result_shaders_skipped', { ok: result.shaders.ok.toLocaleString('en-US'), skipped: result.shaders.failures.length }) })
+        : el('p', { className: 'muted', textContent: t('result_shaders', { ok: result.shaders.ok.toLocaleString('en-US') }) }),
     ]);
   } catch (e) {
     if (e instanceof Cancelled) {
-      showResult(false, [el('p', { textContent: 'Cancelled. Nothing was saved.' })], 'warn');
+      state.outcome = 'cancelled';
+      showResult(false, [el('p', { textContent: t('result_cancelled') })], 'warn');
     } else {
       console.error(e);
-      const msg = e instanceof UserError ? e.message : `Something went wrong: ${e?.message ?? e}`;
+      state.outcome = 'err';
+      for (const id of state.stages) if (rows[id].li.classList.contains('active')) { rows[id].li.className = 'stage error'; rows[id].eta.textContent = ''; }
+      const msg = e instanceof UserError ? e.message : t('result_error', { error: e?.message ?? e });
       log(`ERROR: ${msg}`, 'error');
-      showResult(false, [el('p', { textContent: msg }), el('p', { className: 'muted', textContent: 'Nothing was saved. The Details section has the full log.' })], 'err');
+      showResult(false, [el('p', { textContent: msg }), el('p', { className: 'muted', textContent: t('result_nothing_saved') })], 'err');
     }
   } finally {
     clearInterval(timer);
+    for (const id of state.stages) { rows[id].barBox.classList.remove('indeterminate'); rows[id].eta.textContent = ''; }
     window.removeEventListener('beforeunload', block);
     try { await wake?.release(); } catch { /* ignore */ }
     state.running = false;
@@ -388,7 +914,10 @@ async function start(mode) {
     $('pick').disabled = false;
     document.querySelectorAll('input[name=format]').forEach((r) => (r.disabled = false));
     setButtons(true);
+    renderDlc();
+    renderNsp();
     $('cancel').disabled = true;
+    updateWizard();
   }
 }
 

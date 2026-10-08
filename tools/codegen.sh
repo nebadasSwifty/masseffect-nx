@@ -77,6 +77,7 @@ echo "== post-codegen patches"
 "$PY" "$ROOT/tools/pch_no_global_lock.py"
 "$PY" "$ROOT/tools/pch_ui_viewport.py"
 "$PY" "$ROOT/tools/pch_ui_world_to_screen.py"
+"$PY" "$ROOT/tools/pch_indirect_dispatch.py"
 "$ROOT/tools/verify_pch.sh" "$GEN"
 
 if [[ $ARGS == 1 ]]; then

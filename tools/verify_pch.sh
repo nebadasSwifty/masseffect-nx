@@ -14,9 +14,11 @@ ko() { echo "MISSING: $*" >&2; fail=1; }
 "$PY" "$H/pch_ui_viewport.py" --gen "$T" --check        || ko "pch_ui_viewport (g_me_ui_width in sub_82238FE8)"
 "$PY" "$H/pch_ui_world_to_screen.py" --gen "$T" --check || ko "pch_ui_world_to_screen (g_me_ui_y_scale in sub_827C07F0)"
 "$PY" "$H/direct_calls.py" --gen "$T" --check           || ko "direct_calls (weak-alias direct calls __imp__sub_*)"
+"$PY" "$H/pch_indirect_dispatch.py" --gen "$T" --check  || ko "pch_indirect_dispatch (REX_INDIRECT_DISPATCH switch)"
 # independent greps (guard against a script that reports success wrongly)
 grep -q 'g_me_lockfree_atomics' "$T/masseffect_pch.h"  || ko "g_me_lockfree_atomics not in masseffect_pch.h"
 grep -q 'REX_GUEST_VOLATILE' "$T/masseffect_pch.h"         || ko "REX_GUEST_VOLATILE not in masseffect_pch.h"
+grep -q '#if REX_INDIRECT_DISPATCH == 0' "$T/masseffect_pch.h" || ko "REX_INDIRECT_DISPATCH switch not in masseffect_pch.h"
 cat "$T"/masseffect_recomp.*.cpp | grep -q 'g_me_ui_width'    || ko "g_me_ui_width not in any recomp cpp"
 cat "$T"/masseffect_recomp.*.cpp | grep -q 'g_me_ui_y_scale' || ko "g_me_ui_y_scale not in any recomp cpp"
 n=$(cat "$T"/masseffect_recomp.*.cpp | grep -c '__imp__sub_[0-9A-F]\{8\}(ctx, base);')

@@ -22,11 +22,24 @@ layout(push_constant) uniform Constants {
   uint target_msaa_x, target_msaa_y;
 } c;
 
-// Tile index / pitch without an integer division (a long instruction sequence on Maxwell): tile and pitch are at most
-// 2048, so the fraction of (tile + 0.5) / pitch is at least 0.5 / 2048 away from an integer and the float quotient
-// floors to the exact integer one.
+// EDRAM address math without IMUL (docs/edram-shader-imul.md; exactness: tests/cpu/test_native_edram_imul_free.cpp).
+// NAK on SM50 emits the microcoded, variable-latency IMUL for every 32-bit multiply that is not by a power of two,
+// IMUL.HI for a division by a constant and a long IMUL sequence for a division by a register. Integers below 2^24
+// are exact in float, so these use FMUL/FFMA and conversions instead:
+// - DivPitch: tile < 2^16, 1 <= pitch <= 2048; the fraction of (tile + 0.5) / pitch is at least 0.5 / pitch away
+//   from an integer, far more than the error of the reciprocal, so the float quotient floors to the integer one;
+// - MulSmall: a * b < 2^24 (row * pitch, quotient * pitch);
+// - Div80 / Mod80: x < 2^20; Mul80 is two shifts and an add.
 uint DivPitch(uint tile, uint pitch) { return uint((float(tile) + 0.5) / float(pitch)); }
-uint ModPitch(uint tile, uint pitch) { return tile - DivPitch(tile, pitch) * pitch; }
+uint MulSmall(uint a, uint b) { return uint(float(a) * float(b)); }
+uint ModPitch(uint tile, uint pitch) { return tile - MulSmall(DivPitch(tile, pitch), pitch); }
+uint Div80(uint x) { return uint(fma(float(x), 0.0125, 0.00625)); }
+uint Mul80(uint x) { return (x << 6u) + (x << 4u); }
+uint Mod80(uint x) { return x - Mul80(Div80(x)); }
+// 64-bit views: 40 pixels per tile row; x < 2^20.
+uint Div40(uint x) { return uint(fma(float(x), 0.025, 0.0125)); }
+uint Mul40(uint x) { return (x << 5u) + (x << 3u); }
+uint Mod40(uint x) { return x - Mul40(Div40(x)); }
 layout(location = 0) out uvec4 output_value;
 
 void main() {
@@ -35,10 +48,10 @@ void main() {
   // 64-bit tiles are 40 pixels wide (80 words); the compute writer of a texel is the physical sample with zero
   // sub-sample bits.
   uvec2 physical = pixel << uvec2(c.target_msaa_x, c.target_msaa_y);
-  uint tile_target = (physical.y / 16u) * c.pitch_tiles_target + physical.x / 40u;
+  uint tile_target = MulSmall(physical.y >> 4u, c.pitch_tiles_target) + Div40(physical.x);
   if (tile_target < c.tile_target_start || tile_target - c.tile_target_start >= c.tiles_count) discard;
   uint tile_source = c.tile_source_start + (tile_target - c.tile_target_start);
-  uvec2 p = uvec2(ModPitch(tile_source, c.pitch_tiles_source) * 40u + physical.x % 40u,
+  uvec2 p = uvec2(Mul40(ModPitch(tile_source, c.pitch_tiles_source)) + Mod40(physical.x),
                   DivPitch(tile_source, c.pitch_tiles_source) * 16u + physical.y % 16u) >>
             uvec2(c.source_msaa_x, c.source_msaa_y);
   output_value = any(greaterThanEqual(p, c.source_size)) ? uvec4(0u) : texelFetch(source, ivec2(p), 0);

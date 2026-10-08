@@ -69,6 +69,11 @@ struct StatsShaders {
   uint64_t identified = 0;    // of the distinct ones
   uint64_t no_identify = 0;  // of the distinct ones
   uint64_t ambiguous = 0;         // distinct ones with more than one possible container
+  // Vertex shaders found only by the second-stage lookup (SetPatchedLookup): of the distinct ones, how many,
+  // how many of those needed the same-register fetch permutation, and how many had more than one candidate.
+  uint64_t patched = 0;
+  uint64_t patched_permuted = 0;
+  uint64_t patched_ambiguous = 0;
 };
 
 class ShadersNative {
@@ -104,8 +109,20 @@ class ShadersNative {
   const ShaderEntry* PerFingerprint(uint64_t fingerprint) const;
 
   // Microcode already in host byte order. nullptr if it is not in the library.
-  // Only the ring thread uses it.
-  const ShaderEntry* Identify(bool vertices, std::span<const uint32_t> microcode);
+  // Only the ring thread uses it. *patched (optional) = found by the second-stage lookup below.
+  const ShaderEntry* Identify(bool vertices, std::span<const uint32_t> microcode, bool* patched = nullptr);
+
+  // Second-stage vertex shader lookup (cvar masseffect_native_vs_identify_patched, default on), used only when
+  // the exact masked-microcode lookup finds nothing. Direct3D patches the fetch destination swizzles of a vertex
+  // shader per vertex declaration (a FLOAT3 position 688 -> A88, w = 1; a D3DCOLOR texcoord E88 -> E0A, red/blue
+  // swapped), and the exact lookup keeps those swizzle bits. The second stage accepts a same-length library
+  // entry when me::native::VertexShaderIdentityMatches (ALU tolerance 0) or, with
+  // g_vs_identity_fetch_permutation, VertexShaderFetchPermutationMatches holds: every ALU/CF word identical, the
+  // declared fetch words identical under the loader masks, and every swizzle change representable by the input
+  // remap (the C6 remap in ComputeEntry applies it). The same test the draw-time identity guard uses, so a
+  // program found here is never refused there. Several candidates: the first in library order, as the exact
+  // lookup does. Call before the ring thread starts.
+  void SetPatchedLookup(bool on);
 
   StatsShaders Stats() const;
 

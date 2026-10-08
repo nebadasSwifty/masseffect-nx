@@ -133,6 +133,16 @@ class DedupeVertices {
   }
 
   // Records a copy just made. 'fingerprint' is only used in the paranoid mode of Search.
+  // Whether Search could hit this range: a live entry with the same key and size (the fingerprint aside). Without
+  // one, Search returns false whatever the fingerprint (masseffect_native_dedupe_hash_after_copy).
+  bool Candidate(uint64_t address, uint32_t bytes, uint32_t order) const {
+    const uint64_t key = Key(address, order);
+    const Entry& e = table_[Index(key, bytes)];
+    return e.frame == frame_ && e.generation == generation_ && e.key == key && e.bytes == bytes;
+  }
+  // The query a skipped Search would have counted (it could not hit: no Candidate).
+  void CountQuery() { ++queries_; }
+
   void Note(uint64_t address, uint32_t bytes, uint32_t order, uint64_t offset,
               uint64_t fingerprint = 0) {
     const uint64_t key = Key(address, order);

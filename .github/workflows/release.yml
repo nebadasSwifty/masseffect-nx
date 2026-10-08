@@ -32,7 +32,8 @@ jobs:
       - name: Download the NRO from the draft release
         run: |
           mkdir -p out/release
-          gh release download "$RELEASE_TAG" --pattern masseffect-nx.nro --dir out/release
+          # The prewarm lists only go into SHA256SUMS (they are already release assets).
+          gh release download "$RELEASE_TAG" --pattern masseffect-nx.nro --pattern 'masseffect_prewarm_list-*.bin' --dir out/release
       - name: Load the private packing keys
         env:
           PACK_KEYS: ${{ secrets.SWITCH_PROD_KEYS }}

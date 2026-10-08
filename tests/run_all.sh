@@ -70,7 +70,7 @@ for src in "$HERE"/cpu/test_*.cpp; do
   selected "$name" || continue
   extra_inc=(); extra_src=(); std=c++20; strict=(-Wall -Wextra -Werror); run_args=()
   case "$name" in
-    test_native_crc_fingerprint)
+    test_native_crc_fingerprint|test_native_frame_coherence)
       # Benchmark plus equality checks of the texture fingerprint against xxHash.
       [[ -f "$XXHASH/xxhash.h" ]] || { report SKIP "$name" "run tools/fetch_thirdparty.py for xxHash"; continue; }
       extra_inc=(-I"$XXHASH") ;;
@@ -107,14 +107,17 @@ for src in "$HERE"/cpu/test_*.cpp; do
 done
 
 # ---------------------------------------------------------------------------------------------------------------
-# Python tests (pure Python, no third-party modules).
+# Python tests (pure Python; a test that needs a third-party module exits with 77 when it is missing = skipped).
 # ---------------------------------------------------------------------------------------------------------------
 echo "== Python tests"
 for py in "$HERE"/tools/test_*.py; do
   name="$(basename "$py" .py)"
   selected "$name" || continue
   log="$OUT/cpu/$name.log"
-  if (cd "$HERE/tools" && PYTHONPATH="$ROOT/tools:$HERE/tools" "$PYTHON" "$py") >"$log" 2>&1; then report PASS "$name"
+  (cd "$HERE/tools" && PYTHONPATH="$ROOT/tools:$HERE/tools" "$PYTHON" "$py") >"$log" 2>&1
+  rc=$?
+  if [[ $rc -eq 0 ]]; then report PASS "$name"
+  elif [[ $rc -eq 77 ]]; then report SKIP "$name" "$(tail -1 "$log")"
   else report FAIL "$name" "$log"; fi
 done
 

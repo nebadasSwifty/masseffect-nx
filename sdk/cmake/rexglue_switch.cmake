@@ -107,6 +107,10 @@ function(rexglue_switch_configure_target target_name)
     # Still linked normally, for the build order and their own dependencies
     # (glslang, FFmpeg, ...), which stay regular archives.
     target_link_libraries(${target_name} PRIVATE ${_libs} rex::nvk)
+    # Relink when the driver archive changes (a rebuilt or swapped Mesa SDK at the same path, e.g. -O1 <-> -O2);
+    # ninja does not track archives found through a link directory.
+    set_property(TARGET ${target_name} APPEND PROPERTY LINK_DEPENDS
+        "${REXGLUE_SWITCH_NVK_SDK}/lib/libvulkan.a")
 
     # rex_app.cpp includes imgui.h. rexruntime links imgui privately, so its
     # include path does not reach the title; take the path alone, since imgui's

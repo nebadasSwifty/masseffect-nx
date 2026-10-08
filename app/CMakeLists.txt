@@ -25,13 +25,23 @@ set(MASSEFFECT_SOURCES
     # Hooks on the game's Direct3D entry points (feed the native renderer, internal resolution, optional timing).
     src/me_d3d_trace.cpp
     src/me_shader_dump.cpp
+    # Developer USB file channel (dev_usb_files, docs/usb-files.md).
+    src/me_usb_files.cpp
     src/native/me_native_system.cpp
     src/native/me_ring_wait.cpp
+    src/native/me_switch_text.cpp
+    src/native/me_switch_minigame.cpp
+    src/native/me_ini_override.cpp
+    src/native/me_crowd_cpu.cpp
     src/native/me_resolution.cpp
     src/native/me_physx.cpp
     src/native/me_audio_hooks.cpp
     src/native/me_hot_guest.cpp
     src/native/me_hang_watchdog.cpp
+    src/native/me_console_exec.cpp
+    src/native/me_tour.cpp
+    src/native/me_script_prof.cpp
+    # Engine settings A/B: config value overrides; skeletal/light environment game-thread cost (docs/engine-settings-ab.md).
     src/native/me_render_ring.cpp
     src/native/masseffect/masseffect_native_draws.cpp
     src/native/masseffect/masseffect_deferred_recording.cpp
@@ -41,6 +51,7 @@ set(MASSEFFECT_SOURCES
     src/native/masseffect/masseffect_shader_library.cpp
     src/native/masseffect/me_masseffect_glue.cpp
     src/me_pgo.cpp
+    src/me_packaged.cpp
 )
 add_executable(masseffect ${MASSEFFECT_SOURCES})
 # Line tables only (no code change) for the app's own sources, so console stack profiles can be resolved to source
@@ -58,11 +69,11 @@ else()
     set(MASSEFFECT_GENERATED_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated-shaders")
 endif()
 set(MASSEFFECT_EDRAM_SHADER_INCLUDES)
-foreach(_shader masseffect_edram_7e3_to_rgba8 masseffect_edram_rgba8_to_7e3 masseffect_edram_16f_to_16f me_resolve_exp_bias me_edram_depth_to_rgba8 me_edram_depth_to_16f me_edram_import me_edram_color_to_depth me_edram_depth_to_depth me_edram_depth_to_stencil me_edram_color_to_stencil me_edram_depth_to_depth_msaa2 me_edram_depth_msaa2_to_depth_1x me_edram_depth_to_stencil_msaa2 me_edram_depth_msaa2_to_stencil_1x me_edram_raw64_to_rgba8 me_edram_rgba8_to_raw64 me_edram_raw64_to_16f me_edram_16f_to_raw64 me_edram_raw64_to_raw64 me_edram_depth_to_raw64 me_edram_raw64_to_depth me_depth_resolve_guestspace me_depth_resolve_guestspace_msaa2 me_edram_stencil_to_buffer me_edram_stencil_msaa2_to_buffer me_edram_color_stencil_to_buffer me_edram_color_to_color me_edram_r64_to_r64 me_edram_r16g16_to_rgba8 me_edram_rgba8_to_r16g16 me_edram_r16g16_to_16f me_edram_16f_to_r16g16 me_resolve_7e3_to_unorm10 me_resolve_exp_bias_frag)
+foreach(_shader masseffect_edram_7e3_to_rgba8 masseffect_edram_rgba8_to_7e3 masseffect_edram_16f_to_16f me_resolve_exp_bias me_edram_depth_to_rgba8 me_edram_depth_to_16f me_edram_import me_edram_color_to_depth me_edram_depth_to_depth me_edram_depth_to_stencil me_edram_color_to_stencil me_edram_depth_to_depth_msaa2 me_edram_depth_msaa2_to_depth_1x me_edram_depth_to_stencil_msaa2 me_edram_depth_msaa2_to_stencil_1x me_edram_raw64_to_rgba8 me_edram_rgba8_to_raw64 me_edram_raw64_to_16f me_edram_16f_to_raw64 me_edram_raw64_to_raw64 me_edram_depth_to_raw64 me_edram_raw64_to_depth me_depth_resolve_guestspace me_depth_resolve_guestspace_msaa2 me_edram_stencil_to_buffer me_edram_stencil_msaa2_to_buffer me_edram_color_stencil_to_buffer me_edram_color_to_color me_edram_r64_to_r64 me_edram_r16g16_to_rgba8 me_edram_rgba8_to_r16g16 me_edram_r16g16_to_16f me_edram_16f_to_r16g16 me_resolve_7e3_to_unorm10 me_resolve_exp_bias_frag me_resolve_7e3_to_unorm10_frag me_resolve_7e3_word_frag me_resolve_fixed16_frag)
     set(_extension comp)
     if(_shader STREQUAL "me_edram_import")
         set(_extension vert)
-    elseif(_shader STREQUAL "me_edram_color_to_depth" OR _shader STREQUAL "me_edram_depth_to_depth" OR _shader STREQUAL "me_edram_depth_to_stencil" OR _shader STREQUAL "me_edram_color_to_stencil" OR _shader STREQUAL "me_edram_depth_to_depth_msaa2" OR _shader STREQUAL "me_edram_depth_msaa2_to_depth_1x" OR _shader STREQUAL "me_edram_depth_to_stencil_msaa2" OR _shader STREQUAL "me_edram_depth_msaa2_to_stencil_1x" OR _shader STREQUAL "me_edram_raw64_to_depth" OR _shader STREQUAL "me_edram_color_to_color" OR _shader STREQUAL "me_edram_r64_to_r64" OR _shader STREQUAL "me_resolve_exp_bias_frag")
+    elseif(_shader STREQUAL "me_edram_color_to_depth" OR _shader STREQUAL "me_edram_depth_to_depth" OR _shader STREQUAL "me_edram_depth_to_stencil" OR _shader STREQUAL "me_edram_color_to_stencil" OR _shader STREQUAL "me_edram_depth_to_depth_msaa2" OR _shader STREQUAL "me_edram_depth_msaa2_to_depth_1x" OR _shader STREQUAL "me_edram_depth_to_stencil_msaa2" OR _shader STREQUAL "me_edram_depth_msaa2_to_stencil_1x" OR _shader STREQUAL "me_edram_raw64_to_depth" OR _shader STREQUAL "me_edram_color_to_color" OR _shader STREQUAL "me_edram_r64_to_r64" OR _shader STREQUAL "me_resolve_exp_bias_frag" OR _shader STREQUAL "me_resolve_7e3_to_unorm10_frag" OR _shader STREQUAL "me_resolve_7e3_word_frag" OR _shader STREQUAL "me_resolve_fixed16_frag")
         set(_extension frag)
     endif()
     set(_source "${CMAKE_CURRENT_SOURCE_DIR}/src/native/masseffect/shaders/${_shader}.${_extension}")
@@ -129,6 +140,26 @@ option(MASSEFFECT_FAST_MATH "-fno-math-errno -fno-trapping-math on the recompile
 if(MASSEFFECT_FAST_MATH AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND TARGET masseffect_recomp)
     target_compile_options(masseffect_recomp PRIVATE -fno-math-errno -fno-trapping-math)
 endif()
+
+# Guest indirect calls (bctrl/bcctr; UE3 virtual calls): 0 = legacy 24 MB per-instruction table in guest memory,
+# 1 = compact 1 MB host hash table of function entry points, 2 = per-call-site inline cache + compact table on a miss.
+# Needs a pch from tools/pch_indirect_dispatch.py (run by tools/codegen.sh). docs/cpu-cost-analysis.md
+# "Indirect call dispatch". VERIFY compares every call with the legacy result (cvar indirect_dispatch_verify_calls).
+set(MASSEFFECT_INDIRECT_DISPATCH "0" CACHE STRING "Guest indirect-call dispatch: 0 legacy, 1 compact table, 2 inline cache")
+set_property(CACHE MASSEFFECT_INDIRECT_DISPATCH PROPERTY STRINGS 0 1 2)
+option(MASSEFFECT_INDIRECT_DISPATCH_VERIFY "Compare the fast indirect dispatch with the legacy one (diagnostic)" OFF)
+if(NOT MASSEFFECT_INDIRECT_DISPATCH MATCHES "^[012]$")
+    message(FATAL_ERROR "MASSEFFECT_INDIRECT_DISPATCH must be 0, 1 or 2 (is '${MASSEFFECT_INDIRECT_DISPATCH}')")
+endif()
+foreach(target masseffect_recomp masseffect)
+    if(TARGET ${target})
+        target_compile_definitions(${target} PRIVATE REX_INDIRECT_DISPATCH=${MASSEFFECT_INDIRECT_DISPATCH})
+        if(MASSEFFECT_INDIRECT_DISPATCH_VERIFY)
+            target_compile_definitions(${target} PRIVATE REX_INDIRECT_DISPATCH_VERIFY=1)
+        endif()
+    endif()
+endforeach()
+message(STATUS "Indirect call dispatch: ${MASSEFFECT_INDIRECT_DISPATCH} (verify ${MASSEFFECT_INDIRECT_DISPATCH_VERIFY})")
 
 # Optimisation level of the recompiled game code only (Cortex-A57: 48 KB I-cache, ~50 MB of generated .text; a
 # smaller -Os/-O2 build may miss less than the default -O3). Empty = keep the default.

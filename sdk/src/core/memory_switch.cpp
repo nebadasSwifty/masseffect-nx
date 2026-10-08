@@ -41,10 +41,33 @@
 
 #include <malloc.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 
 #include "guest_memory_switch.h"
+
+/*
+ * Guest window page size. See docs/platform-notes.md, "Guest memory page size", and the comment
+ * above kWindowAlign in guest_memory_switch.cpp.
+ */
+REXCVAR_DEFINE_INT32(guest_memory_large_pages, 0, "Memory",
+                     "Switch: map the guest window so the kernel can use 2 MB blocks instead of 4 KB "
+                     "pages. 0 = off, 1 = 2 MB-aligned window (all views but 0xE0000000), 2 = as 1 but "
+                     "0xE0000000 is the 2 MB view and 0xA0000000/0xC0000000/raw physical are not")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(guest_memory_tlb_benchmark, 0, "Memory",
+                     "Switch: at startup, time random dependent loads over this many MB (0 = off) "
+                     "through 2 MB, 64 KB and 4 KB page mappings and log ns/load (a few seconds)")
+    .range(0, 1024)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(guest_memory_tlb_benchmark_loads, 2000000, "Memory",
+                     "Switch: loads per timed run of guest_memory_tlb_benchmark")
+    .range(100000, 100000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::memory {
 
@@ -259,11 +282,22 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   // Horizon has no named shared memory and no sparse memory. The "file" is the
   // window of the guest memory core, and it is reserved here, empty. Real memory
   // arrives with AllocFixed(kCommit).
-  if (!RexGmBase() && !RexGmInit(AlignUp(length))) {
-    REXLOG_ERROR("Could not reserve the guest window of 0x{:X} bytes. "
-                 "Title takeover is required: in applet mode there is no room.",
-                 length);
-    return kFileMappingHandleInvalid;
+  if (!RexGmBase()) {
+    RexGmConfigure(REXCVAR_GET(guest_memory_large_pages));
+    if (!RexGmInit(AlignUp(length))) {
+      REXLOG_ERROR("Could not reserve the guest window of 0x{:X} bytes. "
+                   "Title takeover is required: in applet mode there is no room.",
+                   length);
+      return kFileMappingHandleInvalid;
+    }
+    REXLOG_INFO("Guest window: base 0x{:016X} (0x{:X} past a 2 MB boundary), large pages mode {}",
+                reinterpret_cast<uintptr_t>(RexGmBase()),
+                reinterpret_cast<uintptr_t>(RexGmBase()) & 0x1FFFFF, RexGmLargePagesMode());
+    if (REXCVAR_GET(guest_memory_tlb_benchmark) > 0) {
+      RexGmTlbBenchmark(size_t(REXCVAR_GET(guest_memory_tlb_benchmark)) << 20,
+                        size_t(REXCVAR_GET(guest_memory_tlb_benchmark_loads)),
+                        [](const char* line) { REXLOG_INFO("{}", line); });
+    }
   }
   return kSwitchMapping;
 }

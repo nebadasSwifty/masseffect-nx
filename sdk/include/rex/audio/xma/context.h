@@ -290,6 +290,16 @@ class XmaContext {
   bool in_silence_ = false;
   uint32_t passed_silence_ = 0;
   uint8_t silence_reason_ = 0;
+  // Fork addition: stuck-voice diagnostics (audio_xma_diag), measurement only. See NoteBlocksWritten
+  // and NoteProduction in xma_context.cpp and docs/platform-notes.md, "Audio: the 344.5 Hz comb".
+  void NoteBlocksWritten(const uint8_t* blocks, uint32_t count, const XMA_CONTEXT_DATA& data);
+  void DescribeState(const XMA_CONTEXT_DATA& data, char* out, size_t size) const;
+  uint64_t last_block_hash_ = 0;
+  uint32_t identical_blocks_ = 0;
+  bool repeat_reported_ = false;
+  bool stall_reported_ = false;
+  bool one_frame_loop_reported_ = false;
+  bool loop_off_reported_ = false;  // audio_xma_loop_zero_end_off diagnostic, once per sound
   std::atomic<bool> is_allocated_ = false;
   std::atomic<bool> is_enabled_ = false;
 

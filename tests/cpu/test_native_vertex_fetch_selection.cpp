@@ -46,5 +46,20 @@ int main() {
   assert(SelectVertexFetch(original, loaded, 16, false, duplicate, index).word_offset == 48);
   original[16 * 3 + 1] = 0; loaded[16 * 3 + 1] = 1;
   assert(!select(16, true)); // Same mask but impossible repeated-selector remap.
+  {
+    // Permuted run (VS CD057930742AFE84): instructions 3 and 4 write r3.zw and r3.xy in the library and the other
+    // way round in the ring; instruction 6 writes r3.xy again later (a TEMP reused at another point).
+    std::array<uint32_t, 21> lib{}, ring{};
+    lib[9] = 0x3000; lib[10] = 0x23F; lib[12] = 0x3000; lib[13] = 0xFC8; lib[18] = 0x3000; lib[19] = 0xFC8;
+    ring = lib;
+    ring[10] = 0x40253FC8; ring[13] = 0x4025323F; ring[19] = 0x40253FC8;
+    const std::array<size_t, 3> declared{3, 4, 6};
+    assert(SelectVertexFetchPermuted(lib, ring, 3, declared, index).word_offset == 12);
+    assert(SelectVertexFetchPermuted(lib, ring, 4, declared, index).word_offset == 9);
+    assert(SelectVertexFetchPermuted(lib, ring, 6, declared, index).word_offset == 18);  // own, never the run
+    // The plain unordered fallback is ambiguous for instruction 4 (r3.xy at 3 and at 6).
+    assert(SelectVertexFetch(lib, ring, 4, false, declared, index).failure ==
+           VertexFetchSelectionFailure::Ambiguous);
+  }
   std::puts("native vertex fetch selection: PASS");
 }

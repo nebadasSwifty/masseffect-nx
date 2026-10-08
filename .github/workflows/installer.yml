@@ -158,7 +158,7 @@ jobs:
             tag=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq '[.[] | select(.draft == false)][0].tag_name // empty')
           fi
           test -n "$tag" || { echo '::error::Publish a complete NRO/NSP release before deploying'; exit 1; }
-          gh release download "$tag" --pattern '*.nro' --pattern '*.nsp' --pattern 'masseffect.toml' --dir release-assets
+          gh release download "$tag" --pattern '*.nro' --pattern '*.nsp' --pattern 'masseffect.toml' --pattern 'masseffect_prewarm_list-*.bin' --dir release-assets
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
       - name: Verify DXC can compile a shader
         run: node installer/tools/wasm_smoke.mjs wasm-all

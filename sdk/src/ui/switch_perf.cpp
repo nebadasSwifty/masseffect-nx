@@ -39,6 +39,11 @@
  * libraries, and the wrappers have to be defined before libnx.a enters the link.
  */
 
+#include <malloc.h>
+#include <unistd.h>
+
+// libnx: the end of the heap that newlib's sbrk hands out (see HeapState).
+extern "C" char* fake_heap_end;
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -66,6 +71,7 @@ size_t RexGmCommittedBytes(void);
 size_t RexGmMappedBytes(void);
 /* 0 = untested, 1 = permissions (watched pages readable), 2 = unmapping. */
 int RexGmProtectionMode(void);
+size_t RexGmLayoutSummary(char* buf, size_t cap);
 Result __real_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem,
                            size_t stack_sz, int prio, int cpuid);
 Result __real_threadClose(Thread* t);
@@ -90,6 +96,27 @@ constexpr u64 kSecondNs = 1000000000ULL;      // tick for the console overlays
 
 /* internal resolution published to the overlays. The game sets it when choosing the video mode. */
 std::atomic<uint32_t> g_resolution{(1280u << 16) | 720u};
+
+/*
+ * A free-text label the game sets (the location tour: "<map> <stop>/<stops>", app/src/native/me_tour.cpp) and the
+ * number of report blocks written, so each block can be attributed to a place. Two buffers: the writer fills the
+ * one the reader is not using and then publishes it; the reader retries once if a write raced its copy.
+ */
+constexpr size_t kLabelBytes = 96;
+char g_labels[2][kLabelBytes]{};
+std::atomic<uint32_t> g_label_seq{0};
+std::atomic<uint32_t> g_report_index{0};
+
+void ReadLabel(char out[kLabelBytes]) {
+  for (int tries = 0; tries < 2; ++tries) {
+    const uint32_t seq = g_label_seq.load(std::memory_order_acquire);
+    std::memcpy(out, g_labels[seq & 1], kLabelBytes);
+    out[kLabelBytes - 1] = 0;
+    if (g_label_seq.load(std::memory_order_acquire) == seq) {
+      return;
+    }
+  }
+}
 constexpr u64 kPassiveIntervalNs = 100000000ULL;  // 100 ms, without pausing threads
 // Next to the rexglue logs, in <NRO folder>/logs/rex/.
 std::string StackFlagPath() {
@@ -104,7 +131,8 @@ constexpr u64 kReportSeconds = 10;
 constexpr u64 kStartDelayNs = 8000000000ULL;
 constexpr size_t kMaxSamples = 1 << 15;
 constexpr size_t kFrames = 10;
-// 0-32 renderer/audio counters (see RexSwitchPerfAdd); 40-55 host-runtime overhead (include/rex/sys_counters.h).
+// 0-32 renderer/audio counters (see RexSwitchPerfAdd); 40-55 host-runtime overhead (include/rex/sys_counters.h);
+// 56-58 XMA stuck-voice diagnostics (xma_context.cpp, audio_xma_diag).
 constexpr unsigned kCounterCount = 64;
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
 std::string ReportPath() {
@@ -250,6 +278,17 @@ extern "C" void RexSwitchPerfToggleAb(void) {
  * view), so that limit is the real ceiling, not free memory. When it runs out,
  * even committing 4 KB fails with 2001-0103 (resource exhausted).
  */
+// The process "used" size above includes the whole heap that libnx reserves at start, so it is always close to the
+// total. The real state of the host heap: bytes malloc hands out, free bytes inside what malloc already took from the
+// heap, and the heap that malloc has not taken yet (fake_heap_end - sbrk(0)).
+void HeapState(u64* in_use_mb, u64* free_in_arena_mb, u64* untouched_mb) {
+  const struct mallinfo mi = mallinfo();
+  *in_use_mb = static_cast<u64>(mi.uordblks) >> 20;
+  *free_in_arena_mb = static_cast<u64>(mi.fordblks) >> 20;
+  char* top = static_cast<char*>(sbrk(0));
+  *untouched_mb = (fake_heap_end && top && fake_heap_end > top) ? static_cast<u64>(fake_heap_end - top) >> 20 : 0;
+}
+
 void LimitOfMapping(u64* used_mb, u64* cap_mb, u64* process_mb, u64* total_mb) {
   *used_mb = *cap_mb = *process_mb = *total_mb = 0;
   u64 v = 0;
@@ -458,6 +497,8 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
 
   u64 lim_used = 0, lim_cap = 0, proc_used = 0, proc_total = 0;
   LimitOfMapping(&lim_used, &lim_cap, &proc_used, &proc_total);
+  u64 heap_in_use = 0, heap_free = 0, heap_untouched = 0;
+  HeapState(&heap_in_use, &heap_free, &heap_untouched);
 
   double total_cpu = 0.0;
   for (size_t i : order) {
@@ -467,7 +508,8 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                "==== %.1f s | mode: %s | game %.1f fps | CPU total %.0f%% (400%% = 4 cores) | faults/s: "
                "emulated read %.0f, SDK handler %.0f, emulated retry %.0f, SEH %.0f, "
                "physical committed %.0f, views %.0f | guest %zu/%zu MB (backing/mapped) | "
-               "mapping limit %llu/%llu MB, process %llu/%llu MB | "
+               "mapping limit %llu/%llu MB, process %llu/%llu MB, heap: malloc in use %llu MB, free in arena "
+               "%llu MB, never taken %llu MB | "
                "samples %zu | watching: %s | samplers: %.0f new/s, %.0f stalls/s\n",
                seconds, mode, double(counters_now[0] - counters_last[0]) / seconds, total_cpu,
                double(counters_now[1] - counters_last[1]) / seconds,
@@ -477,12 +519,27 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                double(counters_now[17] - counters_last[17]) / seconds,
                double(counters_now[18] - counters_last[18]) / seconds,
                RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20,
-               (u64)lim_used, (u64)lim_cap, (u64)proc_used, (u64)proc_total, g_sample_count,
+               (u64)lim_used, (u64)lim_cap, (u64)proc_used, (u64)proc_total, heap_in_use, heap_free,
+               heap_untouched, g_sample_count,
                 (RexGmProtectionMode() == 1   ? "permissions (readable pages)"
                  : RexGmProtectionMode() == 2 ? "unmapping (every read faults)"
                                               : "untested"),
                 double(counters_now[20] - counters_last[20]) / seconds,
                 double(counters_now[19] - counters_last[19]) / seconds);
+  {
+    char label[kLabelBytes];
+    ReadLabel(label);
+    const uint32_t block = g_report_index.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::fprintf(f, "     block %u | label: %s\n", block, label[0] ? label : "-");
+  }
+  // How the guest window is mapped: 4 KB pages or 2 MB blocks (guest_memory_large_pages). See
+  // docs/platform-notes.md, "Guest memory page size".
+  {
+    static char layout[1536];
+    if (RexGmLayoutSummary(layout, sizeof(layout)) > 0) {
+      std::fprintf(f, "     guest pages: %s\n", layout);
+    }
+  }
   // Work the game sends to the GPU, per presented frame. One screen is
   // 1280x720 = 921,600 pixels.
   const auto delta = [&](unsigned id) { return double(counters_now[id] - counters_last[id]); };
@@ -494,8 +551,10 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
   std::fprintf(f,
                "     audio: %.0f client blocks mixed, %.0f requests without data, "
                "%.0f/%.0f audout buffers with non-zero PCM, %.0f saturated samples (above 1.0 before clipping), "
-               "%.0f buffers with a peak of 0.98 or more, maximum peak %.3f | console in %s mode\n",
+               "%.0f buffers with a peak of 0.98 or more, maximum peak %.3f | XMA: %.0f blocks written, "
+               "%.0f repeated-block runs, %.0f stalls of 1 s or more (audio_xma_diag) | console in %s mode\n",
                delta(24), delta(25), delta(26), delta(27), delta(21), delta(22), double(audio_peak) / 10000.0,
+               delta(58), delta(56), delta(57),
                rex::ui::switch_saltynx::BaseMode(appletGetOperationMode() == AppletOperationMode_Console)
                    ? "docked"
                    : "handheld");
@@ -1167,6 +1226,20 @@ void RexSwitchPerfExclusiveCore(int core) {
 
 void RexSwitchPerfResolution(unsigned w, unsigned h) {
   g_resolution.store(((w & 0xFFFF) << 16) | (h & 0xFFFF), std::memory_order_relaxed);
+}
+
+// The label written under the next report blocks (see g_labels); any thread, cheap (no lock, no I/O).
+void RexSwitchPerfSetLabel(const char* label) {
+  const uint32_t seq = g_label_seq.load(std::memory_order_relaxed) + 1;
+  char* dst = g_labels[seq & 1];
+  std::strncpy(dst, label ? label : "", kLabelBytes - 1);
+  dst[kLabelBytes - 1] = 0;
+  g_label_seq.store(seq, std::memory_order_release);
+}
+
+// Report blocks written so far (the block being measured now is this + 1).
+uint32_t RexSwitchPerfReportIndex(void) {
+  return g_report_index.load(std::memory_order_relaxed);
 }
 
 // See g_interval_swap, next to the nwindowQueueBuffer wrapper. 0 = touch nothing (the normal case).

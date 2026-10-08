@@ -98,6 +98,9 @@ struct RecompilerConfig {
   bool dformDispSplit = false;
   /// Mass Effect diet: fctiwz as an fcvtzs plus a NaN select (rex::ppc::fctiwz).
   bool fctiwzInline = false;
+  /// Mass Effect: dcbt / dcbtst become REX_DCBT / REX_DCBTST (__builtin_prefetch of the guest EA, rw=1 for dcbtst)
+  /// instead of nothing. AArch64 PRFM never faults, so any EA is safe. Toml key dcbt_prefetch, default off.
+  bool dcbtPrefetch = false;
   std::unordered_set<uint32_t> lrKeepReturns;
   bool ctrAsLocalVariable = false;
   bool xerAsLocalVariable = false;

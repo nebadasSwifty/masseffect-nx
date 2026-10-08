@@ -35,6 +35,10 @@
 #include "masseffect_waits_hitch.h"
 
 #include "masseffect_native_vertices_dedupe.h"
+#include "../me_ring_partition.h"
+#include "../me_frame_coherence.h"  // masseffect_native_coherence_stats (measurement)
+#include "../me_texture_coherency.h"  // masseffect_native_texture_coherency
+#include "me_draw_cache.h"  // masseffect_native_draw_cache_* (docs/frame-coherence.md)
 #include "me_primitives.h"
 #include "me_depth.h"
 #include "me_rectangle_spirv.h"
@@ -42,6 +46,10 @@
 #include "me_depth_quantize_spirv.h"
 #include "me_fragcoord_xy_spirv.h"
 #include "me_texture_signs_spirv.h"
+#include "me_ps_descriptors_spirv.h"
+#include "me_vs_constants_spirv.h"
+#include "me_restore_7e3_spirv.h"
+#include "me_fixed16_spirv.h"
 #include "me_edram_ownership.h"
 #include "me_raster_state.h"
 #include "../me_vertex_fetch_selection.h"
@@ -188,6 +196,64 @@ REXCVAR_DEFINE_BOOL(masseffect_native_adaptive_texture, true, "Mass Effect",
                     "backs off to masseffect_native_texture_interval_max again");
 
 /*
+ * CPU-updated atlases (docs/image-defects-feros.md, section 7: missing letters in the UI text).
+ *
+ * The UI text is drawn from glyph-cache pages: small single-channel textures (k_8, 256x256 in the logs: 160D3000,
+ * 15BD4000, 14A8F000 ...) into which the game's UI library rasterizes a glyph on the CPU the first time a string
+ * needs it, and then draws the string at once. Only the glyph's few tiles change. Three switches, all on by default:
+ *
+ * masseffect_native_texture_atlas_cap (fresher, never staler): a single-channel texture of at most 512x512 that has
+ * changed after looking stable (late_changes > 0) is rechecked at most every N frames (default 1 = every frame it
+ * is used) instead of the adaptive 4 / 2. A new glyph then appears on the next frame instead of up to 4 frames
+ * later, and a page that receives glyphs rarely can never sit at a long interval. Costs one XXH3 of 64 KB (about
+ * 10-20 us on the A57) per such page and frame; there are a handful. 0 = off (the adaptive cap as before).
+ *
+ * masseffect_native_texture_sample_after_change (exact, removes a non-exact shortcut): a texture with late_changes > 0
+ * is never rechecked by its sample alone (masseffect_native_fingerprints_sampling): a sampled recheck reads 1 in 8
+ * 4 KB blocks, and a glyph written into an unsampled block was invisible until the next full recheck (up to
+ * masseffect_native_fingerprints_sampling rechecks later, with interval 32: about 9 s). Only reachable with
+ * masseffect_native_texture_interval_max >= masseffect_native_fingerprints_sample_min_interval (32 / 8 by default;
+ * the shipped toml's 4 never samples). false = as before.
+ *
+ * masseffect_native_texture_requeue_uploads (exact): a texture whose new content was read and whose upload was queued
+ * for a draw that then stopped before its upload stage (a resolved-texture fetch failing in another sampler, an
+ * upload-buffer reject, a failed send) kept needs_upload = true with its raw hash already updated: every later
+ * recheck found "same bytes" and the image kept the old content until the guest changed it again (a glyph missing
+ * for good). With the switch, PrepareTexture queues such a texture again (its laid-out data is still held) the next
+ * time any draw uses it. Counted and logged ("ME lost texture upload requeued").
+ */
+REXCVAR_DEFINE_INT32(masseffect_native_texture_atlas_cap, 1, "Mass Effect",
+                     "Longest recheck interval, in frames, of a single-channel texture of at most 512x512 that changed "
+                     "after looking stable (UI glyph caches written by the CPU). 1 = every frame it is used; 0 = off "
+                     "(adaptive 4 / 2 as before). Never staler than before")
+    .range(0, 32);
+REXCVAR_DEFINE_BOOL(masseffect_native_texture_sample_after_change, true, "Mass Effect",
+                    "A texture that changed after looking stable is never rechecked by its fingerprint sample alone "
+                    "(always the full hash). Exact; false = as before");
+REXCVAR_DEFINE_BOOL(masseffect_native_texture_requeue_uploads, true, "Mass Effect",
+                    "Queue again a texture whose upload was dropped because its draw stopped before the upload "
+                    "stage (otherwise it kept stale content until the guest changed it again). Exact; false = as before");
+/*
+ * masseffect_native_glyph_trace (diagnostic, default off; docs/image-defects-feros.md, section 7). For UI glyph-cache
+ * pages (single-channel 2D textures up to 512x512, k_8 fetches) it logs every source of their texels:
+ *   - "ME glyph trace: new page": first time the renderer reads a page (address, size, nonzero texels);
+ *   - "ME glyph trace: CPU bytes changed": each time its guest bytes change, the changed 32x32 tiles as rectangles
+ *     (x,y wxh in texels) and the nonzero texel counts before and after (a new glyph = a few tiles, more texels);
+ *   - "ME glyph trace: upload": the upload of that content recorded (or "requeued" if a draw dropped it);
+ *   - "ME glyph trace: served by a RESOLVED image": a k_8 / single-channel fetch answered by the GPU copy of a resolve
+ *     at the same address (texels from a render target, not from guest memory), with the resolve's shape;
+ *   - "ME glyph trace: resolve fingerprint" lines come from masseffect_native_resolved_cpu_overwrite (targets).
+ * Lines are capped (masseffect_native_glyph_trace_lines) so a long session does not flood the log.
+ */
+REXCVAR_DEFINE_BOOL(masseffect_native_glyph_trace, false, "Mass Effect",
+                    "Diagnostic: log every write source of UI glyph-cache pages (single-channel textures up to "
+                    "512x512): CPU changes with their 32x32 tile rectangles, uploads, and fetches served by a resolved "
+                    "GPU image instead of guest memory");
+REXCVAR_DEFINE_INT32(masseffect_native_glyph_trace_lines, 2000, "Mass Effect",
+                     "Maximum lines of masseffect_native_glyph_trace per session")
+    .range(1, 1000000);
+
+/*
  * Sampled recheck of stable textures. See PrepareTexture and SampleFingerprint.
  * Enabled by default: its guard verifies itself and switches off at the first mismatch.
  */
@@ -198,6 +264,43 @@ REXCVAR_DEFINE_INT32(masseffect_native_fingerprints_sampling, 8, "MASSEFFECT",
                      "each texture is still a full one, and the first 3000 compute both fingerprints: a single "
                      "disagreement switches the sampling off. 0 = always the full fingerprint, as before")
     .range(0, 64);
+
+/*
+ * Ring CPU per draw (docs/ring-cpu-per-draw.md). Three switches for the texture recheck, all off by default.
+ *
+ * masseffect_native_fingerprints_skip_unused_sample (exact): a full recheck at interval 4 or more also hashes the
+ * sample, but the sample is only ever consumed by a recheck at interval 8 or more. With the shipped
+ * masseffect_native_texture_interval_max = 4 (or a texture whose adaptive cap is 2 or 4) the interval never gets
+ * there, so ~12-16 % of the bytes of every recheck were hashed for nothing. With the switch the sample is not
+ * computed when neither the current interval nor the texture's cap can reach 8, and the texture keeps no stored
+ * sample (valid_sample = false), so a later cap change can never consume one that was not computed. The bytes are
+ * still counted against the frame budget exactly as before, so postponements do not change either.
+ *
+ * masseffect_native_fingerprints_sample_min_interval (NOT exact, a variant for the user to judge): the interval
+ * from which a stable texture may be rechecked by its sample alone. 8 = as before. 4 lets the shipped 4-frame cap
+ * use sampled rechecks (1 in masseffect_native_fingerprints_sampling still full, the self-check guard unchanged):
+ * a change outside the sampled blocks can then be shown late by up to 4 x N frames instead of 4.
+ *
+ * masseffect_native_texture_spread_phase (NOT frame-identical, never staler): below the 32-frame cap the recheck
+ * has no jitter, so textures that arrived together (one zone) are all rechecked in the same frame: in the Normandy
+ * walk windows 25-38 MB in one frame, 10-15 ms of ring time, a 66 ms frame. With the switch, the first time a
+ * texture's interval reaches its cap, the next recheck is brought forward by 0..cap-1 frames (from its key), so
+ * the textures spread over the cap's frames. No recheck is ever later than before: content is never staler than
+ * the cap; it is only checked (and possibly refreshed) earlier.
+ */
+REXCVAR_DEFINE_BOOL(masseffect_native_fingerprints_skip_unused_sample, false, "MASSEFFECT",
+                    "Texture recheck: do not hash the sample when this texture's interval cannot reach 8 (where "
+                    "the sample is used). Exact: same rechecks, same results, fewer bytes hashed with "
+                    "masseffect_native_texture_interval_max = 4");
+REXCVAR_DEFINE_INT32(masseffect_native_fingerprints_sample_min_interval, 8, "MASSEFFECT",
+                     "Texture recheck: interval from which a stable texture may be rechecked by its sample alone "
+                     "(8 = as before). 4 = sampled rechecks also with the 4-frame cap; NOT exact (a change outside "
+                     "the sample may show up to 4 x masseffect_native_fingerprints_sampling frames late)")
+    .range(4, 32);
+REXCVAR_DEFINE_BOOL(masseffect_native_texture_spread_phase, false, "MASSEFFECT",
+                    "Texture recheck: when a texture first reaches its interval cap below 32, bring its next "
+                    "recheck forward by 0..cap-1 frames so rechecks spread over frames instead of piling up in one. "
+                    "Never staler than the cap; frames may differ from the default (checked earlier)");
 
 REXCVAR_DEFINE_BOOL(masseffect_shadows_no_vegetation, false, "MASSEFFECT",
                     "Do not draw alpha-tested geometry into the shadow map: trees, bushes and "
@@ -250,6 +353,16 @@ REXCVAR_DEFINE_BOOL(masseffect_native_set4_differences, true, "MASSEFFECT",
  * per-part measurement (CNTPCT clock, 1 in N calls) gives the real breakdown in "C6 NVK parts".
  * With an unpatched Mesa (or on PC) none of this does anything.
  */
+// Measurement only (docs/nvk-per-draw.md). The "Vulkan draw" phase of the ring partition is the whole of
+// DrawsVulkanImpl::Draw outside the sampler loop, but "C6 substages" only times the vkCmd* calls, PipelineFor,
+// the shared block and the indices stage: in the heavy Normandy windows they cover 6-10 of the ~20 us that phase
+// costs per recorded draw. The stage stopwatch (stages_ns_) already partitions every timed draw without gaps but
+// was never printed. With this on, a "C6 stages" line follows "C6 substages" every 10 s, on the same timed
+// draws (1 in 64), so the two lines add up.
+REXCVAR_DEFINE_BOOL(masseffect_native_report_stages, false, "MASSEFFECT",
+                    "Native renderer: print the 'C6 stages' line every 10 s (us per timed draw of each stage of "
+                    "DrawsVulkanImpl::Draw: state, indices, textures, upload space and pass, uploads, pipeline and "
+                    "constants, recording; plus the pass change split). Measurement only, nothing else changes");
 REXCVAR_DEFINE_INT32(masseffect_native_nvk_measure, 64, "MASSEFFECT",
                      "Native renderer: measures by parts inside NVK on 1 in N calls "
                      "(power of 2; 'C6 NVK parts' report every 10 s). 0 = no measuring")
@@ -352,6 +465,109 @@ static_assert(sizeof(NvkSwitchDraw) == 24 + 16 * 16 + 13 * 8 + 5 * 40, "NvkSwitc
  *
  * What to check, in motion (not paused): the HUD and the text overlays. If anything looks blurry or delayed, disable this cvar in the toml.
  */
+/*
+ * masseffect_native_invalidate_textures_each_copy = false (the code default; the shipped toml still says true) keeps
+ * the two sampler caches across render target copies: the targeted invalidations (a resolved texture created,
+ * rebuilt, prepared, re-swizzled or cropped) cover what a copy can change. In the Normandy walk windows the
+ * per-copy invalidation causes 40-50k of the ~45k "by generation" misses per 10 s, each a full PrepareTexture
+ * (XXH3 key, textures_/views_/samplers_ lookups, resolved lookups: several us).
+ *
+ * This check proves it on the console: with the per-copy invalidation off, the first N cache hits whose entry was
+ * filled before the latest copy (that is, the hits the old behavior would have turned into misses) are not
+ * taken; PrepareTexture runs as before (the old behavior exactly) and its result is compared with the cached one.
+ * Any difference logs DIFFERENCE and turns the per-copy invalidation back on for the rest of the session.
+ */
+REXCVAR_DEFINE_INT32(masseffect_native_texture_copy_verify, 4096, "MASSEFFECT",
+                     "Native renderer, with masseffect_native_invalidate_textures_each_copy = false: the first N "
+                     "texture cache hits across a copy run the old path and are compared (DIFFERENCE turns the "
+                     "per-copy invalidation back on). 0 = no check")
+    .range(0, 100000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DECLARE(bool, masseffect_native_invalidate_textures_each_copy);  // masseffect_native_targets.cpp
+REXCVAR_DECLARE(int32_t, masseffect_native_verify_n);  // me_native_system.cpp
+
+/*
+ * Texture recheck without hashing (docs/ring-cpu-per-draw.md, "Feros firefight profile 2026-10-08";
+ * app/src/native/me_texture_coherency.h). The ring records, per 16 KB page of physical memory, the stamp of the last
+ * GPU coherency event (COHER_BASE/SIZE_HOST: the range D3D tells the GPU to drop from its caches after the CPU
+ * changed it) and of the resolved texels read back into guest memory. A stable texture whose pages have no newer
+ * stamp than its last full hash is taken as unchanged without XXH3. Same schedule, same answer as a full recheck
+ * that finds the same bytes; exact as long as the game declares every change, which the guards check.
+ */
+REXCVAR_DEFINE_INT32(masseffect_native_texture_coherency, 0, "Mass Effect",
+                     "Texture recheck by coherency events. 0 = off (always XXH3 of the guest bytes). 1 = a stable "
+                     "texture whose guest pages saw no coherency event (COHER_BASE/SIZE_HOST) or read-back since its "
+                     "last full hash is taken as unchanged without hashing; the first masseffect_native_verify_n such "
+                     "rechecks and 1 in masseffect_native_texture_coherency_full_every of each texture still hash, and "
+                     "one changed hash on a texture called clean logs DIFFERENCE and turns it off. 2 = measurement only: "
+                     "always hash, count how often the events would have been right (report every 10 s)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_texture_coherency_full_every, 8, "Mass Effect",
+                     "masseffect_native_texture_coherency = 1: every Nth recheck of a texture that the events call "
+                     "clean is still a full hash (the standing guard). 1 = always (no saving, guard only)")
+    .range(1, 64);
+REXCVAR_DEFINE_INT32(masseffect_native_texture_coherency_max_undeclared, 4, "Mass Effect",
+                     "masseffect_native_texture_coherency = 1: a texture that changes with no coherency event is "
+                     "always hashed from then on (Bink planes and other CPU-written textures do this every frame). "
+                     "Only changes on textures that would have been skipped (tiled, already seen unchanged once) "
+                     "count here: after more than N of them the skip turns off for the session. 0 = the first one")
+    .range(0, 100000);
+REXCVAR_DEFINE_BOOL(masseffect_native_texture_coherency_linear, false, "Mass Effect",
+                    "masseffect_native_texture_coherency: also skip LINEAR (untiled) textures. Off by default: the "
+                    "linear ones are the CPU-written kind (Bink video planes, k_8 1280x720 / 640x360, rewritten "
+                    "every frame without any coherency event)");
+REXCVAR_DEFINE_BOOL(masseffect_native_texture_coherency_early, false, "Mass Effect",
+                    "masseffect_native_texture_coherency on: a texture whose recheck is not due yet is rechecked at "
+                    "once when a coherency event touched its pages since its last hash (fresher textures, less "
+                    "popping; NOT frame-identical). Acts whenever PrepareTexture is reached (always with "
+                    "masseffect_native_cache_textures_between_frames = false)");
+/*
+ * Ring CPU round 3 (docs/ring-cpu-per-draw.md, "Round 3"). Measurement switch plus exact savings in the textures and
+ * uploads stages of DrawsVulkanImpl::Draw. Every saving is off by default and checks itself against the old path.
+ */
+REXCVAR_DEFINE_BOOL(masseffect_native_report_texture_uploads, false, "MASSEFFECT",
+                    "Native renderer: every 10 s, a 'C6 textures and uploads' line: PrepareTexture calls and time by "
+                    "outcome, texture-cache invalidations by reason, and the uploads stage split into parts (texture "
+                    "uploads, vertex fingerprints, dedupe, vertex copies, indices, VS and PS constants). Measurement "
+                    "only, nothing else changes")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_texture_inval_by_address, false, "MASSEFFECT",
+                    "Native renderer (exact): an invalidation tied to one resolved-texture address (created, rebuilt, "
+                    "prepared, re-swizzled, cropped) only drops the sampler-cache entries of ordinary textures whose "
+                    "base falls in the same address bucket; entries of resolved textures are still dropped by any "
+                    "invalidation. The first masseffect_native_texture_inval_verify hits the old rule would refuse "
+                    "are checked against PrepareTexture")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_texture_inval_verify, 4096, "MASSEFFECT",
+                     "Native renderer, with masseffect_native_texture_inval_by_address: the first N cache hits the "
+                     "global invalidation would have refused run PrepareTexture and are compared (DIFFERENCE turns "
+                     "the switch off). 0 = no check")
+    .range(0, 100000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_texture_frames_verify, 4096, "MASSEFFECT",
+                     "Native renderer, with masseffect_native_cache_textures_between_frames = true: the first N cache "
+                     "hits from an earlier frame run PrepareTexture and are compared (DIFFERENCE turns the cross-frame "
+                     "cache off). 0 = no check")
+    .range(0, 100000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_constants_same_content, false, "MASSEFFECT",
+                    "Native renderer (exact): when the VS or PS constants changed generation but the bytes the shader "
+                    "reads equal the last upload of this upload buffer (compared with a CPU-cached copy), the earlier "
+                    "upload is reused instead of copied again. The first masseffect_native_constants_same_verify "
+                    "reuses read the upload back and compare")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_constants_same_verify, 2048, "MASSEFFECT",
+                     "Native renderer, with masseffect_native_constants_same_content: the first N reuses compare the "
+                     "uploaded bytes with the registers (DIFFERENCE turns the switch off). 0 = no check")
+    .range(0, 100000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(masseffect_native_dedupe_hash_after_copy, false, "MASSEFFECT",
+                    "Native renderer: a vertex binding with no live dedupe entry of the same address, size and byte "
+                    "order is copied first and its dedupe fingerprint is computed afterwards, from the same guest "
+                    "bytes (now in the CPU cache) instead of from cold memory before the copy. Same fingerprint, same "
+                    "decisions; the first copies are checked against the fingerprint taken before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(masseffect_native_cache_textures_between_frames, true, "MASSEFFECT",
                     "Native renderer: sampler caches stay valid across frames as long as it is not time to "
                     "recheck the texture contents. false: they expire every frame, as before")
@@ -453,6 +669,9 @@ REXCVAR_DEFINE_BOOL(masseffect_native_pipelines_prewarm, false, "MASSEFFECT",
                     "run after a change). Changes no pipeline and no draw. false = no prewarming (the "
                     "list is still saved)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#include "masseffect_pipelines_cold_cvars.inc"  // cold-start pipeline hitches (docs/cold-start-hitches.md)
+#include "me_draw_cache_cvars.inc"  // per-component draw cache (docs/frame-coherence.md)
+#include "masseffect_ps_descriptors_cvars.inc"  // pixel shader descriptor and clamp rewrites (docs/scene-shader-cost.md)
 /*
  * This test has been answered: there is nothing to gain.
  *
@@ -488,6 +707,66 @@ REXCVAR_DEFINE_BOOL(masseffect_native_vs_pruned_outputs, true, "Mass Effect",
 REXCVAR_DEFINE_BOOL(masseffect_nvk_cache_per_stage, false, "Mass Effect",
                     "NVK: per-stage shader cache keys (runtime disable_lto), so a VS or PS already compiled for "
                     "another pipeline is not compiled again; needs the patched driver");
+REXCVAR_DEFINE_INT32(masseffect_diag_velocity, 0, "Mass Effect",
+                     "Diagnostic for the motion blur (docs/image-defects-feros.md), bit mask, 0 = off. 1: log once "
+                     "per distinct value the RB_COLOR_INFO of draws into a k_16_16 target (velocity buffer) and the "
+                     "six fetch-constant words (sign, exp_adjust, format) of every texture read by the motion blur "
+                     "PS (masseffect_diag_velocity_blur_ps) or with format k_16_16, the velocity constants "
+                     "(DynamicVelocityParameters, StaticVelocityParameters, IndividualVelocityScale) and the "
+                     "RB_COPY_DEST_INFO of k_16_16 resolves; no image change. 2: skip the draws into k_16_16 targets "
+                     "(dynamic objects then take the camera velocity). 4: skip the motion blur draws. 8: draws "
+                     "into k_16_16 targets with the depth test off and no depth write (tests whether a depth "
+                     "mismatch between the base pass and the velocity pass leaves holes in the velocity buffer)");
+REXCVAR_DEFINE_INT32(masseffect_diag_velocity_blur_ps, 0, "Mass Effect",
+                     "Motion blur pixel shader for masseffect_diag_velocity (bits 1 and 4). 0 = found by content: the "
+                     "PS whose original container names both DynamicVelocityParameters and VelocityBuffer (UE3 "
+                     "MotionBlurShader), independent of the package numbering. > 0 = this library number instead "
+                     "(n15184 before the 2026-10-08 package, n15187 after it)")
+    .range(0, 1000000);
+REXCVAR_DEFINE_INT32(masseffect_native_velocity_16_16, 0, "Mass Effect",
+                     "Xenos k_16_16 render targets (velocity buffer, docs/image-defects-feros.md section 3). 0 = old "
+                     "path (PS output stored as UNORM, raw copy on resolve). 1 = exact emulation as in xenia: the "
+                     "host R16G16_UNORM image holds the EDRAM word (two signed fixed-point -32...32 numbers, PS "
+                     "output epilogue me_fixed16_spirv.h) and a resolve unpacks it, applies copy_dest_exp_bias and "
+                     "packs it by copy_dest_number (me_resolve_fixed16_frag.frag). 2 = the same EDRAM word, but the "
+                     "resolve copies it raw (the alternative hypothesis: the game would then read 0.5 as 0.0078)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_motion_blur_frame_fix, 0, "Mass Effect",
+                     "UE3 motion blur on long frames (docs/image-defects-feros.md 3.7), bit mask, 0 = off (the "
+                     "game's constants as is). The game's velocities are per frame, so a 100 ms frame blurs 3x "
+                     "further than a 33 ms one. 1: scale the per-frame motion like a frame of "
+                     "masseffect_native_motion_blur_ref_ms: IndividualVelocityScale c1.xy of the velocity draws and "
+                     "the static scale StaticVelocityParameters c10.xy of the motion blur PS times "
+                     "min(1, ref / frame time); the MaxVelocity clamps (c10.zw, the velocity encoding) stay. 2: "
+                     "re-apply MaxVelocity to the dynamic decode: DynamicVelocityParameters c11 is shrunk so that "
+                     "texel * c11.xy + c11.zw stays within +-c10.zw (no change when the game's constants are "
+                     "consistent; logged when it changes something). 4: a frame longer than "
+                     "masseffect_native_motion_blur_cut_ms is a camera cut, as UE3 does on cuts: c10.xy and c11 "
+                     "are 0, so the motion blur PS copies the scene without blur. Frame time = the interval "
+                     "between the last two guest Swaps on the ring thread")
+    .range(0, 7);
+REXCVAR_DEFINE_DOUBLE(masseffect_native_motion_blur_ref_ms, 33.3, "Mass Effect",
+                      "Reference frame time for masseffect_native_motion_blur_frame_fix bit 1: frames up to this "
+                      "long keep the game's velocities, longer ones are scaled by ref / frame time (30 fps = 33.3)");
+REXCVAR_DEFINE_DOUBLE(masseffect_native_motion_blur_cut_ms, 60.0, "Mass Effect",
+                      "Frame time above which masseffect_native_motion_blur_frame_fix bit 4 treats the frame as a "
+                      "camera cut (no motion blur). Normal frames are 33-45 ms, the hitches 60-120 ms");
+REXCVAR_DEFINE_INT32(masseffect_diag_blur_source, 0, "Mass Effect",
+                     "Diagnostic for the one-frame vanishing of movable objects with Motion Blur on "
+                     "(docs/image-defects-feros.md 3.8). 0 = off. N > 0: the targets keep a per-frame journal of "
+                     "resolves (address, format, source EDRAM view, draws recorded into that view so far) and of the "
+                     "draws into k_16_16 (velocity) views; for every texture of the UE3 motion blur draw they log "
+                     "which resolve wrote the image it samples, how many draws reached the source view and the "
+                     "velocity views after that resolve, and whether the bound image is the one resolved at that "
+                     "address now. The first N frames with a blur draw are logged in full, later ones only when "
+                     "flagged (SUSPECT); a summary every 10 s. No image change")
+    .range(0, 100000);
+REXCVAR_DEFINE_BOOL(masseffect_native_motion_blur_source_guard, true, "Mass Effect",
+                    "UE3 motion blur draw (docs/image-defects-feros.md 3.8): if a texture of the draw is bound to an "
+                    "image that is not the one resolved at its address now (a stale descriptor binding), it is bound "
+                    "again through PrepareTexture without the sampler caches. Exact: in a frame without the defect "
+                    "the bound image already is the current one and nothing changes. false = no check");
 REXCVAR_DEFINE_STRING(masseffect_diag_trace_tile, "", "Mass Effect",
                       "Diagnostic: physical EDRAM tile (0-2047) whose ownership/sync events are logged "
                       "(sets MASSEFFECT_EDRAM_TRACE_TILE before the renderer starts)")
@@ -642,6 +921,15 @@ REXCVAR_DEFINE_INT32(masseffect_native_filter_aniso, 0, "Mass Effect",
 REXCVAR_DEFINE_BOOL(masseffect_native_skip_prepass, true, "Mass Effect",
                     "Skip the scene depth prepass (EDRAM mode 5 draws at the screen width, not clears): its depth, "
                     "rendered in the 2x view, disagrees with the material pass and caused black shards (B1)");
+// docs/occlusion-queries.md section E.
+REXCVAR_DEFINE_BOOL(masseffect_native_query_occlusion_depth, false, "Mass Effect",
+                    "Query modes 2 and 3 with masseffect_native_skip_prepass: the prepass draws that are skipped are "
+                    "drawn instead into a private copy of their depth view (the occlusion depth: never sampled, "
+                    "resolved or aliased), and the occlusion query boxes test against it instead of the scene depth "
+                    "(which holds no prepass). Cleared where the guest clears that depth surface; unused in a frame "
+                    "without such a clear. The image is unchanged")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DECLARE(int32_t, masseffect_native_query_mode);  // me_native_system.cpp
 
 /*
  * Splitting the frame into two submissions.
@@ -795,6 +1083,29 @@ REXCVAR_DEFINE_BOOL(masseffect_native_fold_texture_signs, false, "MASSEFFECT",
                     "Native renderer: put the texture signs (unsigned, biased, gamma) of each draw in "
                     "the pipeline key and fold them into the pixel shader as constants, so the GPU no "
                     "longer runs the per-fetch sign loop. Exact (same image); more pipelines");
+/*
+ * Vertex shader constants folded into the vertex shader (me_vs_constants_spirv.h,
+ * docs/vertex-shader-specialization.md).
+ *
+ * No shader of the game uses Xenos bool or loop constants; the branches of the skinned vertex shaders (the
+ * per-light passes run VS n2013 / n22611 once per light) test a FLOAT constant, MaxBoneInfluences.x, and the
+ * sprite shaders test ScreenAlignment.x. With this setting the float register components a vertex shader
+ * compares, and the identity input remap codes it reads, go in the pipeline key and become constants in the
+ * module: NAK drops the `skipTo` chain, the unused bone slots and the remap select loops (VS n2013 with four
+ * bones: 2687 -> 1054 NAK instructions, 62 -> 9 branches, 119 -> 60 indexed bone loads). The value folded is
+ * the one the shader would have read, so the image is identical. Cost: more pipelines, at most
+ * masseffect_native_fold_vs_constants_max_values value sets per vertex shader (beyond that the shader keeps
+ * reading them at run time).
+ */
+REXCVAR_DEFINE_BOOL(masseffect_native_fold_vs_constants, false, "MASSEFFECT",
+                    "Native renderer: put the float constants a vertex shader compares (MaxBoneInfluences, "
+                    "ScreenAlignment) and its identity input remaps in the pipeline key and fold them into the "
+                    "vertex shader as constants. Exact (same image); more pipelines");
+REXCVAR_DEFINE_INT32(masseffect_native_fold_vs_constants_max_values, 4, "MASSEFFECT",
+                     "Native renderer: with masseffect_native_fold_vs_constants, how many distinct value sets of "
+                     "its compared constants one vertex shader may be specialized for; after that its constants "
+                     "stay dynamic (bounds the pipeline count)")
+    .range(1, 64);
 REXCVAR_DEFINE_BOOL(masseffect_native_z_early, true, "MASSEFFECT",
                     "Native renderer: for draws that test depth but do NOT "
                     "write it (smoke, particles, glass, decals), declares EarlyFragmentTests in the "
@@ -1025,7 +1336,15 @@ namespace {
  * category vanished from the report. The shadow map is recognized for what it is: a depth-only target, with
  * no color at all.
  */
+// keys[4] bit 61 (bits 62 = depth used, 40-41 = MSAA, 24-35 = base, 16 = format, 0-13 = pitch):
+// masseffect_native_query_occlusion_depth, the draw binds the private occlusion depth of that depth view instead
+// of the view itself. Part of the pass key, so such draws never share a pass with the scene depth.
+constexpr uint64_t kKeyOcclusionDepth = uint64_t(1) << 61;
+
 inline uint32_t CategoryOfTarget(uint32_t pitch, const uint64_t* keys) {
+  if (keys[4] & kKeyOcclusionDepth) {
+    return kGpuOcclusionDepth;
+  }
   const bool color = keys[0] || keys[1] || keys[2] || keys[3];
   if (!color && keys[4] && pitch >= 1600) {
     return kGpuShadows;
@@ -1077,15 +1396,22 @@ constexpr const char* kFileOldList = "masseffect_native_pipelines_list.bin";
 // uint32 ("NFPL", version, record size and record count) followed by the records (RegisterPipeline).
 constexpr uint32_t kMagicPipelinesList = 0x4C50464Eu;  // "NFPL" in little-endian
 // Version 3: PipelineKey grew the texture signs (signs_low, signs_high, signs_heaps).
-constexpr uint32_t kVersionPipelinesList = 3;
+// Version 4: PipelineKey grew the folded vertex shader constants (vs_values, vs_fold).
+// Version 5: signs_heaps bits 24-26 mark the pixel shader descriptor/clamp rewrites (kKeyPs*); with
+// masseffect_native_ps_combined_heap the pipeline layout has a sixth set.
+constexpr uint32_t kVersionPipelinesList = 5;
 constexpr size_t kHeaderList = 4 * sizeof(uint32_t);
-constexpr size_t kMaxRegistersList = 4096;
+// A plain cap on records (file list + this session's), 448 bytes each: 8192 = 3.6 MB per copy (the ring's
+// vectors, the serialized list and the writer's copy). Raised from 4096 on 2026-10-09: with stale shader numbers
+// the old cap filled up with duplicates and stopped recording (RenumberPipelinesList now drops those).
+constexpr size_t kMaxRegistersList = 8192;
 // 296 bytes: MASSEFFECT's shader_common.h (g_NdcScale at +280 and g_NdcOffset at +288).
 // Shared constants: texture and sampler indices (0-63), booleans, texcoords, half pixel, alpha threshold
 // (68) and function (69), NDC (64-73) and g_InputRemap for the 16 locations (74-89).
 // 90 words up to g_InputRemap (bytes 296..359) and 32 more for 1/size of the 16 texture slots (bytes
-// 360..487), which avoid querying the texture size on every sample.
-constexpr uint32_t kSharedWords = 122;
+// 360..487), which avoid querying the texture size on every sample. Words 122/123 (bytes 488..495, the end of the
+// 31-float4 block the shaders declare): -FLT_MAX / FLT_MAX for masseffect_native_ps_flt_bounds_ubo, always written.
+constexpr uint32_t kSharedWords = 124;
 constexpr uint32_t kWordInvSize = 90;
 // Constants through a dynamic UBO (masseffect_native_constants_ubo). The bit is SPEC_CONSTANT_CONSTANTS_UBO
 // from shader_common.h, and the sizes are the blocks the shaders declare: 256 and 224 float4, and 23 shared
@@ -1110,6 +1436,10 @@ constexpr uint32_t kSpecZEarly = uint32_t(1) << 20;
 // Renderer-only bit (shader_common.h leaves 23 free for the app): the texture signs carried in the key
 // (PipelineKey::signs_*) are folded into the pixel shader module (masseffect_native_fold_texture_signs).
 constexpr uint32_t kSpecSignsFolded = uint32_t(1) << 23;
+// Renderer-only bit (shader_common.h leaves 19 free for the app): the vertex shader constants carried in the key
+// (PipelineKey::vs_values, vs_fold) are folded into the vertex shader module
+// (masseffect_native_fold_vs_constants).
+constexpr uint32_t kSpecVsFolded = uint32_t(1) << 19;
 // Renderer-only pipeline/module variant: clamp fragment outputs to the numeric range of Xenos 7e3 RGB
 // render targets. The shader sources don't inspect this bit; it only keeps the pipeline key distinct.
 constexpr uint32_t kSpecTarget7e3 = uint32_t(1) << 24;
@@ -1128,6 +1458,16 @@ constexpr uint32_t kSpecRasterGridX = uint32_t(1) << 22;
 // lets the prewarm thread build the exact same transformed SPIR-V module as the ring.
 constexpr uint32_t kSpecMask7e3Displacement = 25;
 constexpr uint32_t kSpecMask7e3 = uint32_t(0xF) << kSpecMask7e3Displacement;
+// Bits 10-13 (shader_common.h does not test them): restore into 7e3 (masseffect_native_restore_into_7e3). Bit
+// 10 + i = color slot i is the k_2_10_10_10_FLOAT image standing in for a k_2_10_10_10 view, and the pixel
+// shader's output i gets the UNORM10 -> 7e3 epilogue (me_restore_7e3_spirv.h). Never prewarmed.
+constexpr uint32_t kSpecRestore7e3Displacement = 10;
+constexpr uint32_t kSpecRestore7e3 = uint32_t(0xF) << kSpecRestore7e3Displacement;
+// Bits 4-7 (shader_common.h tests bits 2-4 only under UNLEASHED_RECOMP, which Mass Effect does not define):
+// k_16_16 encode (masseffect_native_velocity_16_16). Bit 4 + i = color slot i is a k_16_16 render target and the
+// pixel shader's output i gets the fixed-point -32...32 encode epilogue (me_fixed16_spirv.h). Never prewarmed.
+constexpr uint32_t kSpecFixed16Displacement = 4;
+constexpr uint32_t kSpecFixed16 = uint32_t(0xF) << kSpecFixed16Displacement;
 
 /*
  * The render target height comes from the pitch, not from what the game uses.
@@ -2204,6 +2544,11 @@ struct PipelineKey {
   uint32_t fill2 = 0;
   uint32_t signs_high = 0;
   uint32_t signs_heaps = 0;
+  // With kSpecVsFolded (masseffect_native_fold_vs_constants): the raw bits of the first n float register
+  // components the vertex shader compares (VertexConstantsInfo::components order), and in vs_fold bits 0-15 the
+  // input locations whose remap code is the identity (folded to 0xFFF), bits 16-17 n. All zero without the bit.
+  uint32_t vs_values[me::native::kVsConstantsMaxComponents] = {};
+  uint32_t vs_fold = 0;
 };
 static_assert(std::has_unique_object_representations_v<PipelineKey>,
               "PipelineKey cannot have implicit padding: it is hashed and compared byte by byte");
@@ -2254,6 +2599,18 @@ struct Texture {
   uint64_t sample_fingerprint = 0;
   bool valid_sample = false;
   uint8_t consecutive_samples = 0;
+  bool phase_spread = false;  // masseffect_native_texture_spread_phase: the one-time early recheck was applied
+  // masseffect_native_texture_coherency: stamp (me_texture_coherency.h) taken right before raw_fingerprint was last
+  // computed, the guest ranges it covered (base layers and mips) and the clean rechecks since the last full hash.
+  bool coherency_valid = false;
+  // confirmed: a hash once found the same bytes while the events called it clean (only those are skipped, so a
+  // texture rewritten on every frame, such as a video plane, never is). exempt: it changed once with no event; it is
+  // always hashed from then on (sticky for the life of this cache entry).
+  bool coherency_confirmed = false;
+  bool coherency_exempt = false;
+  uint8_t coherency_clean_run = 0;
+  uint32_t coherency_stamp = 0;
+  uint64_t coherency_start = 0, coherency_bytes = 0, coherency_mips = 0, coherency_mips_bytes = 0;
   bool needs_upload = false;
   std::vector<uint8_t> data;  // levels already laid out for the host: level after level and, in each, layer after layer
   uint32_t levels = 1;        // mip levels of the host image
@@ -2286,16 +2643,29 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         dfn_(deferred::Table(vulkan_device->functions())),
         device_(vulkan_device->device()),
         memory_(memory),
-        context_(context) {}
+        context_(context) {
+    // masseffect_native_query_occlusion_depth (docs/occlusion-queries.md section E): init-only, like the query mode.
+    occlusion_depth_requested_ = REXCVAR_GET(masseffect_native_query_occlusion_depth);
+    occlusion_depth_on_ = occlusion_depth_requested_ && REXCVAR_GET(masseffect_native_query_mode) >= 2 &&
+                          REXCVAR_GET(masseffect_native_skip_prepass);
+    if (occlusion_depth_requested_) {
+      REXLOG_INFO("[native] occlusion depth: {}", occlusion_depth_on_
+                      ? "on (skipped prepass draws go to a private depth twin; query boxes test against it)"
+                      : "requested but inactive (needs masseffect_native_query_mode 2 or 3 and "
+                        "masseffect_native_skip_prepass)");
+    }
+  }
 
   ~DrawsVulkanImpl() override {
     ReportPayloadAudit("shutdown");
     StopPrewarmed();  // uses the pipeline cache and the layout: first
+    StopAsyncSpecialized();  // same: its pipelines use the cache, the modules and the render passes
     StopPreloadShaders();
     StopCopies();
     StopBindings();  // in-flight vkBindImageMemory calls finish before any image is destroyed
     SaveCachePipelines();
     StopWriterCache();  // writes whatever is still pending
+    DcDestroy();  // draw cache: the persistent index arena
     for (auto& [key, par] : pipelines_) {
       dfn_.vkDestroyPipeline(device_, par.second, nullptr);
     }
@@ -2329,10 +2699,18 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       for (const auto& entry : bucket)
         if (entry.module) dfn_.vkDestroyShaderModule(device_, entry.module, nullptr);
     }
+    for (const auto& [hash, bucket] : modules_vs_constants_) {
+      for (const auto& entry : bucket)
+        if (entry.module) dfn_.vkDestroyShaderModule(device_, entry.module, nullptr);
+    }
     for (const auto& [hash, bucket] : modules_depth_quantize_) {
       for (const auto& entry : bucket)
         if (entry.module) dfn_.vkDestroyShaderModule(device_, entry.module, nullptr);
     }
+    for (const auto& [source, module] : modules_restore_7e3_)
+      if (module) dfn_.vkDestroyShaderModule(device_, module, nullptr);
+    for (const auto& [source, module] : modules_fixed16_)
+      if (module && module != source.first) dfn_.vkDestroyShaderModule(device_, module, nullptr);
     for (auto& [entry, shader_module] : modules_alpha_only_) {
       if (shader_module != VK_NULL_HANDLE) {
         dfn_.vkDestroyShaderModule(device_, shader_module, nullptr);
@@ -2360,6 +2738,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     for (ImageNative& empty : empty_) {
       DestroyImage(empty);
     }
+    DestroyOcclusionDepths();
     // The pool's slabs are released after destroying every image that lives in them. The other way round
     // would free memory that the VkImages still have bound.
     pool_textures_.Finish();
@@ -2369,6 +2748,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (pool_ != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorPool(device_, pool_, nullptr);
     if (pool_ubo_ != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorPool(device_, pool_ubo_, nullptr);
     if (layout_ubo_ != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorSetLayout(device_, layout_ubo_, nullptr);
+    DestroyCombinedHeap();
     for (VkDescriptorSetLayout layout : layouts_) {
       if (layout != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorSetLayout(device_, layout, nullptr);
     }
@@ -2535,9 +2915,24 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     static const uint32_t screen_width = uint32_t(rex::cvar::HasNonDefaultValue("video_mode_width") ?
         std::max<int32_t>(1, std::atoi(rex::cvar::GetFlagByName("video_mode_width").c_str())) : 1280);
     // (A smaller guest video mode keeps the 1280 surface pitch and narrows only the viewport.)
+    // A draw measured by a real occlusion query is not a prepass draw to drop: dropping it would turn the
+    // query into "visible" (it writes no depth: the query boxes have depth writes off).
+    // masseffect_native_query_occlusion_depth (docs/occlusion-queries.md section E): the skipped prepass draw is
+    // recorded into the occlusion depth instead, when this frame cleared that depth surface; otherwise dropped.
+    bool to_occlusion_depth = false;
     if (edram_mode == 5 && (pitch == 1280 || pitch == screen_width) && type != 8 &&
-        REXCVAR_GET(masseffect_native_skip_prepass)) {
-      return true;
+        REXCVAR_GET(masseffect_native_skip_prepass) && !p.occlusion_query) {
+      if (!occlusion_depth_on_) {
+        return true;
+      }
+      const uint32_t info_depth = r[gr::XE_GPU_REG_RB_DEPTH_INFO];
+      if (!(r[gr::XE_GPU_REG_RB_DEPTHCONTROL] & 0x4) ||  // writes no depth: nothing to keep
+          !OcclusionDepthClearedThisSwap(info_depth & 0xFFF, (info_depth >> 16) & 0x1,
+                                         SamplesPitch(pitch, r[gr::XE_GPU_REG_RB_SURFACE_INFO]))) {
+        ++occlusion_depth_counts_[kOcclusionPrepassDropped];
+        return true;
+      }
+      to_occlusion_depth = true;
     }
     const uint32_t register_mask =
         edram_mode == uint32_t(xenos::EdramMode::kColorDepth) ? r[gr::XE_GPU_REG_RB_COLOR_MASK] : 0;
@@ -2547,6 +2942,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     uint64_t keys[5] = {};
     uint32_t masks = 0;
     bool has_target = false;
+    // Restore into 7e3: the targets code already bound these slots' 7e3 image (PrepareDrawEDRAM4).
+    const uint32_t restore_7e3 = context_->RestoreInto7e3Mask();
     for (uint32_t i = 0; i < 4; ++i) {
       const uint32_t mask = (register_mask >> (i * 4)) & 0xF;
       if (!mask || !ps || !((ps->outputs >> i) & 0x1)) {
@@ -2557,10 +2954,99 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       if (HostFormatTargetColor(format) == VK_FORMAT_UNDEFINED) {  // Mass Effect: HDR targets
         return Reject(200 + format, "color target format not supported yet");
       }
-      keys[i] = (uint64_t(1) << 63) | (uint64_t(info & 0xFFF) << 24) | (uint64_t(format) << 16) |
+      const uint32_t format_key = ((restore_7e3 >> i) & 1u)
+          ? uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) : format;
+      keys[i] = (uint64_t(1) << 63) | (uint64_t(info & 0xFFF) << 24) | (uint64_t(format_key) << 16) |
                   (uint64_t((r[gr::XE_GPU_REG_RB_SURFACE_INFO] >> 16) & 3) << 40) | pitch;
       masks |= mask << (i * 4);
       has_target = true;
+    }
+    // masseffect_native_motion_blur_frame_fix: whether this draw writes the velocity buffer (a k_16_16 slot), read
+    // here because the bound plan below may clear keys[]. Only computed when the fix is on.
+    bool velocity_target_fix = false;
+    if (motion_blur_fix_ && ps) {
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (keys[i] && ((r[kInfoColor[i]] >> 16) & 0xF) == uint32_t(xenos::ColorRenderTargetFormat::k_16_16))
+          velocity_target_fix = true;
+      }
+    }
+    // masseffect_diag_velocity (docs/image-defects-feros.md). Off by default; the ring thread is the only caller,
+    // so the function-local sets need no lock.
+    if (const int32_t diag_velocity = REXCVAR_GET(masseffect_diag_velocity); diag_velocity && ps) {
+      bool velocity_target = false;
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (keys[i] && ((r[kInfoColor[i]] >> 16) & 0xF) == uint32_t(xenos::ColorRenderTargetFormat::k_16_16)) {
+          velocity_target = true;
+        }
+      }
+      const bool motion_blur = IsMotionBlurPs(*ps);
+      if (diag_velocity & 1) {
+        static std::unordered_set<uint64_t> seen;
+        // The pixel shader constants that decide what the velocity buffer means (shader-relative cN = register
+        // c(256 + N)): the motion blur reads DynamicVelocityParameters c11 (velocity = texel.xy * c11.xy + c11.zw,
+        // NOT clamped, then scaled by |v / c10.wz|^2) and StaticVelocityParameters c10; the velocity draws write
+        // clamp(0.5 + 0.5 * d / max(|d|, 1), c1.z, c1.w) with d = screen motion * IndividualVelocityScale c1.xy.
+        // c11.zw / c11.xy = -0.5 means the game expects the buffer value back as written (0.5 = no motion);
+        // about -0.0078 would mean it expects the raw fixed-point word read as UNORM. Logged on change, capped.
+        static uint32_t constants_lines = 0;
+        static uint32_t last_blur[8] = {};
+        const uint32_t* c = r + kRegConstantsPs;
+        if (motion_blur && constants_lines < 160 && std::memcmp(last_blur, c + 10 * 4, sizeof(last_blur)) != 0) {
+          std::memcpy(last_blur, c + 10 * 4, sizeof(last_blur));
+          ++constants_lines;
+          // The guest values (before masseffect_native_motion_blur_frame_fix) and the last Swap interval: c10/c11
+          // changing with the frame time would mean the game already scales its velocities by DeltaTime.
+          REXLOG_INFO("[native] velocity diag: motion blur PS n{} DynamicVelocityParameters c11 {} {} {} {} "
+                      "StaticVelocityParameters c10 {} {} {} {} (frame {:.1f} ms)", ps->number, Float(c[44]),
+                      Float(c[45]), Float(c[46]), Float(c[47]), Float(c[40]), Float(c[41]), Float(c[42]),
+                      Float(c[43]), context_->SwapIntervalMs());
+        }
+        if (velocity_target && constants_lines < 160 &&
+            seen.size() < 256 && seen.insert(XXH3_64bits(c + 4, 4 * sizeof(uint32_t)) ^ 0x5CA1Eull).second) {
+          ++constants_lines;
+          REXLOG_INFO("[native] velocity diag: velocity draw PS n{} IndividualVelocityScale c1 {} {} {} {} "
+                      "depth control {:08X}", ps->number, Float(c[4]), Float(c[5]), Float(c[6]), Float(c[7]),
+                      r[gr::XE_GPU_REG_RB_DEPTHCONTROL]);
+        }
+        if (velocity_target && seen.size() < 256 &&
+            seen.insert((uint64_t(ps->number) << 32) | r[kInfoColor[0]]).second) {
+          REXLOG_INFO("[native] velocity diag: k_16_16 target draw VS n{} PS n{} color info {:08X} {:08X} {:08X} "
+                      "{:08X} mask {:04X} blend0 {:08X} exp bias {}",
+                      p.vs->number, ps->number, r[kInfoColor[0]], r[kInfoColor[1]], r[kInfoColor[2]],
+                      r[kInfoColor[3]], register_mask, r[gr::XE_GPU_REG_RB_BLENDCONTROL0],
+                      int32_t(r[kInfoColor[0]] << 6) >> 26);
+        }
+        for (const SamplerShader& sampler : ps->samplers) {
+          if (sampler.register_value >= 16) continue;
+          const uint32_t* f = r + kRegFetch + uint32_t(sampler.register_value) * 6;
+          if (!motion_blur && (f[1] & 0x3F) != 25) continue;
+          const uint64_t key = XXH3_64bits(f, 6 * sizeof(uint32_t)) ^ (uint64_t(ps->number) << 40);
+          if (seen.size() >= 256 || !seen.insert(key).second) continue;
+          REXLOG_INFO("[native] velocity diag: PS n{} fetch {} words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}: "
+                      "format {} base {:08X} {}x{} signs x{} y{} z{} w{} exp_adjust {} num_format {} swizzle {:03X} "
+                      "filters mag {} min {}",
+                      ps->number, sampler.register_value, f[0], f[1], f[2], f[3], f[4], f[5], f[1] & 0x3F,
+                      (f[1] >> 12) << 12, (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, (f[0] >> 2) & 3,
+                      (f[0] >> 4) & 3, (f[0] >> 6) & 3, (f[0] >> 8) & 3, int32_t(f[3] << 13) >> 26, f[3] & 1,
+                      (f[3] >> 1) & 0xFFF, (f[3] >> 19) & 3, (f[3] >> 21) & 3);
+        }
+      }
+      if (((diag_velocity & 2) && velocity_target) || ((diag_velocity & 4) && motion_blur)) {
+        return true;
+      }
+      static bool velocity_no_depth_active = false;
+      if ((diag_velocity & 8) && velocity_target && !velocity_no_depth_active) {
+        // Same draw from a register copy with RB_DEPTHCONTROL z enable and z write cleared. Diagnostic only.
+        static std::vector<uint32_t> registers_copy;
+        registers_copy.assign(r, r + 0x5003);  // kRegisterCount of me_native_system.cpp
+        registers_copy[gr::XE_GPU_REG_RB_DEPTHCONTROL] &= ~uint32_t(0x6);
+        SubmissionDraw copy = p;
+        copy.registers = registers_copy.data();
+        velocity_no_depth_active = true;
+        const bool drawn = Draw(copy);
+        velocity_no_depth_active = false;
+        return drawn;
+      }
     }
     /*
      * Draws that cannot change a single pixel (masseffect_native_skip_invisibles).
@@ -2719,6 +3205,28 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (!has_target || !pitch) {
       return true;  // writes nothing visible
     }
+    // masseffect_native_query_occlusion_depth: the redirected prepass draw, and a query box (depth only) of a view
+    // whose occlusion depth was cleared this frame, bind the occlusion depth. A prepass draw that lost its depth
+    // binding (same-base plan) is dropped as before.
+    if (to_occlusion_depth) {
+      if (!keys[4] || keys[0] || keys[1] || keys[2] || keys[3]) {
+        ++occlusion_depth_counts_[kOcclusionPrepassDropped];
+        return true;
+      }
+      keys[4] |= kKeyOcclusionDepth;
+    } else if (occlusion_depth_on_ && p.occlusion_query && edram_mode == 5 && keys[4] && !keys[0] &&
+               !keys[1] && !keys[2] && !keys[3]) {
+      const uint32_t info_depth = r[gr::XE_GPU_REG_RB_DEPTH_INFO];
+      if (OcclusionDepthClearedThisSwap(info_depth & 0xFFF, (info_depth >> 16) & 0x1,
+                                        SamplesPitch(pitch, r[gr::XE_GPU_REG_RB_SURFACE_INFO]))) {
+        keys[4] |= kKeyOcclusionDepth;
+        const OcclusionDepth* twin = OcclusionDepthFind(keys[4] & ~kKeyOcclusionDepth);
+        ++occlusion_depth_counts_[twin && twin->prepass_swap == swaps_seen_ ? kOcclusionBoxes
+                                                                           : kOcclusionBoxesNoPrepass];
+      } else {
+        ++occlusion_depth_counts_[kOcclusionBoxesScene];
+      }
+    }
     CutSubstage(15, t_indices_185);  // render targets and discards
     // --- Vertex and index range --------------------------------------------
     const uint32_t displacement = r[gr::XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
@@ -2770,6 +3278,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     uint64_t indices_cache_fingerprint = 0;
     const uint8_t* indices_cache_data = nullptr;
     bool indices_cache_rotate = false;
+    DcIndexState dc_indices;  // draw cache: persistent index arena (me_draw_cache_members.inc)
+    bool dc_indices_converted = false;
     indices_.clear();
     if (src_data == uint32_t(xenos::SourceSelect::kDMA)) {
       const uint32_t size = r[gr::XE_GPU_REG_VGT_DMA_SIZE];
@@ -2808,9 +3318,14 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           indices_cache_key = (uint64_t(base & 0x1FFFFFFF) << 2) | (indices_cache_rotate ? 1u : 0u);
           const uint64_t bytes_i = uint64_t(count) * 2;
           indices_cache_fingerprint = bytes_i <= 16384 ? std::max<uint64_t>(1, RangeFingerprint(data, size_t(bytes_i))) : 0;
+          me::native::coherence::NoteContent(indices_cache_key, bytes_i, indices_cache_fingerprint, data, bytes_i, true);  // frame coherence
           IndicesEntryCache& e = indices_cache_[(indices_cache_key * 0x9E3779B97F4A7C15ull >> 40) &
                                                   (indices_cache_.size() - 1)];
-          if (e.frame == frame_ && e.generation == indices_cache_generation_ &&
+          dc_indices_converted = DcIndicesLookup(indices_cache_key, count, indices_cache_fingerprint, data,
+                                                 indices_cache_rotate, output, min, max, dc_indices);
+          if (dc_indices_converted || dc_indices.store) {
+            // The arena answered (or takes this range): the per-frame entry is neither used nor filled.
+          } else if (e.frame == frame_ && e.generation == indices_cache_generation_ &&
               e.key == indices_cache_key && e.count == count && e.fingerprint == indices_cache_fingerprint) {
             min = e.vmin;
             max = e.vmax;
@@ -2829,7 +3344,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
             indices_cache_registrar = true;
           }
         }
-        if (!indices_cache_hit) {
+        if (!indices_cache_hit && !dc_indices_converted) {
           // With hand-written NEON and its guard (IndicesFrom16, masseffect_native_indices_neon).
           IndicesFrom16(data, count, output, order == xenos::Endian::k8in16, min, max);
         }
@@ -3038,6 +3553,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     textures_to_upload_.clear();
     const auto t_samplers =
         time_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    DcTexState dc_textures;  // draw cache: texture bindings (me_draw_cache_members.inc)
+    {
+    me::native::ring_partition::Scope phase_textures(me::native::ring_partition::kTextures);
+    DcTexturesBefore(ps, r, dc_textures);
     for (const SamplerShader& sampler :
          ps ? std::span<const SamplerShader>(ps->samplers) : std::span<const SamplerShader>()) {
       if (sampler.register_value >= 16) {
@@ -3048,9 +3567,21 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       // Per-register cache: same fetch constant, same frame and no render target copies in between.
       CacheSampler& cache = cache_samplers_[sampler.register_value];
       // Valid until cache.valid_until (with the cross-frame cache disabled, only its own frame)
+      // masseffect_native_texture_copy_verify (and the inval_by_address and frames checks): a hit the old behavior
+      // would have refused is checked instead of taken (the reference values are compared after PrepareTexture).
+      CacheSampler verify_ref[2];
+      uint8_t verify_on[2] = {0, 0};
+      const auto verify_take = [&](int k, const CacheSampler& e) {
+        const uint8_t due = VerifyDue(e);
+        if (!due) return false;
+        verify_on[k] = due;
+        verify_ref[k] = e;  // a copy: the entry itself is refilled before the comparison
+        return true;
+      };
       if ((cache_between_frames_ ? frame_ <= cache.valid_until : cache.frame == frame_) &&
-          cache.generation == generation_textures_ &&
-          Equal(cache.fetch.data(), fetch, sizeof(cache.fetch))) {
+          GenerationValid(cache) &&
+          Equal(cache.fetch.data(), fetch, sizeof(cache.fetch)) &&
+          !verify_take(0, cache)) {
         shared[cache.heap * 16 + sampler.register_value] = cache.slot;
         shared[48 + sampler.register_value] = cache.sampler;
         WriteInvSize(shared, sampler.register_value, cache.width, cache.height);
@@ -3067,36 +3598,51 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       CacheSampler& per_fetch =
           cache_fetch_[XXH3_64bits(fetch, sizeof(uint32_t) * 6) & (cache_fetch_.size() - 1)];
       uint64_t valid_until = frame_;
+      // The invalidation fields the values below are known to be fresh at (copies, generations, frame).
+      CacheSampler fresh;
       if ((cache_between_frames_ ? frame_ <= per_fetch.valid_until : per_fetch.frame == frame_) &&
-          per_fetch.generation == generation_textures_ &&
-          Equal(per_fetch.fetch.data(), fetch, sizeof(per_fetch.fetch))) {
+          GenerationValid(per_fetch) &&
+          Equal(per_fetch.fetch.data(), fetch, sizeof(per_fetch.fetch)) &&
+          !verify_take(1, per_fetch)) {
         slot_texture = per_fetch.slot;
         heap = per_fetch.heap;
         slot_sampler = per_fetch.sampler;
         valid_until = per_fetch.valid_until;
         host_width = per_fetch.width;
         host_height = per_fetch.height;
+        fresh = per_fetch;
         ++samplers_cache_fetch_;
       } else {
         // Why the table misses ("C6 cache per fetch" report, every 10 s).
-        if (!Equal(per_fetch.fetch.data(), fetch, sizeof(per_fetch.fetch))) {
+        if (verify_on[1]) {
+          // checked below, not a miss of the cache
+        } else if (!Equal(per_fetch.fetch.data(), fetch, sizeof(per_fetch.fetch))) {
           ++(per_fetch.frame == UINT64_MAX ? fetch_empty_failures_ : fetch_failures_clash_);
-        } else if (per_fetch.generation != generation_textures_) {
+        } else if (!GenerationValid(per_fetch)) {
           ++fetch_failures_generation_;
         } else {
           ++fetch_expired_failures_;
         }
         bool punctual_sampling = false;
         me_resolve_fetch_sampler_ = sampler.register_value;
+        const auto before_prepare = report_tex_up_ ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
+        prepared_resolved_ = false;
+        prepare_kind_ = kPrepareOther;
         PrepareTexture(fetch, slot_texture, heap, bytes_textures, punctual_sampling, valid_until,
                         host_width, host_height);
+        if (report_tex_up_) {
+          prepare_n_[prepare_kind_] += 1;
+          prepare_ns_[prepare_kind_] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - before_prepare)
+                                                     .count());
+        }
         if (me_resolved_fetch_failed_this_draw_) {
           return false;  // No cache entry and no stale-RAM / empty-texture fallback.
         }
         slot_texture |= uint32_t(RemappedSigns(fetch)) << 24;
         slot_sampler = SlotSampler(fetch, punctual_sampling);
-        per_fetch.frame = frame_;
-        per_fetch.generation = generation_textures_;
+        FillGenerations(per_fetch, fetch);
         std::memcpy(per_fetch.fetch.data(), fetch, sizeof(per_fetch.fetch));
         per_fetch.slot = slot_texture;
         per_fetch.heap = heap;
@@ -3104,12 +3650,22 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         per_fetch.valid_until = valid_until;
         per_fetch.width = host_width;
         per_fetch.height = host_height;
+        fresh = per_fetch;
       }
+      if (verify_on[0] || verify_on[1])
+        CheckCopyVerify(verify_on, verify_ref, slot_texture, heap, slot_sampler, host_width, host_height, fetch);
       shared[heap * 16 + sampler.register_value] = slot_texture;
       shared[48 + sampler.register_value] = slot_sampler;
       WriteInvSize(shared, sampler.register_value, host_width, host_height);
-      cache.frame = frame_;
-      cache.generation = generation_textures_;
+      // The register entry inherits the freshness of where its values came from (with the old rule, a per-fetch hit
+      // is always of the current generation and frame, as before).
+      cache.copies = fresh.copies;
+      cache.frame = fresh.frame;
+      cache.generation = fresh.generation;
+      cache.generation_images = fresh.generation_images;
+      cache.generation_address = fresh.generation_address;
+      cache.bucket = fresh.bucket;
+      cache.resolved = fresh.resolved;
       std::memcpy(cache.fetch.data(), fetch, sizeof(cache.fetch));
       cache.slot = slot_texture;
       cache.heap = heap;
@@ -3118,11 +3674,18 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       cache.width = host_width;
       cache.height = host_height;
     }
+    DcTexturesAfter(dc_textures);
+    }
+    // masseffect_native_motion_blur_source_guard / masseffect_diag_blur_source (docs/image-defects-feros.md 3.8):
+    // the UE3 motion blur draw (one per frame) reports what each of its textures is bound to.
+    if (motion_blur_source_check_ && ps && IsMotionBlurPs(*ps)) CheckMotionBlurSources(*ps, r, shared, bytes_textures);
     if (time_) {  // C6 substages: the sampler loop inside the textures stage
-      sub_ns_[14] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  std::chrono::steady_clock::now() - t_samplers)
-                                  .count());
+      const uint64_t ns_samplers = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - t_samplers)
+                                                .count());
+      sub_ns_[14] += ns_samplers;
       ++sub_n_[14];
+      if (dc_textures.active) dc_tex_time_.Add(dc_textures.hit, ns_samplers);
     }
     Stage(2, mark);
     // Upload commands execute BEFORE all work commands in the submission. Updating
@@ -3221,6 +3784,13 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       }
     }
     const VkCommandBuffer cmd = pass_commands_;
+    if (keys[4] & kKeyOcclusionDepth) {
+      // The guest clear of this surface may have come while the occlusion depth pass stayed open.
+      ApplyOcclusionDepthClear(cmd);
+      if (to_occlusion_depth && pass_occlusion_depth_) {
+        pass_occlusion_depth_->prepass_swap = swaps_seen_;
+      }
+    }
     if (recording_generation_ != context_->GenerationCommands()) {
       recording_generation_ = context_->GenerationCommands();
       pipeline_bound_ = VK_NULL_HANDLE;
@@ -3234,11 +3804,13 @@ class DrawsVulkanImpl final : public DrawsVulkan {
 
     Stage(3, mark);
     // --- Uploads: textures, vertices, indices and constants ------------------------------
+    auto up_mark = mark;  // masseffect_native_report_texture_uploads: parts of this stage (timed draws)
     for (Texture* texture : textures_to_upload_) {
       if (!UploadTexture(*texture)) {
         return false;
       }
     }
+    CutUpload(0, up_mark);  // texture uploads
     std::array<VkDeviceSize, 16> offsets_vertices{};
     // If the guest has waited for the GPU since the last draw, it may legally have rewritten an already
     // referenced range: what was recorded is no longer valid.
@@ -3264,19 +3836,36 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       // Mass Effect on Switch: the full XXH3 of every range was ~18 % of the ring thread. With
       // masseffect_native_dedupe_sample the check hashes every 8th block (SampleFingerprint) instead.
       static const uint32_t max_fingerprint = uint32_t(REXCVAR_GET(masseffect_native_dedupe_max_fingerprint));
-      const uint64_t vertices_fingerprint = dedupe_active_ && type != 8 && (!max_fingerprint || source.bytes <= max_fingerprint)
-          ? std::max<uint64_t>(1, REXCVAR_GET(masseffect_native_dedupe_sample)
-                                      ? SampleFingerprint(source.data, source.bytes, source.bytes)
-                                      : XXH3_64bits(source.data, source.bytes)) : 0;
+      const bool with_fingerprint =
+          dedupe_active_ && type != 8 && (!max_fingerprint || source.bytes <= max_fingerprint);
+      const auto fingerprint_of = [&] {
+        return std::max<uint64_t>(1, REXCVAR_GET(masseffect_native_dedupe_sample)
+                                         ? SampleFingerprint(source.data, source.bytes, source.bytes)
+                                         : XXH3_64bits(source.data, source.bytes));
+      };
+      // masseffect_native_dedupe_hash_after_copy: with no live entry of this key and size, Search cannot hit and the
+      // fingerprint only goes into Note, so it is taken after the (synchronous) copy, from the same guest bytes.
+      const bool hash_after_copy = with_fingerprint && dedupe_after_copy_ && !active_copies_ &&
+                                   !dedupe_.Candidate(source.address, source.bytes, uint32_t(source.order));
+      // While its check runs, the fingerprint is also taken before the copy, as without the switch.
+      uint64_t vertices_fingerprint =
+          with_fingerprint && (!hash_after_copy || dedupe_after_verify_left_ > 0) ? fingerprint_of() : 0;
+      CutUpload(1, up_mark);  // vertex fingerprints
+      me::native::coherence::NoteContent(source.address, (uint64_t(source.bytes) << 2) | uint32_t(source.order), vertices_fingerprint, source.data, source.bytes, false);  // frame coherence
       const uint64_t discrepancies_before = dedupe_.discrepancies();
       // If this same range was already copied in this frame, its place in the upload buffer is reused and
       // nothing is copied. See masseffect_native_vertices_dedupe.h.
-      if (dedupe_active_ && type != 8 &&
-          dedupe_.Search(source.address, source.bytes, uint32_t(source.order), offset,
-                         vertices_fingerprint)) {
+      if (hash_after_copy) {
+        dedupe_.CountQuery();  // the Search that could not hit
+      } else if (dedupe_active_ && type != 8 &&
+                 dedupe_.Search(source.address, source.bytes, uint32_t(source.order), offset,
+                                vertices_fingerprint)) {
         offsets_vertices[b] = offset;
+        ++up_dedupe_hits_;
+        CutUpload(2, up_mark);  // dedupe
         continue;
       }
+      CutUpload(2, up_mark);  // dedupe
       if (dedupe_.discrepancies() != discrepancies_before && dedupe_.discrepancies() <= 8) {
         REXLOG_WARN("[native] stale vertex reuse prevented: address {:08X}, {} bytes, "
                     "frame {}, discrepancy {}", source.address, source.bytes,
@@ -3311,19 +3900,35 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                               XXH3_64bits(raw.data(), raw.size()));
       }
       bytes_vertices_ += source.bytes;
+      up_bytes_copied_ += source.bytes;
+      ++up_copies_;
       offsets_vertices[b] = offset;
+      if (hash_after_copy) {
+        vertices_fingerprint = CheckHashAfterCopy(vertices_fingerprint, fingerprint_of(), source.address,
+                                                  source.bytes);
+      }
+      CutUpload(3, up_mark);  // vertex copies (and the fingerprint taken after them)
       if (dedupe_active_ && type != 8) {
         dedupe_.Note(source.address, source.bytes, uint32_t(source.order), offset,
                        vertices_fingerprint);
       }
+      CutUpload(2, up_mark);  // dedupe
     }
+    up_bindings_ += entry->bindings.size();
     if (time_) {
       ns_vertices_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - before_vertices)
                                    .count());
     }
     VkDeviceSize offset_indices = 0;
-    if (with_indices && indices_cache_hit && indices_cache_frame_hit == frame_) {
+    bool indices_in_arena = false;  // draw cache: bound from the persistent index arena
+    if (with_indices && dc_indices.hit) {
+      offset_indices = DcIndicesHit(dc_indices);
+      indices_in_arena = true;
+    } else if (with_indices && dc_indices.store && indices_from_16 &&
+               DcIndicesStore(dc_indices, indices16_.data(), bytes_indices, vmin, vmax, offset_indices)) {
+      indices_in_arena = true;
+    } else if (with_indices && indices_cache_hit && indices_cache_frame_hit == frame_) {
       offset_indices = indices_cache_offset;  // already uploaded by an earlier draw of this upload buffer
     } else if (with_indices) {
       if (indices_cache_hit) {
@@ -3351,6 +3956,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         e.generation = indices_cache_generation_;
       }
     }
+    CutUpload(4, up_mark);  // indices
     // Only the registers each shader reads (ShaderEntry::constants_bytes). With the same generation, the
     // copy is reused if it already covers what this shader needs.
     // Start the bounded audit at the first HDR target so menu cache hits cannot
@@ -3361,7 +3967,16 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       if (format == 3 || format == 7 || format == 12) me_constant_audit_hdr_ = true;
     }
     const uint32_t bytes_vs = std::min<uint32_t>(p.vs->constants_bytes, kRegistersConstants * 4);
-    if (constants_vs_generation_ != p.generation_constants_vs ||
+    // masseffect_native_constants_same_content: a new generation whose bytes equal this buffer's last upload.
+    const bool vs_same = constants_vs_generation_ != p.generation_constants_vs &&
+                         constants_vs_epoch_ == epoch_upload_ && bytes_vs <= constants_vs_bytes_ &&
+                         ConstantsSame(true, r + kRegConstantsVs, bytes_vs, constants_vs_offset_, 0, 0.0f);
+    if (vs_same) {
+      // The upload at constants_vs_offset_ holds these bytes of the new generation, and only these: a later shader of
+      // the same generation that reads more must upload again.
+      constants_vs_generation_ = p.generation_constants_vs;
+      constants_vs_bytes_ = bytes_vs;
+    } else if (constants_vs_generation_ != p.generation_constants_vs ||
         constants_vs_epoch_ != epoch_upload_ || bytes_vs > constants_vs_bytes_) {
       // Why they are uploaded again (measurement only; each upload is another set 4 offset).
       ++reuploaded_vs_[constants_vs_generation_ != p.generation_constants_vs ? 0
@@ -3371,6 +3986,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       Reserve(use_ubo_ ? std::max<VkDeviceSize>(bytes_vs, kUboBytesVs) : bytes_vs, use_ubo_ ? alignment_ubo_ : 16,
                constants_vs_offset_);
       std::memcpy(upload_data_ + constants_vs_offset_, r + kRegConstantsVs, bytes_vs);
+      ShadowConstants(true, r + kRegConstantsVs, bytes_vs);
       constants_vs_generation_ = p.generation_constants_vs;
       constants_vs_epoch_ = epoch_upload_;
       constants_vs_bytes_ = bytes_vs;
@@ -3378,6 +3994,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       AuditCacheConstants(true, p.vs->number, p.generation_constants_vs,
                              r + kRegConstantsVs, constants_vs_offset_, bytes_vs);
     }
+    CutUpload(5, up_mark);  // VS constants
     const uint32_t bytes_ps =
         ps ? std::min<uint32_t>(ps->constants_bytes, kRegistersConstants * 4) : 0;
     uint8_t constants_mode_ps = 0;
@@ -3391,7 +4008,28 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         std::memcpy(&tonemap_scale_bits, &tonemap_scale, sizeof(tonemap_scale_bits));
       }
     }
-    if (ps && (constants_ps_generation_ != p.generation_constants_ps ||
+    // masseffect_native_motion_blur_frame_fix: the velocity draws and the motion blur PS take a patched copy of
+    // the bank. It is uploaded as if the guest had written it (content reuse compares the patched words), and mode
+    // 2 forces an upload on the switch to and from a patched draw, as the tone-map override does with mode 1.
+    const uint32_t* constants_ps_source = r + kRegConstantsPs;
+    if (motion_blur_fix_ && ps && !constants_mode_ps && bytes_ps &&
+        PatchMotionBlurConstants(*ps, velocity_target_fix, r + kRegConstantsPs, bytes_ps,
+                                 constants_ps_patched_.data())) {
+      constants_ps_source = constants_ps_patched_.data();
+      constants_mode_ps = 2;
+      // The patch key: a different patch of the same guest generation must not reuse the previous upload.
+      tonemap_scale_bits = uint32_t(XXH3_64bits(constants_ps_source, bytes_ps)) | 1u;
+    }
+    const bool ps_same = ps && constants_ps_generation_ != p.generation_constants_ps &&
+                         constants_ps_epoch_ == epoch_upload_ && bytes_ps <= constants_ps_bytes_ &&
+                         constants_mode_ps == constants_ps_mode_ &&
+                         tonemap_scale_bits == constants_ps_tonemap_scale_bits_ &&
+                         ConstantsSame(false, constants_ps_source, bytes_ps, constants_ps_offset_, constants_mode_ps,
+                                       tonemap_scale);
+    if (ps_same) {
+      constants_ps_generation_ = p.generation_constants_ps;  // as for the VS constants above
+      constants_ps_bytes_ = bytes_ps;
+    } else if (ps && (constants_ps_generation_ != p.generation_constants_ps ||
                constants_ps_epoch_ != epoch_upload_ || bytes_ps > constants_ps_bytes_ ||
                constants_mode_ps != constants_ps_mode_ ||
                tonemap_scale_bits != constants_ps_tonemap_scale_bits_)) {
@@ -3400,8 +4038,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                                                                               : 2];
       Reserve(use_ubo_ ? std::max<VkDeviceSize>(bytes_ps, kUboBytesPs) : bytes_ps, use_ubo_ ? alignment_ubo_ : 16,
                constants_ps_offset_);
-      std::memcpy(upload_data_ + constants_ps_offset_, r + kRegConstantsPs, bytes_ps);
-      if (constants_mode_ps) {
+      std::memcpy(upload_data_ + constants_ps_offset_, constants_ps_source, bytes_ps);
+      ShadowConstants(false, constants_ps_source, bytes_ps);
+      if (constants_mode_ps == 1) {
         // UE3 writes this composition with SCENE_COLOR_BIAS_FACTOR=8 for Xenos' packed 7e3
         // output path. In the native renderer the EDRAM view is canonical FP16, so carrying that
         // packed-domain scale to the host attachment saturates the later UNORM presentation. The
@@ -3418,6 +4057,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       AuditCacheConstants(false, ps->number, p.generation_constants_ps,
                              r + kRegConstantsPs, constants_ps_offset_, bytes_ps);
     }
+    CutUpload(6, up_mark);  // PS constants
+    up_timed_ += time_ ? 1 : 0;
 
     Stage(4, mark);
     // --- Viewport, scissor and shared constants ---------------------------------------
@@ -3523,6 +4164,33 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     shared[69] = function_alpha;  // g_AlphaFunction
     std::memcpy(&shared[70], ndc, sizeof(ndc));
     std::copy(entry->remaps.begin(), entry->remaps.end(), shared + 74);
+    shared[me::native::kSharedWordFltMin] = me::native::kFltMinBits;  // masseffect_native_ps_flt_bounds_ubo
+    shared[me::native::kSharedWordFltMax] = me::native::kFltMaxBits;
+    // The texture signs of the key, taken before PlanPsDescriptors changes descriptor words, and the pixel shader
+    // descriptor/clamp rewrites (masseffect_ps_descriptors_members.inc), before the block is uploaded.
+    uint32_t signs_registers[8];
+    uint32_t signs_folded = 0, signs_heaps = 0;
+    uint64_t signs = 0;
+    if (fold_signs_ && ps && ps->shader && use_ubo_) {
+      // Only with the UBO: me_texture_signs_spirv.h relies on the 64-bit pointer path being dead.
+      const uint32_t n = SignedRegistersPS(*ps, signs_registers);
+      for (; signs_folded < n; ++signs_folded) {
+        const uint32_t reg = signs_registers[signs_folded];
+        uint32_t heap = 3, value = 0;
+        bool single = true;
+        for (uint32_t h = 0; h < 3; ++h) {
+          if (const uint32_t v = shared[h * 16 + reg] >> 24) {
+            single &= heap == 3;
+            heap = h;
+            value = v;
+          }
+        }
+        if (!single) break;  // never expected: one heap per register; fold the registers before it only
+        signs |= uint64_t(value) << (8 * signs_folded);
+        signs_heaps |= heap << (2 * signs_folded);
+      }
+    }
+    const uint32_t ps_rewrites = ps ? PlanPsDescriptors(*ps, *p.vs, signs_folded, shared) : 0;
     VkDeviceSize offset_shared;
     /*
      * How many draws really change the shared constants.
@@ -3638,34 +4306,46 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       specialization |= kSpecTarget7e3 |
                           (outputs_mask_7e3 << kSpecMask7e3Displacement);
     }
-    // The texture signs of this draw, for the pixel shader module (masseffect_native_fold_texture_signs).
-    // Only with the UBO: me_texture_signs_spirv.h relies on the 64-bit pointer path being dead.
-    if (fold_signs_ && ps && ps->shader && (specialization & kSpecConstantsUbo)) {
-      uint32_t registers[8];
-      const uint32_t n = SignedRegistersPS(*ps, registers);
-      uint64_t signs = 0;
-      uint32_t heaps = 0, folded = 0;
-      for (; folded < n; ++folded) {
-        const uint32_t reg = registers[folded];
-        uint32_t heap = 3, value = 0;
-        bool single = true;
-        for (uint32_t h = 0; h < 3; ++h) {
-          if (const uint32_t v = shared[h * 16 + reg] >> 24) {
-            single &= heap == 3;
-            heap = h;
-            value = v;
-          }
-        }
-        if (!single) break;  // never expected: one heap per register; fold the registers before it only
-        signs |= uint64_t(value) << (8 * folded);
-        heaps |= heap << (2 * folded);
+    {
+      uint32_t restore_slots = 0;
+      for (uint32_t i = 0; i < 4; ++i)
+        if (keys[i] && ((restore_7e3 >> i) & 1u)) restore_slots |= 1u << i;
+      if (restore_slots) specialization |= restore_slots << kSpecRestore7e3Displacement;
+    }
+    // masseffect_native_velocity_16_16: every draw into a k_16_16 slot stores the Xenos EDRAM word. The encode is
+    // exact for blending ONE/ZERO (RB_BLENDCONTROL 0x00010001, all the velocity draws); another blend would blend
+    // encoded words, so it is logged.
+    if (velocity_16_16_ && ps) {
+      static constexpr uint32_t kBlendSlot[4] = {
+          gr::XE_GPU_REG_RB_BLENDCONTROL0, gr::XE_GPU_REG_RB_BLENDCONTROL1,
+          gr::XE_GPU_REG_RB_BLENDCONTROL2, gr::XE_GPU_REG_RB_BLENDCONTROL3};
+      uint32_t fixed16_slots = 0;
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (!keys[i] || ((r[kInfoColor[i]] >> 16) & 0xF) != uint32_t(xenos::ColorRenderTargetFormat::k_16_16))
+          continue;
+        fixed16_slots |= 1u << i;
+        const uint32_t blend = r[kBlendSlot[i]] & 0x1FFF1FFF;
+        if (blend != 0x00010001u && fixed16_blend_logged_.size() < 32 &&
+            fixed16_blend_logged_.insert((uint64_t(ps->number) << 32) | blend).second)
+          REXLOG_WARN("[native] k_16_16 encode: PS n{} RT{} blends with {:08X} (not ONE/ZERO): encoded words are "
+                      "blended, not fixed-point values", ps->number, i, blend);
       }
-      if (folded) {
-        key.signs_low = uint32_t(signs);
-        key.signs_high = uint32_t(signs >> 32);
-        key.signs_heaps = heaps | (folded << 16);
-        specialization |= kSpecSignsFolded;
-      }
+      if (fixed16_slots) specialization |= fixed16_slots << kSpecFixed16Displacement;
+    }
+    // The texture signs of this draw, for the pixel shader module (masseffect_native_fold_texture_signs), taken
+    // from the shared block before it was uploaded (above), and the pixel shader rewrites (kKeyPs* bits).
+    if (signs_folded) {
+      key.signs_low = uint32_t(signs);
+      key.signs_high = uint32_t(signs >> 32);
+      key.signs_heaps = signs_heaps | (signs_folded << 16);
+      specialization |= kSpecSignsFolded;
+    }
+    key.signs_heaps |= ps_rewrites;
+    // The compared vertex constants and identity input remaps of this draw, for the vertex shader module
+    // (masseffect_native_fold_vs_constants). Only with the UBO (me_vs_constants_spirv.h relies on the 64-bit
+    // pointer path being dead) and not for rectangles (their vertex module is another transform).
+    if (fold_vs_ && p.vs->shader && (specialization & kSpecConstantsUbo) && !(specialization & kSpecRectangle)) {
+      if (FoldVsConstantsInKey(*p.vs, bytes_vs, r, *entry, key)) specialization |= kSpecVsFolded;
     }
     key.specialization = specialization;
     std::copy(std::begin(pass_formats_), std::end(pass_formats_), std::begin(key.formats));
@@ -3696,7 +4376,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     // Looked up with SearchKey (phase 0a: canonical form; phases 1 and 2: without the state set through
     // vkCmdSet*). the key stays raw: the deferred sky (opaque_in_all), the counter and the dynamic state read
     // it.
-    MASSEFFECT_SUB(11, pipeline = PipelineFor(SearchKey(key), *entry, p));
+    MASSEFFECT_SUB(11, pipeline = DcPipelineFor(key, *entry, p));  // = PipelineFor(SearchKey(key), ...) (draw cache)
     if (pipeline == VK_NULL_HANDLE) {
       return false;
     }
@@ -3927,6 +4607,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (!sets_bound_) {
       MASSEFFECT_SUB(1, dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, 4,
                                                 sets_.data(), 0, nullptr));
+      BindCombinedSet(cmd);  // set 5, masseffect_native_ps_combined_heap
       sets_bound_ = true;
     }
     // Dynamic state and push constants repeat a lot between consecutive draws: they are only recorded if
@@ -4091,12 +4772,23 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       label.pLabelName = name.c_str();
       label_gpu_(cmd, &label);
     }
+    // Real occlusion query (masseffect_native_query_mode 2 and 3): this draw alone, inside its pass. Host samples
+    // become guest samples: (guest MSAA samples per pixel) / (host pixels per guest pixel: the X raster grid
+    // and the scaled shadow map's scale in both axes).
+    const uint32_t occlusion =
+        !p.occlusion_query
+            ? UINT32_MAX
+            : context_->BeginOcclusionDraw(
+                  float(1u << ((r[gr::XE_GPU_REG_RB_SURFACE_INFO] >> 16) & 3)) /
+                  std::max(1e-3f, pass_raster_scale_x_ * pass_scale_ * pass_scale_));
     if (with_indices) {
       // The upload buffer is bound once per index type and each draw uses firstIndex.
       const VkIndexType indices_type = indices_from_16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
-      if (indices_type != indices_type_recorded_) {
-        MASSEFFECT_SUB(9, dfn_.vkCmdBindIndexBuffer(cmd, upload_, 0, indices_type));
+      const VkBuffer buffer_indices = indices_in_arena ? dc_idx_buffer_ : upload_;  // draw cache: index arena
+      if (indices_type != indices_type_recorded_ || buffer_indices != indices_buffer_recorded_) {
+        MASSEFFECT_SUB(9, dfn_.vkCmdBindIndexBuffer(cmd, buffer_indices, 0, indices_type));
         indices_type_recorded_ = indices_type;
+        indices_buffer_recorded_ = buffer_indices;
       }
       // On the base-zero path, vertexOffset also carries where the copy starts (in vertices).
       const int32_t vertices_displacement =
@@ -4109,6 +4801,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       MASSEFFECT_SUB(10, dfn_.vkCmdDraw(cmd, count, 1,
                                    base_zero ? first_vertex : 0, 0));  // firstVertex
     }
+    if (occlusion != UINT32_MAX) {
+      context_->FinishOcclusionDraw(occlusion);
+    }
     if (query_draw != UINT32_MAX) {
       context_->FinishStatsDraw(query_draw);
     }
@@ -4117,7 +4812,13 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       ++sub_samples_;
       ReportSubstages();
     }
-    ++drawn_;
+    // A prepass draw recorded into the occlusion depth is not counted as drawn: the render target code would
+    // otherwise publish the scene depth tiles as written by it (EDRAM mode 4), and nothing wrote them.
+    if (to_occlusion_depth) {
+      ++occlusion_depth_counts_[kOcclusionPrepass];
+    } else {
+      ++drawn_;
+    }
     ++draws_in_pass_;  // to know at which position of the pass the sky ends up emitted
     drawn_timed_ += time_ ? 1 : 0;
     return true;
@@ -4154,6 +4855,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (!sets_bound_) {
       dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, 4,
                                    sets_.data(), 0, nullptr);
+      BindCombinedSet(cmd);  // set 5, masseffect_native_ps_combined_heap
       sets_bound_ = true;
     }
     {
@@ -4221,6 +4923,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       sub_ns_.fill(0);
       sub_n_.fill(0);
       sub_samples_ = 0;
+      stages_reported_ = stages_ns_;  // masseffect_native_report_stages: the window starts here
+      stages_calls_reported_ = stopwatch_counter_;
+      stages_drawn_reported_ = drawn_;
       return;
     }
     static constexpr const char* kNames[19] = {
@@ -4244,9 +4949,44 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
     MASSEFFECT_REPORT_RING("[native] C6 substages ({} timed draws; sum {:.2f} us per draw){}", sub_samples_,
                 total, line);
+    if (REXCVAR_GET(masseffect_native_report_stages)) {
+      ReportStages();
+    }
     sub_ns_.fill(0);
     sub_n_.fill(0);
     sub_samples_ = 0;
+  }
+
+  /*
+   * masseffect_native_report_stages: stages_ns_ since the previous line, per timed recorded draw (the divisor of
+   * "C6 substages"). Stages 0-6 partition a recorded draw from its entry to its end; 7 is the pass change inside
+   * stage 3, and 8-11 split it (FinishPass, targets, render pass and framebuffer, vkCmdBeginRenderPass). The
+   * timed draws that are rejected after some stages add their time but not to the divisor, as before. Draw calls
+   * and recorded draws of the window tell how much of the ring's "Vulkan draw" phase falls on draws that never
+   * reach Vulkan.
+   */
+  void ReportStages() {
+    static constexpr const char* kStageNames[kStagesDraw] = {
+        "state (entry, EntryFor)", "indices", "textures", "upload space and pass", "uploads",
+        "pipeline and constants", "recording", "[in 3] pass change", "[in 7] FinishPass", "[in 7] targets",
+        "[in 7] render pass and framebuffer", "[in 7] BeginRenderPass"};
+    std::string line;
+    double sum = 0.0;
+    for (size_t k = 0; k < kStagesDraw; ++k) {
+      const double per_draw = double(stages_ns_[k] - stages_reported_[k]) / 1e3 / double(sub_samples_);
+      if (k < 7) {
+        sum += per_draw;
+      }
+      line += fmt::format(" | {} {:.2f}", kStageNames[k], per_draw);
+    }
+    const uint32_t calls = stopwatch_counter_ - stages_calls_reported_;
+    const uint64_t recorded = drawn_ - stages_drawn_reported_;
+    MASSEFFECT_REPORT_RING("[native] C6 stages (us per timed recorded draw; {} timed; stages 0-6 sum {:.2f} us; "
+                           "{} Draw calls, {} recorded){}",
+                           sub_samples_, sum, calls, recorded, line);
+    stages_reported_ = stages_ns_;
+    stages_calls_reported_ = stopwatch_counter_;
+    stages_drawn_reported_ = drawn_;
   }
 
   /*
@@ -4954,6 +5694,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     ReportChangesPipeline(now);  // reads its cvar every frame and writes every 20 s
     TryPrewarm();       // starts the thread as soon as the library is loaded
     PrewarmedReport(now);  // every 10 s, if there is anything new, and its guard
+    AsyncSpecializedPerFrame(now);  // background specialized pipelines: install the finished ones, report
     if (now - pipelines_direct_report_ < std::chrono::seconds(10)) {
       return;
     }
@@ -4989,6 +5730,83 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     t = now;
   }
 
+  // masseffect_native_report_texture_uploads: one part of the uploads stage, on the timed draws.
+  void CutUpload(size_t k, std::chrono::steady_clock::time_point& t) {
+    if (!time_ || !report_tex_up_) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    up_ns_[k] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count());
+    t = now;
+  }
+
+  /*
+   * masseffect_native_constants_same_content. The VS (vs = true) or PS constants changed generation (a register of
+   * the bank was written) but the epoch and the size allow the reuse of this upload buffer's last upload. True if the
+   * bytes the shader reads equal that upload's, so it can be reused: the CPU-cached shadow holds exactly what was
+   * copied to `offset` (ShadowConstants, at the same time as the copy), and nothing writes there afterwards; for the PS
+   * the tonemap override (mode, scale) is part of the caller's condition. Measures the same comparison with the
+   * switch off (report only). The first constants_same_verify_left_ reuses read the upload buffer back and compare it
+   * with the registers (with the override applied); a difference turns the switch off.
+   */
+  bool ConstantsSame(bool vs, const uint32_t* current, uint32_t bytes, VkDeviceSize offset, uint8_t mode_ps,
+                     float tonemap_scale) {
+    if (!constants_same_ && !report_tex_up_) return false;
+    if (!bytes || !shadow_valid_[vs ? 0 : 1]) return false;
+    if (!EqualInLine((vs ? shadow_vs_ : shadow_ps_).data(), current, bytes)) return false;
+    if (report_tex_up_) ++up_constants_same_[vs ? 0 : 1];
+    if (!constants_same_) return false;
+    if (constants_same_verify_left_ > 0) {
+      --constants_same_verify_left_;
+      ++constants_same_verified_;
+      std::array<uint32_t, kRegistersConstants> expected;
+      std::memcpy(expected.data(), current, bytes);
+      if (!vs && mode_ps == 1) std::memcpy(expected.data(), &tonemap_scale, sizeof(tonemap_scale));
+      if (offset > used_upload_ || bytes > used_upload_ - offset ||
+          std::memcmp(upload_data_ + offset, expected.data(), bytes) != 0) {
+        REXLOG_ERROR("[native] DIFFERENCE: {} constants reused by content ({} bytes at offset {}) differ from the "
+                     "upload buffer; masseffect_native_constants_same_content is off from now on",
+                     vs ? "VS" : "PS", bytes, offset);
+        constants_same_ = false;
+        constants_same_verify_left_ = 0;
+        return false;
+      }
+      if (constants_same_verify_left_ == 0)
+        REXLOG_INFO("[native] C6: constants reused by content: {} reuses checked against the upload buffer, all "
+                    "equal (check finished)", constants_same_verified_);
+    }
+    ++constants_same_hits_[vs ? 0 : 1];
+    return true;
+  }
+  // The bytes just copied to the bank's upload offset, in CPU-cached memory (masseffect_native_constants_same_content).
+  void ShadowConstants(bool vs, const uint32_t* current, uint32_t bytes) {
+    if (!constants_same_ && !report_tex_up_) return;
+    std::memcpy((vs ? shadow_vs_ : shadow_ps_).data(), current, bytes);
+    shadow_valid_[vs ? 0 : 1] = true;
+    up_constants_uploads_[vs ? 0 : 1] += 1;
+    up_constants_bytes_[vs ? 0 : 1] += bytes;
+  }
+  // masseffect_native_dedupe_hash_after_copy: the fingerprint taken after the copy. While the check runs, `before` is
+  // the one taken before the copy (the old path) and the two are compared; a difference (the guest rewrote the range
+  // between the two reads) turns the switch off and keeps `before`, as without the switch.
+  uint64_t CheckHashAfterCopy(uint64_t before, uint64_t after, uint64_t address, uint32_t bytes) {
+    ++dedupe_after_uses_;
+    if (dedupe_after_verify_left_ <= 0) return after;
+    --dedupe_after_verify_left_;
+    if (before != after) {
+      REXLOG_ERROR("[native] DIFFERENCE: vertex fingerprint after the copy differs from the one before ({:08X}, {} "
+                   "bytes); masseffect_native_dedupe_hash_after_copy is off from now on",
+                   address, bytes);
+      dedupe_after_copy_ = false;
+      dedupe_after_verify_left_ = 0;
+      return before;
+    }
+    if (dedupe_after_verify_left_ == 0)
+      REXLOG_INFO("[native] C6: vertex fingerprints after the copy: {} checked against the one before, all equal "
+                  "(check finished)", dedupe_after_uses_);
+    return after;
+  }
+
   void Stage(size_t stage, std::chrono::steady_clock::time_point& mark) {
     if (!time_) {
       return;
@@ -4996,6 +5814,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     const auto now = std::chrono::steady_clock::now();
     stages_ns_[stage] += uint64_t(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+    me::native::coherence::NoteStage(stage, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count()));  // frame coherence
     mark = now;
   }
 
@@ -5096,6 +5915,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     // recorded: after the pass closes (which may emit the deferred sky), and meanwhile the thread has kept
     // binding.
     CollectBindings(true);
+    DcFlush();  // draw cache: the index arena bytes written for this submission
     if (used_upload_ && !coherent_upload_) {
       rex::ui::vulkan::util::FlushMappedMemoryRange(vulkan_device_, upload_memory_, upload_type_, 0,
                                                     upload_real_size_, used_upload_);
@@ -5110,6 +5930,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     WaitUploads();  // already empty after BeforeSend; just in case, before switching buffers
     ReportCopies();  // every 10 s, who made the vertex copies and how long the ring waited
     ReportCacheFetch();  // every 10 s, the per-fetch sampler table
+    ReportCoherency();  // masseffect_native_texture_coherency, every 10 s
+    ReportTexturesUploads();  // masseffect_native_report_texture_uploads, every 10 s
+    DcReport();  // draw cache, every 10 s
     // A texture may arrive here with its bind in flight (it was prepared before this submission's first
     // Record) and that is normal; what it cannot have is its data already in the upload buffer just
     // submitted.
@@ -5135,6 +5958,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     // The upload buffer is reset here, so the recorded offsets are no longer valid. This also covers
     // SendAndWait, which goes through here.
     dedupe_.NewFrame(frame_);
+    DcSlotStarted(slot);  // draw cache: this slot's previous frame is complete on the GPU
     sent_after_shadows_ = false;  // the post-shadow submission is once per frame
     /*
      * Diagnostic cvars are read once per frame, not per draw.
@@ -5157,6 +5981,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     ps_alpha_only_frame_ = PsAlphaOnly();
     no_ps_no_color_frame_ = NoPsNoColor();
     no_vegetation_ = REXCVAR_GET(masseffect_shadows_no_vegetation);
+    motion_blur_fix_ = REXCVAR_GET(masseffect_native_motion_blur_frame_fix);
+    motion_blur_source_check_ = REXCVAR_GET(masseffect_native_motion_blur_source_guard) ||
+                                (context_ && context_->BlurSourceJournal());
     pipelines_direct_ = REXCVAR_GET(masseffect_native_pipelines_direct) && !pipelines_direct_off_;
     canonical_key_ = REXCVAR_GET(masseffect_native_canonical_key) && !canonical_off_key_;  // phase 0a
     {
@@ -5213,6 +6040,20 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                     new_value ? "by constant" : "asked from the texture");
       }
     }
+    // The folded vertex shader constants change the pipelines too: once per frame.
+    {
+      const bool new_value = REXCVAR_GET(masseffect_native_fold_vs_constants);
+      if (new_value != fold_vs_) {
+        fold_vs_ = new_value;
+        REXLOG_INFO("[native] VS constants: {}", new_value
+                        ? "compared float constants and identity input remaps folded into the vertex shader "
+                          "(in the pipeline key)"
+                        : "read by the vertex shader at run time, as before");
+      }
+      vs_constants_max_values_ = uint32_t(std::max(1, REXCVAR_GET(masseffect_native_fold_vs_constants_max_values)));
+    }
+    // The pixel shader descriptor/clamp rewrites change the pipelines too: once per frame.
+    PsDescriptorsPerFrame();
     // The texture signs in the key change the pipelines too: once per frame.
     {
       const bool new_value = REXCVAR_GET(masseffect_native_fold_texture_signs);
@@ -5254,6 +6095,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       }
     }
     ReportZEarly();
+    ReportOcclusionDepth();
     ReportPipelinesDirect();
     ReportMinutiae();
     ReportBaseZero();
@@ -5287,7 +6129,26 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
   }
 
-  void InvalidateTextures() override { ++generation_textures_; }
+  void InvalidateTextures() override {
+    BumpTexturesAll();
+    ++invalidations_[DrawsVulkan::kInvalidationKinds];  // untargeted (report)
+  }
+  // masseffect_native_texture_inval_by_address: the old rule sees the global generation, the new one the bucket.
+  void InvalidateTexturesAt(uint32_t address, uint32_t reason) override {
+    ++generation_textures_;
+    if (address == UINT32_MAX) {
+      // Each copy: every entry (as before). Prepare of an image no resolved texture holds: nothing a fetch can see.
+      if (reason == DrawsVulkan::kInvalidationEachCopy) ++generation_images_;
+    } else {
+      ++generation_address_[BucketAddress(address)];
+    }
+    ++invalidations_[std::min<uint32_t>(reason, DrawsVulkan::kInvalidationKinds)];
+  }
+  void NoteResolvedAt(uint32_t address) override { ++generation_address_[BucketAddress(address)]; }
+  void NoteCopyTextures() override {
+    ++generation_copies_;
+    if (copy_invalidation_forced_) BumpTexturesAll();  // a check failed: the old per-copy invalidation
+  }
 
   // Only the cache entries that use a view of those images. The views stay valid (they go with their
   // image); what has to be redone is which slot each fetch constant gets.
@@ -5503,7 +6364,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   // Actually retires a group of images. First the views and their slots (pointed at the empty texture),
   // then the images. Used by both the gradual and the batch eviction.
   void DropImages(const std::unordered_set<VkImage>& images) {
-    ++generation_textures_;
+    BumpTexturesAll();
     for (auto it = views_.begin(); it != views_.end();) {
       if (!images.count(it->second.image)) {
         ++it;
@@ -5795,7 +6656,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   }
 
   void ForgetImage(VkImage image) override {
-    ++generation_textures_;  // the sampler cache could point to a retired view
+    BumpTexturesAll();  // the sampler cache could point to a retired view
     const auto index = views_per_image_.find(image);  // without walking views_
     if (index == views_per_image_.end()) {
       return;
@@ -6870,6 +7731,97 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         100.0 * double(failures) / double(std::max<uint64_t>(d[0] + failures, 1)), d[1], d[2], d[3], d[4]);
   }
 
+  /*
+   * masseffect_native_report_texture_uploads, every 10 s. Line 1: where the textures stage goes. Sampler preparations
+   * by how they were answered (register entry, per-fetch entry, PrepareTexture), PrepareTexture calls and their time
+   * by outcome (all calls, not a sample), the invalidations by reason and what the round-3 switches did. Line 2: the
+   * uploads stage split into parts, us per timed draw that reached its end (the same 1 in 64 draws as "C6 stages"),
+   * plus counts over all draws.
+   */
+  void ReportTexturesUploads() {
+    if (!report_tex_up_) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (tex_up_report_ == std::chrono::steady_clock::time_point{}) {
+      tex_up_report_ = now;
+      return;
+    }
+    if (now - tex_up_report_ < std::chrono::seconds(10)) return;
+    const double seconds = std::chrono::duration<double>(now - tex_up_report_).count();
+    tex_up_report_ = now;
+    TexUpReported c;
+    c.prepare_n = prepare_n_;
+    c.prepare_ns = prepare_ns_;
+    c.up_ns = up_ns_;
+    c.up_timed = up_timed_;
+    c.up_bindings = up_bindings_;
+    c.up_dedupe_hits = up_dedupe_hits_;
+    c.up_copies = up_copies_;
+    c.up_bytes_copied = up_bytes_copied_;
+    c.uploads = up_constants_uploads_;
+    c.bytes = up_constants_bytes_;
+    c.same = up_constants_same_;
+    c.same_hits = constants_same_hits_;
+    c.invalidations = invalidations_;
+    c.samplers_cache = samplers_cache_;
+    c.samplers_fetch = samplers_cache_fetch_;
+    c.failures_generation = fetch_failures_generation_;
+    c.failures_expired = fetch_expired_failures_;
+    c.failures_other = fetch_failures_clash_ + fetch_empty_failures_;
+    c.dedupe_after = dedupe_after_uses_;
+    const TexUpReported& o = tex_up_reported_;
+    static constexpr const char* kKinds[kPrepareKinds] = {
+        "other", "resolved", "checked this frame", "not due", "postponed", "same sample", "same fingerprint",
+        "same data", "changed", "created"};
+    std::string kinds;
+    uint64_t calls = 0, ns = 0;
+    for (size_t k = 0; k < kPrepareKinds; ++k) {
+      const uint64_t n = c.prepare_n[k] - o.prepare_n[k];
+      const uint64_t t = c.prepare_ns[k] - o.prepare_ns[k];
+      calls += n;
+      ns += t;
+      if (n) kinds += fmt::format(" | {} {} ({:.1f} ms, {:.1f} us each)", kKinds[k], n, double(t) / 1e6,
+                                  double(t) / 1e3 / double(n));
+    }
+    static constexpr const char* kReasons[DrawsVulkan::kInvalidationKinds + 1] = {
+        "format", "created", "crop", "prepared", "prepared (not resolved)", "each copy", "untargeted"};
+    std::string reasons;
+    for (size_t k = 0; k < c.invalidations.size(); ++k) {
+      const uint64_t n = c.invalidations[k] - o.invalidations[k];
+      if (n) reasons += fmt::format("{}{} {}", reasons.empty() ? "" : ", ", kReasons[k], n);
+    }
+    MASSEFFECT_REPORT_RING(
+        "[native] C6 textures (last {:.1f} s): samplers {} register hits, {} per-fetch hits, {} PrepareTexture "
+        "({} by generation, {} expired, {} slot); PrepareTexture {:.1f} ms in {} calls{} | invalidations: {} | "
+        "by address {} (checked {}), cross-frame {} (checked {})",
+        seconds, c.samplers_cache - o.samplers_cache, c.samplers_fetch - o.samplers_fetch, calls,
+        c.failures_generation - o.failures_generation, c.failures_expired - o.failures_expired,
+        c.failures_other - o.failures_other, double(ns) / 1e6, calls, kinds, reasons.empty() ? "none" : reasons,
+        inval_by_address_ ? "on" : "off", address_verified_, cache_between_frames_ ? "on" : "off", frames_verified_);
+    static constexpr const char* kParts[7] = {"texture uploads", "vertex fingerprints", "dedupe", "vertex copies",
+                                              "indices", "VS constants", "PS constants"};
+    const uint64_t timed = c.up_timed - o.up_timed;
+    std::string parts;
+    double sum = 0.0;
+    for (size_t k = 0; k < 7; ++k) {
+      const double us = timed ? double(c.up_ns[k] - o.up_ns[k]) / 1e3 / double(timed) : 0.0;
+      sum += us;
+      parts += fmt::format(" | {} {:.2f}", kParts[k], us);
+    }
+    const uint64_t bindings = c.up_bindings - o.up_bindings;
+    const uint64_t copies = c.up_copies - o.up_copies;
+    MASSEFFECT_REPORT_RING(
+        "[native] C6 uploads (us per timed draw; {} timed; sum {:.2f}){} || vertex bindings {}: {} dedupe hits, {} "
+        "copied ({:.1f} MB, {:.0f} B each; {} fingerprinted after the copy) | VS constants {} uploads ({:.1f} MB), {} "
+        "with the same bytes as the last upload ({} reused) | PS constants {} uploads ({:.1f} MB), {} same ({} reused)",
+        timed, sum, parts, bindings, c.up_dedupe_hits - o.up_dedupe_hits, copies,
+        double(c.up_bytes_copied - o.up_bytes_copied) / 1048576.0,
+        copies ? double(c.up_bytes_copied - o.up_bytes_copied) / double(copies) : 0.0, c.dedupe_after - o.dedupe_after,
+        c.uploads[0] - o.uploads[0], double(c.bytes[0] - o.bytes[0]) / 1048576.0, c.same[0] - o.same[0],
+        c.same_hits[0] - o.same_hits[0], c.uploads[1] - o.uploads[1], double(c.bytes[1] - o.bytes[1]) / 1048576.0,
+        c.same[1] - o.same[1], c.same_hits[1] - o.same_hits[1]);
+    tex_up_reported_ = c;
+  }
+
   void StopCopies() {
     if (!copies_thread_.joinable()) {
       return;
@@ -7191,6 +8143,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       pipelines_no_save_ = 1;
       list_no_save_ = 1;
     }
+    serialize_off_ring_ = REXCVAR_GET(masseffect_native_pipelines_save_serialize_off_ring);
     LoadPipelinesList();  // the prewarm list
   }
 
@@ -7204,8 +8157,13 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       list = SerializePipelinesList();
     }
     std::vector<uint8_t> data;
-    if (pipelines_no_save_) {
+    bool cache_wanted = false;  // masseffect_native_pipelines_save_serialize_off_ring: the writer serializes it
+    if (pipelines_no_save_ && serialize_off_ring_) {
       pipelines_no_save_ = 0;
+      cache_wanted = cache_pipelines_ != VK_NULL_HANDLE;
+    } else if (pipelines_no_save_) {
+      pipelines_no_save_ = 0;
+      const auto serialize_start = std::chrono::steady_clock::now();
       size_t bytes = 0;
       // without new entries it is not rewritten (the SD card is slow on the Switch)
       if (cache_pipelines_ != VK_NULL_HANDLE &&
@@ -7220,8 +8178,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           bytes_cache_saved_ = bytes;
         }
       }
+      ns_ring_serialize_ = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - serialize_start).count());
     }
-    if (data.empty() && list.empty()) {
+    if (data.empty() && list.empty() && !cache_wanted) {
       return;
     }
     // The file is written on its own thread: on the Switch, writing about 2 MB to the SD card from the ring
@@ -7239,6 +8199,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (!list.empty()) {
       writer_list_ = std::move(list);
     }
+    writer_cache_wanted_ |= cache_wanted;
     pending_writer_ = true;
     writer_warning_.notify_one();
   }
@@ -7247,6 +8208,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   void WriterCacheMain() {
     std::vector<uint8_t> data;
     std::vector<uint8_t> list;  // the prewarm one
+    bool cache_wanted = false;
     for (;;) {
       {
         std::unique_lock<std::mutex> latch(writer_mutex_);
@@ -7258,7 +8220,15 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         writer_data_ = {};
         list = std::move(writer_list_);
         writer_list_ = {};
+        cache_wanted = writer_cache_wanted_;
+        writer_cache_wanted_ = false;
         pending_writer_ = false;
+      }
+      // masseffect_native_pipelines_save_serialize_off_ring: vkGetPipelineCacheData here, not on the ring.
+      writer_ns_serialize_ = 0;
+      if (cache_wanted) data = SerializeCacheOnWriter(writer_ns_serialize_);
+      if (data.empty() && list.empty()) {
+        continue;  // the cache did not change size and the list did not change: nothing to write
       }
       // A single file with both parts. Only one may arrive (the cache did not grow, or the list did not
       // change): the other is the last one written.
@@ -7276,6 +8246,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   // renamed. Writer thread only. The first time it is written, the two older files are deleted if present.
   void WriteFilePipelines() {
     const auto before = std::chrono::steady_clock::now();
+    uint32_t pieces = 0;  // WriteChunked (masseffect_native_pipelines_save_chunk_kb)
     const std::filesystem::path path = PathFilePipelines();
     std::error_code error;
     std::filesystem::create_directories(path.parent_path(), error);
@@ -7291,8 +8262,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           !file.write(reinterpret_cast<const char*>(&version), 4) ||
           !file.write(reinterpret_cast<const char*>(&bytes_list), 8) ||
           !file.write(reinterpret_cast<const char*>(&bytes_cache), 8) ||
-          !file.write(reinterpret_cast<const char*>(written_list_.data()), std::streamsize(bytes_list)) ||
-          !file.write(reinterpret_cast<const char*>(written_cache_.data()), std::streamsize(bytes_cache))) {
+          !WriteChunked(file, written_list_.data(), size_t(bytes_list), pieces) ||
+          !WriteChunked(file, written_cache_.data(), size_t(bytes_cache), pieces)) {
         return;
       }
     }
@@ -7311,14 +8282,16 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
     if (saved_cache_++ < 8) {
       REXLOG_INFO("[native] C6: pipelines saved ({} KB of cache and {} in the prewarm list, in {} ms, from "
-                  "its thread{})",
+                  "its thread{}; {} pieces; cache serialized {} in {:.1f} ms)",
                   written_cache_.size() >> 10,
                   written_list_.size() >= kHeaderList
                       ? (written_list_.size() - kHeaderList) / sizeof(RegisterPipeline)
                       : 0,
                   std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before)
                       .count(),
-                  error ? ", could not rename" : "");
+                  error ? ", could not rename" : "", pieces,
+                  serialize_off_ring_ ? "on this thread" : "on the ring",
+                  double(serialize_off_ring_ ? writer_ns_serialize_ : ns_ring_serialize_.load()) / 1e6);
     }
   }
 
@@ -7604,6 +8577,24 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     cache_between_frames_ = REXCVAR_GET(masseffect_native_cache_textures_between_frames);
     REXLOG_INFO("[native] C6: texture caches across frames (masseffect_native_cache_textures_between_frames) = {}",
                 cache_between_frames_ ? "YES" : "no");
+    // Ring CPU round 3 (docs/ring-cpu-per-draw.md).
+    report_tex_up_ = REXCVAR_GET(masseffect_native_report_texture_uploads);
+    inval_by_address_ = REXCVAR_GET(masseffect_native_texture_inval_by_address);
+    address_verify_left_ = inval_by_address_ ? std::max<int32_t>(0, REXCVAR_GET(masseffect_native_texture_inval_verify)) : 0;
+    frames_verify_left_ =
+        cache_between_frames_ ? std::max<int32_t>(0, REXCVAR_GET(masseffect_native_texture_frames_verify)) : 0;
+    constants_same_ = REXCVAR_GET(masseffect_native_constants_same_content);
+    constants_same_verify_left_ =
+        constants_same_ ? std::max<int32_t>(0, REXCVAR_GET(masseffect_native_constants_same_verify)) : 0;
+    dedupe_after_copy_ = REXCVAR_GET(masseffect_native_dedupe_hash_after_copy);
+    dedupe_after_verify_left_ = dedupe_after_copy_ ? 4096 : 0;
+    REXLOG_INFO("[native] C6 round 3: report textures/uploads {}; invalidation by address {} (first {} hits "
+                "checked); cross-frame hits checked {}; constants reused by content {} (first {} checked); vertex "
+                "fingerprint after the copy {} (first {} checked)",
+                report_tex_up_ ? "on" : "off", inval_by_address_ ? "ON" : "off", address_verify_left_,
+                frames_verify_left_, constants_same_ ? "ON" : "off", constants_same_verify_left_,
+                dedupe_after_copy_ ? "ON" : "off", dedupe_after_verify_left_);
+    DcInit();  // per-component draw cache (me_draw_cache_members.inc)
     mipmaps_ = REXCVAR_GET(masseffect_native_mipmaps);
     REXLOG_INFO("[native] C3: texture mip levels (masseffect_native_mipmaps) = {}", mipmaps_ ? "YES" : "no");
     textures_mb_max_ = REXCVAR_GET(masseffect_native_textures_mb_max);
@@ -7664,11 +8655,15 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
     const VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                     24};
+    // Set 5, the combined image+sampler heap (masseffect_native_ps_combined_heap, read at start-up).
+    if (!CreateCombinedHeap()) {
+      return false;
+    }
     VkPipelineLayoutCreateInfo info_layout{};
     info_layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    const std::array<VkDescriptorSetLayout, 5> layouts_pipeline = {layouts_[0], layouts_[1], layouts_[2],
-                                                                    layouts_[3], layout_ubo_};
-    info_layout.setLayoutCount = 5;
+    const std::array<VkDescriptorSetLayout, 6> layouts_pipeline = {layouts_[0], layouts_[1], layouts_[2],
+                                                                    layouts_[3], layout_ubo_, comb_set_layout_};
+    info_layout.setLayoutCount = comb_layout_ ? 6 : 5;
     info_layout.pSetLayouts = layouts_pipeline.data();
     info_layout.pushConstantRangeCount = 1;
     info_layout.pPushConstantRanges = &range;
@@ -7775,6 +8770,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     write.pImageInfo = &image;
     dfn_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    if (heap == 0) CombinedMirrorImage(slot, view);  // masseffect_native_ps_combined_heap
   }
 
   void WriteSampler(uint32_t slot, VkSampler sampler) {
@@ -7789,6 +8785,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     write.pImageInfo = &image;
     dfn_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    CombinedMirrorSampler(slot, sampler);  // masseffect_native_ps_combined_heap
   }
 
   uint32_t ReserveSlot(uint32_t heap) {
@@ -7886,13 +8883,24 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         {me::native::ShaderIdentityStage::Vertex, patched},
         {me::native::ShaderIdentityStage::Vertex, vs.microcode}, vs.elements,
         [](const ElementVertex& e) { return e.instruction; });
+    // masseffect_native_vs_fetch_permutation: Direct3D reordered back-to-back fetches into one temporary register.
+    // Each element then takes the fetch of its own run that writes its components (never one outside the run).
+    const bool permuted_identity =
+        !ordered_identity && me::native::g_vs_identity_fetch_permutation.load(std::memory_order_relaxed) &&
+        me::native::VertexShaderFetchPermutationMatches(
+            {me::native::ShaderIdentityStage::Vertex, patched},
+            {me::native::ShaderIdentityStage::Vertex, vs.microcode}, vs.elements,
+            [](const ElementVertex& e) { return e.instruction; });
     uint32_t used_locations = 0;
     for (const ElementVertex& element : vs.elements) {
       const uint32_t register_value = (vs.microcode[size_t(element.instruction) * 3] >> 12) & 0x3F;
       const uint32_t original = vs.microcode[size_t(element.instruction) * 3 + 1] & 0xFFF;
-      const auto selection = me::native::SelectVertexFetch(
-          vs.microcode, patched, element.instruction, ordered_identity, vs.elements,
-          [](const ElementVertex& e) { return e.instruction; });
+      const auto selection =
+          permuted_identity
+              ? me::native::SelectVertexFetchPermuted(vs.microcode, patched, element.instruction, vs.elements,
+                                                      [](const ElementVertex& e) { return e.instruction; })
+              : me::native::SelectVertexFetch(vs.microcode, patched, element.instruction, ordered_identity,
+                                              vs.elements, [](const ElementVertex& e) { return e.instruction; });
       if (!selection) {
         if (selection.failure == me::native::VertexFetchSelectionFailure::Ambiguous) {
           const uint64_t program_hash = XXH3_64bits(patched.data(), patched.size_bytes());
@@ -8025,12 +9033,249 @@ class DrawsVulkanImpl final : public DrawsVulkan {
 
   // Texture of a fetch constant: heap slot and, if it has to be uploaded, it is left in textures_to_upload_
   // with its data already prepared. Base level of 2D textures and cubemaps.
+  // masseffect_native_texture_spread_phase: the first time a texture sits at a cap below 32 (no jitter there),
+  // bring this one recheck forward by 0..cap-1 frames, chosen from its key. Only ever earlier, never later.
+  void SpreadPhase(Texture& t, uint64_t key) const {
+    if (t.phase_spread || !REXCVAR_GET(masseffect_native_texture_spread_phase)) return;
+    const uint32_t cap = CapInterval(t);
+    if (t.interval != cap || cap >= 32 || cap < 2) return;
+    t.phase_spread = true;
+    const uint64_t mixed = (key ^ (key >> 29)) * 0xBF58476D1CE4E5B9ull;
+    const uint32_t early = uint32_t(mixed >> 40) % cap;  // 0..cap-1: next stays >= frame_ + 1
+    t.next -= early;
+  }
+
+  // masseffect_native_texture_coherency: read the switches once (the first PrepareTexture, before any texture holds
+  // a stamp, so no event a stamp depends on can have been missed) and start recording events.
+  void CoherencyMode() {
+    if (coherency_mode_ >= 0) return;
+    coherency_mode_ = REXCVAR_GET(masseffect_native_texture_coherency);
+    coherency_full_every_ = uint32_t(std::clamp(REXCVAR_GET(masseffect_native_texture_coherency_full_every), 1, 64));
+    coherency_early_ = coherency_mode_ > 0 && REXCVAR_GET(masseffect_native_texture_coherency_early);
+    coherency_linear_ = REXCVAR_GET(masseffect_native_texture_coherency_linear);
+    coherency_max_undeclared_ = uint64_t(std::max(REXCVAR_GET(masseffect_native_texture_coherency_max_undeclared), 0));
+    coherency_verify_left_ = std::max<int32_t>(0, REXCVAR_GET(masseffect_native_verify_n));
+    me::native::texture_coherency::Enable(coherency_mode_ > 0);
+    if (coherency_mode_ > 0) {
+      REXLOG_INFO("[native] C3: texture recheck by coherency events (masseffect_native_texture_coherency) = {}; "
+                  "{}; early recheck on an event {}; linear textures {}; at most {} undeclared changes of stable "
+                  "textures",
+                  coherency_mode_,
+                  coherency_mode_ == 1
+                      ? fmt::format("clean rechecks skip XXH3, the first {} and 1 in {} per texture still hash",
+                                    coherency_verify_left_, coherency_full_every_)
+                      : std::string("measurement only, every recheck still hashes"),
+                  coherency_early_ ? "on" : "off", coherency_linear_ ? "skipped too" : "always hashed",
+                  coherency_max_undeclared_);
+    }
+  }
+
+  // masseffect_native_texture_coherency_early: a recheck that is not due is brought forward when an event touched
+  // the texture's pages after its last hash (only ever earlier; the full path then decides).
+  bool CoherencyEarly(const Texture& t) {
+    if (!coherency_early_ || coherency_mode_ <= 0 || !t.coherency_valid) return false;
+    namespace tc = me::native::texture_coherency;
+    if (tc::Clean(t.coherency_start, t.coherency_bytes, t.coherency_stamp) &&
+        (!t.coherency_mips_bytes || tc::Clean(t.coherency_mips, t.coherency_mips_bytes, t.coherency_stamp))) {
+      return false;
+    }
+    ++coherency_early_n_;
+    return true;
+  }
+
+  // After every full raw hash with the switch on: classify it (clean or dirty by the events, same or changed
+  // bytes), check the guarded rechecks and store the stamp and ranges for the next recheck.
+  void CoherencyAfterHash(Texture& texture, bool clean, bool eligible, bool guard, bool equal, uint32_t stamp,
+                          uint64_t start,
+                          uint64_t bytes, uint64_t mips, uint64_t mips_bytes, uint32_t width, uint32_t height,
+                          uint32_t format, bool linear) {
+    // A different range (address, size, mips) is a different content: it must be seen unchanged again first.
+    if (texture.coherency_valid && (texture.coherency_start != start || texture.coherency_bytes != bytes ||
+                                    texture.coherency_mips != mips || texture.coherency_mips_bytes != mips_bytes)) {
+      texture.coherency_confirmed = false;
+    }
+    if (texture.image.prepared && texture.coherency_valid) {
+      if (clean) {
+        if (equal) {
+          ++coherency_clean_equal_;
+          coherency_bytes_clean_equal_ += bytes + mips_bytes;
+          texture.coherency_confirmed = true;
+        } else {
+          // The bytes changed and no event declared it. This texture is always hashed from now on.
+          ++coherency_clean_changed_;
+          if (!texture.coherency_exempt) {
+            texture.coherency_exempt = true;
+            const uint64_t k = ++coherency_exempted_;
+            if (k <= 32 || (k & 255) == 0) {
+              REXLOG_INFO("[native] C3 coherency: texture {:08X} {}x{} format {} {} ({} KB, mips {} KB) changed with no "
+                          "coherency event; always hashed from now on ({} textures so far){}",
+                          uint32_t(start), width, height, format, linear ? "linear" : "tiled", bytes >> 10,
+                          mips_bytes >> 10, k, eligible ? "; it was ELIGIBLE for the skip" : "");
+            }
+          }
+          if (eligible) {
+            // A texture that had been seen unchanged and could have been skipped: with mode 1 its new content
+            // could have been shown late. These count against the session limit.
+            const uint64_t n = ++coherency_clean_changed_eligible_;
+            if (coherency_mode_ == 1) {
+              const bool off = n > coherency_max_undeclared_;
+              REXLOG_ERROR("[native] DIFFERENCE: texture {:08X} {}x{} format {} ({} KB, mips {} KB) changed in guest "
+                           "memory with no coherency event since its last hash after it had been stable ({} of {} "
+                           "allowed; {} guarded rechecks were equal){}",
+                           uint32_t(start), width, height, format, bytes >> 10, mips_bytes >> 10, n,
+                           coherency_max_undeclared_, coherency_verified_,
+                           off ? "; the recheck by coherency events is OFF for the rest of the session"
+                               : "; this texture is always hashed from now on");
+              if (off) {
+                coherency_mode_ = 0;
+                coherency_early_ = false;
+                me::native::texture_coherency::Enable(false);
+              }
+            }
+          }
+        }
+        if (guard && equal && coherency_mode_ == 1) {
+          ++coherency_guards_;
+          ++coherency_verified_;
+          if (coherency_verify_left_ > 0 && --coherency_verify_left_ == 0) {
+            REXLOG_INFO("[native] C3: texture recheck by coherency events: {} clean rechecks hashed, all equal "
+                        "(verification finished; 1 in {} per texture still hashes)",
+                        coherency_verified_, coherency_full_every_);
+          }
+        }
+      } else if (equal) {
+        ++coherency_dirty_equal_;
+      } else {
+        ++coherency_dirty_changed_;
+      }
+    }
+    texture.coherency_clean_run = 0;
+    if (coherency_mode_ <= 0) {
+      texture.coherency_valid = false;
+      return;
+    }
+    texture.coherency_valid = true;
+    texture.coherency_stamp = stamp;
+    texture.coherency_start = start;
+    texture.coherency_bytes = bytes;
+    texture.coherency_mips = mips;
+    texture.coherency_mips_bytes = mips_bytes;
+  }
+
+  // masseffect_native_texture_coherency, every 10 s (only while the switch is on).
+  void ReportCoherency() {
+    if (coherency_mode_ <= 0 && coherency_report_ == std::chrono::steady_clock::time_point{}) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - coherency_report_ < std::chrono::seconds(10)) return;
+    const bool first = coherency_report_ == std::chrono::steady_clock::time_point{};
+    coherency_report_ = now;
+    namespace tc = me::native::texture_coherency;
+    CoherencyReported c;
+    c.skips = coherency_skips_;
+    c.bytes_skipped = coherency_bytes_skipped_;
+    c.guards = coherency_guards_;
+    c.early = coherency_early_n_;
+    c.clean_equal = coherency_clean_equal_;
+    c.clean_changed = coherency_clean_changed_;
+    c.clean_changed_eligible = coherency_clean_changed_eligible_;
+    c.exempted = coherency_exempted_;
+    c.dirty_equal = coherency_dirty_equal_;
+    c.dirty_changed = coherency_dirty_changed_;
+    c.bytes_clean_equal = coherency_bytes_clean_equal_;
+    c.events = tc::g.events.load(std::memory_order_relaxed);
+    c.empty = tc::g.events_empty.load(std::memory_order_relaxed);
+    c.bytes = tc::g.bytes.load(std::memory_order_relaxed);
+    c.pages = tc::g.pages_marked.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < c.sources.size(); ++i) c.sources[i] = tc::g.by_source[i].load(std::memory_order_relaxed);
+    const CoherencyReported& p = coherency_reported_;
+    if (!first) {
+      MASSEFFECT_REPORT_RING(
+          "[native] C3 coherency (last 10 s, mode {}): events {} (BASE writes {}, waits {}, MMIO {}, read-backs {}; "
+          "{} empty), {:.1f} MB declared, {} pages stamped | rechecks skipped {} ({:.1f} MB not hashed), guarded {}, "
+          "early {} | hashed: clean+same {} ({:.1f} MB), clean+CHANGED {} (of stable eligible textures {}; textures "
+          "exempted {}), dirty+same {}, dirty+changed {}",
+          coherency_mode_, c.events - p.events, c.sources[0] - p.sources[0], c.sources[1] - p.sources[1],
+          c.sources[2] - p.sources[2], c.sources[3] - p.sources[3], c.empty - p.empty,
+          double(c.bytes - p.bytes) / 1048576.0, c.pages - p.pages, c.skips - p.skips,
+          double(c.bytes_skipped - p.bytes_skipped) / 1048576.0, c.guards - p.guards, c.early - p.early,
+          c.clean_equal - p.clean_equal, double(c.bytes_clean_equal - p.bytes_clean_equal) / 1048576.0,
+          c.clean_changed - p.clean_changed, c.clean_changed_eligible - p.clean_changed_eligible,
+          c.exempted - p.exempted, c.dirty_equal - p.dirty_equal, c.dirty_changed - p.dirty_changed);
+    }
+    coherency_reported_ = c;
+  }
+
   static uint32_t CapInterval(const Texture& t) {
     uint32_t cap = uint32_t(REXCVAR_GET(masseffect_native_texture_interval_max));
     if (t.late_changes && REXCVAR_GET(masseffect_native_adaptive_texture)) {
       cap = std::min<uint32_t>(cap, t.late_changes >= 3 ? 2u : 4u);
     }
-    return cap;
+    // masseffect_native_texture_atlas_cap: CPU-updated single-channel atlases (UI glyph caches).
+    if (t.late_changes && IsAtlasCandidate(t)) {
+      const int32_t atlas = REXCVAR_GET(masseffect_native_texture_atlas_cap);
+      if (atlas > 0) cap = std::min<uint32_t>(cap, uint32_t(atlas));
+    }
+    return std::max<uint32_t>(cap, 1u);
+  }
+
+  // Small single-channel 2D texture: the shape of the UI glyph-cache pages (k_8 -> R8_UNORM).
+  static bool IsAtlasCandidate(const Texture& t) {
+    return t.image.format == VK_FORMAT_R8_UNORM && t.layers == 1 && t.background == 0 && t.image.width <= 512 &&
+           t.image.height <= 512;
+  }
+
+  // --- masseffect_native_glyph_trace -----------------------------------------------------------------------------
+  bool GlyphTraceLine() {
+    if (glyph_trace_left_ <= 0) return false;
+    --glyph_trace_left_;
+    return true;
+  }
+
+  // The CPU content of a glyph page that is about to be uploaded (untiled, one byte per texel, level 0 first):
+  // which 32x32 tiles changed since the previous upload of that page, and the nonzero texels before and after.
+  void TraceGlyphPage(const Texture& texture, uint32_t base, const std::vector<uint8_t>& data, bool created) {
+    const uint32_t w = texture.image.width, h = texture.image.height;
+    const size_t texels = size_t(w) * h;
+    if (!w || !h || data.size() < texels) return;
+    const auto count = [&](const uint8_t* p) {
+      uint64_t n = 0;
+      for (size_t i = 0; i < texels; ++i) n += p[i] != 0;
+      return n;
+    };
+    const uint64_t after = count(data.data());
+    auto it = glyph_trace_pages_.find(base);
+    if (it == glyph_trace_pages_.end() || it->second.size() != texels) {
+      if (it == glyph_trace_pages_.end() && glyph_trace_pages_.size() >= 128) return;  // bounded memory
+      glyph_trace_pages_[base].assign(data.begin(), data.begin() + texels);
+      if (GlyphTraceLine())
+        REXLOG_INFO("[native] ME glyph trace: new page {:08X} {}x{} (frame {}, {}): {} nonzero texels", base, w, h,
+                    frame_, created ? "texture created" : "first content seen", after);
+      return;
+    }
+    std::vector<uint8_t>& previous = it->second;
+    const uint64_t before = count(previous.data());
+    std::string rects;
+    uint32_t changed = 0, tiles = 0;
+    for (uint32_t ty = 0; ty < h; ty += 32) {
+      for (uint32_t tx = 0; tx < w; tx += 32) {
+        ++tiles;
+        const uint32_t tw = std::min(32u, w - tx), th = std::min(32u, h - ty);
+        bool differs = false;
+        for (uint32_t y = 0; y < th && !differs; ++y) {
+          const size_t o = size_t(ty + y) * w + tx;
+          differs = std::memcmp(previous.data() + o, data.data() + o, tw) != 0;
+        }
+        if (!differs) continue;
+        ++changed;
+        if (rects.size() < 900) rects += fmt::format(" [{},{} {}x{}]", tx, ty, tw, th);
+      }
+    }
+    std::memcpy(previous.data(), data.data(), texels);
+    if (GlyphTraceLine())
+      REXLOG_INFO("[native] ME glyph trace: CPU bytes changed {:08X} {}x{} (frame {}, recheck interval {}): {} of {} "
+                  "32x32 tiles{}; nonzero texels {} -> {}",
+                  base, w, h, frame_, texture.interval, changed, tiles, rects.empty() ? " (none: other levels)" : rects,
+                  before, after);
   }
 
   void PrepareTexture(const uint32_t* f, uint32_t& slot, uint32_t& heap,
@@ -8076,7 +9321,21 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     const uint32_t swizzle = (f[3] >> 1) & 0xFFF;
     const uint32_t base = (f[1] >> 12) << 12;
     if (!cube && !volume) {
-      if (const ImageNative* resolved = context_->ResolvedTexture(base & 0x1FFFFFFF)) {
+      if (const ImageNative* resolved = context_->ResolvedTexture(base & 0x1FFFFFFF, f)) {
+        prepared_resolved_ = true;  // masseffect_native_texture_inval_by_address
+        // masseffect_native_glyph_trace: a k_8 fetch (glyph-page shape) answered by a resolve's GPU image.
+        if (glyph_trace_ && (f[1] & 0x3F) == 2 && glyph_trace_resolved_.size() < 4096 &&
+            glyph_trace_resolved_
+                .insert(uint64_t(base) ^ ((uint64_t)(resolved->image) << 20) ^
+                        (uint64_t(resolved->resolved_guest_format) << 58))
+                .second &&
+            GlyphTraceLine()) {
+          REXLOG_INFO("[native] ME glyph trace: k_8 fetch {:08X} {}x{} served by a RESOLVED image {}x{} guest format "
+                      "{} (texels from a render target, not from guest memory; frame {})",
+                      base, (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, resolved->width, resolved->height,
+                      resolved->resolved_guest_format, frame_);
+        }
+        prepare_kind_ = kPrepareResolved;
         AuditFetchResolved(base & 0x1FFFFFFF, f, *resolved);
         resolved = context_->ResolvedTextureForFetch(base & 0x1FFFFFFF, f, *resolved);
         if (!resolved) {
@@ -8235,6 +9494,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       const auto before_create = std::chrono::steady_clock::now();
       const uint64_t wait_before_create = ns_wait_bindings_total_;
       measuring_creation_ = true;
+      prepare_kind_ = kPrepareCreated;
       const bool created = CreateTextureInThread(texture, tf.format, host_width, host_height, layers, background, levels) ||
                           CreateTexture(texture.image, tf.format, host_width, host_height, layers, background, levels);
       measuring_creation_ = false;
@@ -8362,15 +9622,32 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     slot = SlotView(texture.image.image, tf.format, swizzle, tf.swizzle_host, heap);
     host_width_out = texture.image.width;  // the host's, which is what the shader sees
     host_height_out = texture.image.height;
+    // masseffect_native_texture_requeue_uploads: an upload queued by an earlier draw that stopped before its upload
+    // stage. The data is still held (UploadTexture releases it) and is the content the raw hash already describes.
+    if (texture.needs_upload && !texture.data.empty() && requeue_uploads_ &&
+        std::find(textures_to_upload_.begin(), textures_to_upload_.end(), &texture) == textures_to_upload_.end()) {
+      textures_to_upload_.push_back(&texture);
+      bytes_upload += (texture.data.size() + 3) & ~size_t(3);
+      ++requeued_uploads_;
+      if (glyph_trace_ && IsAtlasCandidate(texture) && GlyphTraceLine()) {
+        REXLOG_INFO("[native] ME glyph trace: upload requeued {:08X} (frame {})", base, frame_);
+      }
+      if (requeued_uploads_ <= 32 || (requeued_uploads_ & 1023) == 0) {
+        REXLOG_INFO("[native] ME lost texture upload requeued ({} so far): {:08X} {}x{} format {} ({} KB)",
+                    requeued_uploads_, base, width, height, format, texture.data.size() >> 10);
+      }
+    }
     if (texture.frame == frame_) {
       // Valid until the frame before the next check (if it changed now, only this frame)
       valid_until = std::max<uint64_t>(frame_, texture.next ? texture.next - 1 : 0);
+      if (prepare_kind_ != kPrepareCreated) prepare_kind_ = kPrepareChecked;
       return;  // already checked this frame
     }
     // Textures that do not change are checked less and less often (down to every 32 frames); those that
     // change (videos) go back to being checked every frame.
-    if (texture.image.prepared && frame_ < texture.next) {
+    if (texture.image.prepared && frame_ < texture.next && !CoherencyEarly(texture)) {
       valid_until = texture.next - 1;
+      prepare_kind_ = kPrepareNotDue;
       return;
     }
     texture.frame = frame_;
@@ -8409,6 +9686,47 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       const uint64_t extension = (layers - 1) * stride_face + extension_layer;
       if (raw_start + extension <= kPhysicalMemory) {
         /*
+         * masseffect_native_texture_coherency. A prepared texture whose guest pages saw no coherency event since
+         * its last full hash is unchanged unless the game wrote it without declaring it. Mode 1 answers it here
+         * without reading its bytes, exactly as the full recheck that finds the same bytes would (interval,
+         * next, phase, valid_until), except for the guarded rechecks (the first verify_n, then 1 in full_every
+         * per texture), which take the full path and must find the same hash. It is placed before the budget:
+         * a skipped recheck reads nothing, so it costs no budget.
+         */
+        CoherencyMode();
+        bool coherency_clean = false, coherency_guard = false, coherency_eligible = false;
+        if (coherency_mode_ > 0 && texture.image.prepared && texture.coherency_valid &&
+            texture.coherency_start == raw_start && texture.coherency_bytes == extension &&
+            texture.coherency_mips == (extension_mips ? (dir_mips & 0x1FFFFFFF) : 0) &&
+            texture.coherency_mips_bytes == extension_mips) {
+          namespace tc = me::native::texture_coherency;
+          coherency_clean = tc::Clean(raw_start, extension, texture.coherency_stamp) &&
+                            (!extension_mips || tc::Clean(dir_mips, extension_mips, texture.coherency_stamp));
+          // Only stable, tiled (unless _linear), never-undeclared textures may skip. Mode 2 classifies the same way.
+          // A CPU-updated atlas under masseffect_native_texture_atlas_cap is always hashed: its glyph writes may come
+          // without a coherency event, and the skip would delay them by up to coherency_full_every rechecks.
+          coherency_eligible = texture.coherency_confirmed && !texture.coherency_exempt &&
+                               (tile_texture || coherency_linear_) &&
+                               !(texture.late_changes && IsAtlasCandidate(texture) &&
+                                 REXCVAR_GET(masseffect_native_texture_atlas_cap) > 0);
+          if (coherency_clean && coherency_eligible && coherency_mode_ == 1) {
+            coherency_guard = coherency_verify_left_ > 0 ||
+                              uint32_t(texture.coherency_clean_run) + 1u >= coherency_full_every_;
+            if (!coherency_guard) {
+              ++texture.coherency_clean_run;
+              ++coherency_skips_;
+              coherency_bytes_skipped_ += extension + extension_mips;
+              texture.postponements = 0;
+              texture.interval = std::min<uint32_t>(texture.interval * 2, CapInterval(texture));
+              texture.next = frame_ + texture.interval + (texture.interval >= 32 ? (key >> 7) & 7 : 0);
+              SpreadPhase(texture, key);
+              valid_until = texture.next - 1;
+              prepare_kind_ = kPrepareSameFull;
+              return;
+            }
+          }
+        }
+        /*
          * Per-frame check budget.
          * During stutters both game threads wait for room in the ring (20-50 ms) while the ring neither
          * stops nor waits for the GPU: the ring thread itself is stuck. During the stutters, that thread was in
@@ -8433,6 +9751,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
          * later. A single disagreement turns sampling off for the rest of the session, with a warning.
          */
         if (sampling_fingerprints_ < 0) {
+          sample_after_change_ = REXCVAR_GET(masseffect_native_texture_sample_after_change);
           const int32_t each = REXCVAR_GET(masseffect_native_fingerprints_sampling);
           sampling_fingerprints_ = each >= 2 ? std::min<int32_t>(each, 64) : 0;
           REXLOG_INFO("[native] C3: sampled recheck of stable textures (masseffect_native_fingerprints_sampling) "
@@ -8445,9 +9764,19 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         const uint64_t bytes_of_sample = BytesSample(extension) + BytesSample(extension_mips);
         const bool with_sample = sampling_fingerprints_ > 0 && texture.image.prepared && texture.interval >= 4 &&
                                  bytes_of_sample * 2 <= bytes_complete;
-        const bool sample_util = with_sample && texture.interval >= 8 && texture.valid_sample;
-        const bool sample_only = sample_util && checked_samples_ >= kSamplesToCheck &&
-                                  texture.consecutive_samples + 1u < uint32_t(sampling_fingerprints_);
+        // masseffect_native_fingerprints_sample_min_interval (8 = as before; 4 is the non-exact variant).
+        const uint32_t sample_min = uint32_t(REXCVAR_GET(masseffect_native_fingerprints_sample_min_interval));
+        const bool sample_util = with_sample && texture.interval >= sample_min && texture.valid_sample;
+        // masseffect_native_fingerprints_skip_unused_sample: the sample is only consumed from sample_min on; if
+        // neither this interval nor the texture's cap reaches it, it is not computed (and none is stored).
+        const bool sample_compute =
+            with_sample && (!REXCVAR_GET(masseffect_native_fingerprints_skip_unused_sample) ||
+                            texture.interval >= sample_min || CapInterval(texture) >= sample_min);
+        // masseffect_native_texture_sample_after_change: a texture known to receive partial CPU updates (late_changes)
+        // is always rechecked with the full hash.
+        const bool sample_only = !coherency_guard && sample_util && checked_samples_ >= kSamplesToCheck &&
+                                  texture.consecutive_samples + 1u < uint32_t(sampling_fingerprints_) &&
+                                  !(texture.late_changes && sample_after_change_);
         const uint64_t bytes_sample = with_sample ? bytes_of_sample : 0;
         // What will actually be read, which is what counts against the budget.
         const uint64_t bytes_fingerprint = sample_only ? bytes_sample : bytes_complete + bytes_sample;
@@ -8467,6 +9796,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           texture.next = frame_ + 1 + (key & 1);
           valid_until = texture.next - 1;
           masseffect::waits::g_postponed_fingerprints.fetch_add(1, std::memory_order_relaxed);
+          prepare_kind_ = kPreparePostponed;
           return;
         }
         texture.postponements = 0;
@@ -8478,7 +9808,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         // The sample goes before the full hash. If the full one matches, the sample is of that same content,
         // and it is the one stored.
         uint64_t sample = 0;
-        if (with_sample) {
+        if (sample_compute) {
           sample = SampleFingerprint(raw_base, extension, 0);
           if (extension_mips) {
             sample = SampleFingerprint(raw_mips, extension_mips, sample);
@@ -8498,7 +9828,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           bytes_saved_sample_ += bytes_complete - bytes_sample;
           texture.interval = std::min<uint32_t>(texture.interval * 2, CapInterval(texture));
           texture.next = frame_ + texture.interval + (texture.interval >= 32 ? (key >> 7) & 7 : 0);
+          SpreadPhase(texture, key);
           valid_until = texture.next - 1;
+          prepare_kind_ = kPrepareSameSample;
           return;
         }
         if (sample_only) {
@@ -8507,6 +9839,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           bytes_frame_fingerprint_ += bytes_complete;
           masseffect::waits::g_bytes_fingerprint.fetch_add(bytes_complete, std::memory_order_relaxed);
         }
+        // masseffect_native_texture_coherency: the stamp is taken before the bytes are read (see the header).
+        const uint32_t coherency_before = coherency_mode_ > 0 ? me::native::texture_coherency::Current() : 0;
         uint64_t raw_fingerprint = XXH3_64bits(raw_base, size_t(extension));
         if (extension_mips) {  // and the bytes of all the mips
           raw_fingerprint = XXH3_64bits_withSeed(raw_mips, size_t(extension_mips), raw_fingerprint);
@@ -8517,6 +9851,12 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                          .count()),
             std::memory_order_relaxed);
         const bool complete_equal = texture.image.prepared && raw_fingerprint == texture.raw_fingerprint;
+        if (coherency_mode_ > 0) {
+          CoherencyAfterHash(texture, coherency_clean, coherency_eligible, coherency_guard, complete_equal,
+                             coherency_before, raw_start,
+                             extension, extension_mips ? (dir_mips & 0x1FFFFFFF) : 0, extension_mips, width, height,
+                             format, !tile_texture);
+        }
         if (sample_util && !sample_only) {
           // The guard. This stable recheck computed both hashes.
           ++checked_samples_;
@@ -8536,20 +9876,35 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         }
         if (complete_equal) {
           // The sample of this content, for the stable rechecks.
-          if (with_sample && sampling_fingerprints_ > 0) {
+          if (sample_compute && sampling_fingerprints_ > 0) {
             texture.sample_fingerprint = sample;
             texture.valid_sample = true;
+          } else if (with_sample) {
+            texture.valid_sample = false;  // skipped as unused: never let a later cap change consume an old one
           }
           texture.consecutive_samples = 0;
           texture.interval = std::min<uint32_t>(texture.interval * 2, CapInterval(texture));
           // At the maximum interval, from 32 to 39 depending on the texture, so they do not coincide.
           texture.next = frame_ + texture.interval + (texture.interval >= 32 ? (key >> 7) & 7 : 0);
+          SpreadPhase(texture, key);
           valid_until = texture.next - 1;
+          prepare_kind_ = kPrepareSameFull;
           return;
         }
         texture.valid_sample = false;  // the content changed; the sample is no longer valid
         if (texture.image.prepared && texture.interval >= 2 && texture.late_changes < 255) {
           ++texture.late_changes;
+          // masseffect_native_texture_atlas_cap: from now on this page is rechecked every N frames.
+          if (texture.late_changes == 1 && IsAtlasCandidate(texture) &&
+              REXCVAR_GET(masseffect_native_texture_atlas_cap) > 0) {
+            static uint32_t atlases = 0;
+            if (++atlases <= 32) {
+              REXLOG_INFO("[native] ME CPU-updated atlas {:08X} {}x{} format {} ({}): rechecked at most every {} "
+                          "frames from now on (masseffect_native_texture_atlas_cap; {} so far)",
+                          uint32_t(raw_start), width, height, format, tile_texture ? "tiled" : "linear",
+                          REXCVAR_GET(masseffect_native_texture_atlas_cap), atlases);
+            }
+          }
         }
         if (texture.image.prepared && texture.interval >= 4) {
           // Diagnostic (texture popping): a stable texture changed at the same address; the old content was
@@ -8671,8 +10026,14 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (texture.image.prepared && fingerprint == texture.fingerprint) {
       texture.interval = std::min<uint32_t>(texture.interval * 2, CapInterval(texture));
       texture.next = frame_ + texture.interval;
+      SpreadPhase(texture, key);
       valid_until = texture.next - 1;
+      prepare_kind_ = kPrepareSameData;
       return;
+    }
+    if (prepare_kind_ != kPrepareCreated) prepare_kind_ = kPrepareChanged;
+    if (glyph_trace_ && IsAtlasCandidate(texture) && tf.bytes == 1 && tf.block == 1) {
+      TraceGlyphPage(texture, base, data, prepare_kind_ == kPrepareCreated);  // masseffect_native_glyph_trace
     }
     texture.interval = 1;
     texture.next = frame_ + 1;
@@ -9195,6 +10556,11 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       RecordCopyTexture(upload, texture, offset);
     }
     texture.needs_upload = false;
+    if (glyph_trace_ && IsAtlasCandidate(texture) && GlyphTraceLine()) {  // masseffect_native_glyph_trace
+      REXLOG_INFO("[native] ME glyph trace: upload {:08X} {}x{} recorded (frame {}{})", texture.address,
+                  texture.image.width, texture.image.height, frame_,
+                  texture.in_flight ? ", deferred to the bind thread" : "");
+    }
     /*
      * The copy of the pixels is no longer needed. They are already in the upload buffer, and to know
      * whether the texture changes its hashes are kept, not the bytes. Keeping the copy made the texture
@@ -9425,11 +10791,22 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         }
       }
     }
+    pass_occlusion_depth_ = nullptr;
     if (keys[4]) {
       images[4] = context_->TargetDepth(uint32_t(keys[4] >> 24) & 0xFFF,
                                                   uint32_t(keys[4] >> 16) & 0x1, pitch);
       if (!images[4]) {
         return Reject(41, "no depth target");
+      }
+      // masseffect_native_query_occlusion_depth: the private twin of this depth view, same size and format (the
+      // pipelines stay compatible), created on first use.
+      if (keys[4] & kKeyOcclusionDepth) {
+        OcclusionDepth* twin = OcclusionDepthFor(keys[4] & ~kKeyOcclusionDepth, *images[4]);
+        if (!twin) {
+          return Reject(44, "no occlusion depth image");
+        }
+        images[4] = &twin->image;
+        pass_occlusion_depth_ = twin;
       }
     }
     (void)r;
@@ -9540,6 +10917,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     pass_generation_ = context_->GenerationCommands();
     pass_width_ = width;
     pass_height_ = height;
+    pass_area_height_ = pass_height;
     // Grid expansion changes only physical X coverage, not the shadow scale
     // (which applies in both axes). Derive the latter from the logical width.
     pass_raster_scale_x_ = float(1u << raster_grid_x);
@@ -10174,6 +11552,130 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     return module;
   }
 
+  /*
+   * masseffect_native_fold_vs_constants, ring thread, per draw: puts in the key the values of the float register
+   * components the vertex shader compares and the identity input remaps it reads. Returns true if anything was
+   * put. A component is folded only when the draw uploads it (bytes_vs) and its value is an ordinary float (no
+   * NaN, infinity or denormal: the module must compute exactly what the UBO would give, and NIR's constant
+   * folding of those is not worth trusting). Each vertex shader may be specialized for at most
+   * masseffect_native_fold_vs_constants_max_values distinct value sets; after that its components stay dynamic
+   * (the identity remaps are still folded: they do not multiply pipelines, they follow the vertex input).
+   */
+  bool FoldVsConstantsInKey(const ShaderEntry& vs, uint32_t bytes_vs, const uint32_t* r, const VerticesEntry& entry,
+                            PipelineKey& key) {
+    auto it = vs_constants_states_.find(vs.number);
+    if (it == vs_constants_states_.end()) {
+      VsConstantsState state;
+      std::string reason;
+      state.valid = me::native::AnalyzeVertexConstants(vs.shader->Spirv(), state.info, reason);
+      if (!state.valid) {
+        REXLOG_WARN("[native] VS constants: VS n{} cannot be analyzed ({}); not folded", vs.number, reason);
+      } else if ((state.info.n_components || state.info.remap_locations) && ++vs_constants_analyzed_ <= 64) {
+        std::string compared;
+        for (uint32_t k = 0; k < state.info.n_components; ++k)
+          compared += fmt::format(" c{}.{}", state.info.components[k] / 4, "xyzw"[state.info.components[k] % 4]);
+        REXLOG_INFO("[native] VS constants: VS n{} compares{}{}; reads the input remaps of locations {:04X}",
+                    vs.number, state.info.n_components ? compared : std::string(" nothing"),
+                    state.info.more_components ? " (and more, not folded)" : "", state.info.remap_locations);
+      }
+      it = vs_constants_states_.emplace(vs.number, std::move(state)).first;
+    }
+    VsConstantsState& state = it->second;
+    if (!state.valid) return false;
+    uint32_t n = 0;
+    if (!state.over_budget) {
+      for (; n < state.info.n_components; ++n) {
+        const uint32_t component = state.info.components[n];
+        if ((component + 1) * 4 > bytes_vs) break;  // not uploaded for this shader: leave it (and later ones) dynamic
+        const uint32_t bits = r[kRegConstantsVs + component];
+        const uint32_t exponent = (bits >> 23) & 0xFF;
+        if (exponent == 0xFF || (exponent == 0 && (bits & 0x7FFFFF))) break;
+        key.vs_values[n] = bits;
+      }
+      if (n) {
+        std::array<uint32_t, me::native::kVsConstantsMaxComponents + 1> set{};
+        std::copy_n(key.vs_values, n, set.begin());
+        set.back() = n;
+        if (std::find(state.sets.begin(), state.sets.end(), set) == state.sets.end()) {
+          if (state.sets.size() >= vs_constants_max_values_) {
+            state.over_budget = true;
+            REXLOG_WARN("[native] VS constants: VS n{} has more than {} value sets; its compared constants stay "
+                        "dynamic from now on", vs.number, vs_constants_max_values_);
+            std::fill(std::begin(key.vs_values), std::end(key.vs_values), 0u);
+            n = 0;
+          } else {
+            state.sets.push_back(set);
+            if (++vs_constants_sets_logged_ <= 256) {
+              std::string values;
+              for (uint32_t k = 0; k < n; ++k) {
+                float f;
+                std::memcpy(&f, &key.vs_values[k], sizeof(f));
+                values += fmt::format(" c{}.{}={} ({:08X})", state.info.components[k] / 4,
+                                      "xyzw"[state.info.components[k] % 4], f, key.vs_values[k]);
+              }
+              REXLOG_INFO("[native] VS constants: VS n{} value set #{}:{}", vs.number, state.sets.size(), values);
+            }
+          }
+        }
+      }
+    }
+    uint32_t remaps = 0;
+    for (uint32_t location = 0; location < 16; ++location) {
+      if (((state.info.remap_locations >> location) & 1) && entry.remaps[location] == kRemapIdentity)
+        remaps |= 1u << location;
+    }
+    key.vs_fold = remaps | (n << 16);
+    return key.vs_fold != 0;
+  }
+
+  /*
+   * The vertex shader constants of the key folded into the vertex shader module (masseffect_native_fold_vs_constants).
+   * Ring and prewarm. Without the bit, or when nothing folds or the transform fails, the selected module is
+   * returned: it reads the same values at run time, so the image is the same either way.
+   */
+  VkShaderModule ModuleVsConstants(VkShaderModule selected, const PipelineKey& key, const ShaderEntry& vs) {
+    if (!selected || !(key.specialization & kSpecVsFolded) || !vs.shader) return selected;
+    const uint32_t n = std::min<uint32_t>((key.vs_fold >> 16) & 0x3u, me::native::kVsConstantsMaxComponents);
+    const uint32_t remaps = key.vs_fold & 0xFFFFu;
+    std::lock_guard<std::mutex> lock(modules_vs_constants_mutex_);
+    const auto& code = vs.shader->Spirv();
+    // Library entries live for the whole session, so the entry address identifies the source code (no copy of
+    // the ~120 KB of SPIR-V per variant).
+    auto& bucket = modules_vs_constants_[&vs];
+    for (const auto& entry : bucket) {
+      if (entry.vs_fold == key.vs_fold && Equal(entry.values, key.vs_values, sizeof(entry.values)))
+        return entry.module ? entry.module : selected;
+    }
+    me::native::VertexConstantsInfo info;
+    std::vector<uint32_t> folded;
+    me::native::VertexConstantsFold stats;
+    std::string reason;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (!me::native::AnalyzeVertexConstants(code, info, reason) ||
+        !me::native::FoldVertexConstants(code, info.components, key.vs_values, std::min(n, info.n_components),
+                                         remaps & info.remap_locations, folded, stats, reason)) {
+      if (++vs_constants_fold_failures_ <= 8)
+        REXLOG_WARN("[native] VS constants: VS n{} not folded: {}", vs.number, reason);
+    } else if (stats.folded_components || stats.folded_remaps) {
+      VkShaderModuleCreateInfo create{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      create.codeSize = folded.size() * sizeof(uint32_t);
+      create.pCode = folded.data();
+      if (dfn_.vkCreateShaderModule(device_, &create, nullptr, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
+    }
+    ModuleVsConstantsEntry entry;
+    std::memcpy(entry.values, key.vs_values, sizeof(entry.values));
+    entry.vs_fold = key.vs_fold;
+    entry.module = module;
+    bucket.push_back(std::move(entry));
+    if (!module) return selected;  // cached as "not folded"; never destroyed twice
+    if (++vs_constants_modules_ <= 32 || (vs_constants_modules_ & 255) == 0)
+      REXLOG_INFO("[native] VS constants folded: VS n{} ({} modules so far), {} compared reads and {} remap reads "
+                  "folded, values {:08X} {:08X} {:08X}, fold {:05X}", vs.number, vs_constants_modules_,
+                  stats.folded_components, stats.folded_remaps, key.vs_values[0], key.vs_values[1],
+                  key.vs_values[2], key.vs_fold);
+    return module;
+  }
+
   VkShaderModule ModuleDepthHalf(VkShaderModule selected) {
     if (!selected) return VK_NULL_HANDLE;
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
@@ -10301,6 +11803,270 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     modules_alpha_only_.emplace(&entry, shader_module);
     RegistrarModuleCode(shader_module, pruned);
     return shader_module != VK_NULL_HANDLE ? shader_module : ModuleFor(entry);
+  }
+
+  // Restore into 7e3 (masseffect_native_restore_into_7e3): asked by the targets code before it binds the 7e3
+  // image for a k_2_10_10_10 draw. A shader whose output cannot take the epilogue keeps the conversion.
+  bool SupportsRestore7e3(const ShaderEntry& ps, uint32_t slot) override {
+    if (!ps.shader || slot > 3) return false;
+    const uint64_t key = (uint64_t(ps.number) << 4) | (1u << slot);
+    if (const auto it = restore_7e3_supported_.find(key); it != restore_7e3_supported_.end()) return it->second;
+    std::vector<uint32_t> transformed;
+    me::native::Restore7e3Stats stats;
+    std::string reason;
+    const bool ok = me::native::TransformRestore7e3(ps.shader->Spirv(), 1u << slot, transformed, stats, reason);
+    REXLOG_INFO("[native] restore into 7e3: PS n{} output {} {}", ps.number, slot,
+                ok ? fmt::format("takes the epilogue ({} stores)", stats.stores) : "declined: " + reason);
+    restore_7e3_supported_.emplace(key, ok);
+    return ok;
+  }
+
+  // The UNORM10 -> 7e3 epilogue on the FINAL selected pixel shader module (after texture signs; the FragCoord
+  // and depth transforms find the result through codes_modules_depth_). No fallback to the module without
+  // the epilogue: that would write raw UNORM10 values into the 7e3 image. SupportsRestore7e3 checked the
+  // library SPIR-V before the targets code chose this path, so a failure here is not expected.
+  VkShaderModule ModuleRestore7e3(VkShaderModule selected, uint32_t slots, const ShaderEntry& ps) {
+    if (!selected) return VK_NULL_HANDLE;
+    std::lock_guard<std::mutex> lock(modules_depth_mutex_);
+    if (const auto it = modules_restore_7e3_.find({selected, slots}); it != modules_restore_7e3_.end())
+      return it->second;
+    const auto source = codes_modules_depth_.find(selected);
+    VkShaderModule module = VK_NULL_HANDLE;
+    std::vector<uint32_t> transformed;
+    std::string reason = "selected module has no tracked SPIR-V";
+    me::native::Restore7e3Stats stats;
+    if (source != codes_modules_depth_.end()) {
+      const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
+      if (me::native::TransformRestore7e3(code, slots, transformed, stats, reason)) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = transformed.size() * sizeof(uint32_t);
+        info.pCode = transformed.data();
+        if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) {
+          module = VK_NULL_HANDLE;
+          reason = "vkCreateShaderModule failure";
+        }
+      }
+    }
+    modules_restore_7e3_.emplace(std::make_pair(selected, slots), module);
+    if (!module) {
+      REXLOG_ERROR("[native] restore into 7e3: PS n{} slots {:X}: epilogue failed ({}); draw rejected", ps.number,
+                   slots, reason);
+      return VK_NULL_HANDLE;
+    }
+    if (++restore_7e3_modules_ <= 16)
+      REXLOG_INFO("[native] restore into 7e3: PS n{} slots {:X} module with the UNORM10 -> 7e3 epilogue ({} "
+                  "stores, {} words)", ps.number, slots, stats.stores, transformed.size());
+    ModuleCodeDepth tracked;
+    tracked.owned = std::move(transformed);
+    codes_modules_depth_.insert_or_assign(module, std::move(tracked));
+    return module;
+  }
+
+  // masseffect_native_velocity_16_16: the k_16_16 encode epilogue on the final selected pixel shader module, after
+  // restore-into-7e3 (the FragCoord and depth transforms find the result through codes_modules_depth_). If the
+  // module stores none of the selected outputs, or the transform declines its shape, the selected module is used
+  // as is and the reason is logged: such a draw stores the plain UNORM value, as without the mode.
+  VkShaderModule ModuleFixed16(VkShaderModule selected, uint32_t slots, const ShaderEntry& ps) {
+    if (!selected) return VK_NULL_HANDLE;
+    std::lock_guard<std::mutex> lock(modules_depth_mutex_);
+    if (const auto it = modules_fixed16_.find({selected, slots}); it != modules_fixed16_.end()) return it->second;
+    const auto source = codes_modules_depth_.find(selected);
+    VkShaderModule module = VK_NULL_HANDLE;
+    std::vector<uint32_t> transformed;
+    std::string reason = "selected module has no tracked SPIR-V";
+    me::native::Fixed16Stats stats;
+    uint32_t missing = 0;
+    bool ok = false;
+    if (source != codes_modules_depth_.end()) {
+      const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
+      ok = me::native::TransformFixed16Encode(code, slots, transformed, stats, missing, reason);
+      if (ok && stats.stores) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = transformed.size() * sizeof(uint32_t);
+        info.pCode = transformed.data();
+        if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) {
+          module = VK_NULL_HANDLE;
+          ok = false;
+          reason = "vkCreateShaderModule failure";
+        }
+      }
+    }
+    if (!ok || !stats.stores) {
+      modules_fixed16_.emplace(std::make_pair(selected, slots), selected);
+      if (!ok)
+        REXLOG_ERROR("[native] k_16_16 encode: PS n{} slots {:X}: epilogue failed ({}); plain output kept",
+                     ps.number, slots, reason);
+      else
+        REXLOG_INFO("[native] k_16_16 encode: PS n{} slots {:X}: no store to encode", ps.number, slots);
+      return selected;
+    }
+    modules_fixed16_.emplace(std::make_pair(selected, slots), module);
+    if (++fixed16_modules_ <= 16)
+      REXLOG_INFO("[native] k_16_16 encode: PS n{} slots {:X} module with the fixed-point -32...32 epilogue ({} "
+                  "stores, {} words{})", ps.number, slots, stats.stores, transformed.size(),
+                  missing ? fmt::format(", slots {:X} not stored", missing) : std::string());
+    ModuleCodeDepth tracked;
+    tracked.owned = std::move(transformed);
+    codes_modules_depth_.insert_or_assign(module, std::move(tracked));
+    return module;
+  }
+
+  // masseffect_diag_velocity: the UE3 motion blur pixel shader. Its original container carries the constant table
+  // with the parameter names; both names together identify MotionBlurShader whatever the package numbering is.
+  // Bit 0 = MotionBlurShader (DynamicVelocityParameters + VelocityBuffer), bit 1 = a velocity draw PS
+  // (IndividualVelocityScale: VelocityShader, writes the per-object screen motion into the k_16_16 buffer).
+  static constexpr uint8_t kRoleMotionBlur = 1, kRoleVelocityWriter = 2;
+  uint8_t VelocityRole(const ShaderEntry& ps) {
+    if (const auto it = motion_blur_ps_.find(ps.number); it != motion_blur_ps_.end()) return it->second;
+    uint8_t role = 0;
+    if (ps.shader) {
+      const auto& o = ps.shader->original;
+      const auto has = [&](std::string_view name) {
+        return std::search(o.begin(), o.end(), name.begin(), name.end()) != o.end();
+      };
+      if (has("DynamicVelocityParameters") && has("VelocityBuffer")) role |= kRoleMotionBlur;
+      if (has("IndividualVelocityScale")) role |= kRoleVelocityWriter;
+    }
+    motion_blur_ps_.emplace(ps.number, role);
+    if (role & kRoleMotionBlur)
+      REXLOG_INFO("[native] velocity diag: motion blur PS identified by content: n{}", ps.number);
+    return role;
+  }
+  bool IsMotionBlurPs(const ShaderEntry& ps) {
+    if (const int32_t forced = REXCVAR_GET(masseffect_diag_velocity_blur_ps); forced > 0)
+      return ps.number == uint32_t(forced);
+    return (VelocityRole(ps) & kRoleMotionBlur) != 0;
+  }
+
+  /*
+   * masseffect_native_motion_blur_source_guard / masseffect_diag_blur_source (docs/image-defects-feros.md 3.8).
+   * After the sampler loop of the UE3 motion blur draw (one per frame): every 2D texture the targets serve from a
+   * resolve is prepared once more, bypassing the sampler caches, and the slot that gives is compared with the slot the
+   * loop bound. A difference is a stale binding (a cache entry that outlived a change of the image behind that
+   * address); the guard then binds the fresh slot and drops the cache entries that gave the old one. The targets log
+   * each texture's provenance (masseffect_diag_blur_source). The extra PrepareTexture of a resolved fetch is a map
+   * lookup (ResolvedTexture) and a view lookup (SlotView): what any cache miss does. A failed preparation keeps the
+   * loop's binding.
+   */
+  void CheckMotionBlurSources(const ShaderEntry& ps, const uint32_t* r, uint32_t* shared,
+                              VkDeviceSize& bytes_textures) {
+    const bool guard = REXCVAR_GET(masseffect_native_motion_blur_source_guard);
+    for (const SamplerShader& sampler : ps.samplers) {
+      if (sampler.register_value >= 16) continue;
+      const uint32_t reg = uint32_t(sampler.register_value);
+      const uint32_t* fetch = r + kRegFetch + reg * 6;
+      if ((fetch[0] & 0x3) != uint32_t(xenos::FetchConstantType::kTexture) ||
+          ((fetch[5] >> 9) & 0x3) != uint32_t(xenos::DataDimension::k2DOrStacked))
+        continue;
+      if (context_->ResolvedImageNow((fetch[1] & 0xFFFFF000u) & 0x1FFFFFFFu) == VK_NULL_HANDLE) {
+        context_->NoteMotionBlurFetch(ps.number, reg, fetch, false);  // not served from a resolve
+        continue;
+      }
+      uint32_t slot_texture = 0, heap = 0, host_width = 0, host_height = 0;
+      bool punctual = false;
+      uint64_t valid_until = frame_;
+      const bool failed_before = me_resolved_fetch_failed_this_draw_;
+      prepared_resolved_ = false;
+      prepare_kind_ = kPrepareOther;
+      me_resolve_fetch_sampler_ = reg;
+      PrepareTexture(fetch, slot_texture, heap, bytes_textures, punctual, valid_until, host_width, host_height);
+      const bool failed = me_resolved_fetch_failed_this_draw_ && !failed_before;
+      me_resolved_fetch_failed_this_draw_ = failed_before;
+      if (failed || heap != 0 || !slot_texture) {
+        context_->NoteMotionBlurFetch(ps.number, reg, fetch, false);
+        continue;
+      }
+      const bool stale = (shared[reg] & 0xFFFFFFu) != (slot_texture & 0xFFFFFFu);  // heap 0: 2D textures
+      context_->NoteMotionBlurFetch(ps.number, reg, fetch, stale);
+      if (!stale || !guard) continue;
+      const uint32_t old_slot = shared[reg] & 0xFFFFFFu;
+      slot_texture |= uint32_t(RemappedSigns(fetch)) << 24;
+      shared[reg] = slot_texture;
+      shared[48 + reg] = SlotSampler(fetch, punctual);
+      WriteInvSize(shared, reg, host_width, host_height);
+      cache_samplers_[reg].frame = UINT64_MAX;
+      cache_samplers_[reg].valid_until = 0;
+      CacheSampler& per_fetch = cache_fetch_[XXH3_64bits(fetch, sizeof(uint32_t) * 6) & (cache_fetch_.size() - 1)];
+      per_fetch.frame = UINT64_MAX;
+      per_fetch.valid_until = 0;
+      if (++motion_blur_rebinds_ <= 64 || (motion_blur_rebinds_ & 255) == 0)
+        REXLOG_WARN("[native] motion blur source guard: PS n{} t{} {:08X} was bound to slot {} but the resolve there "
+                    "now gives slot {}; bound again ({} so far, frame {})",
+                    ps.number, reg, fetch[1] & 0xFFFFF000u, old_slot, slot_texture & 0xFFFFFFu,
+                    motion_blur_rebinds_, frame_);
+    }
+  }
+
+  /*
+   * masseffect_native_motion_blur_frame_fix (docs/image-defects-feros.md 3.7). `bank` is the guest PS constant
+   * bank (shader-relative cN = words 4N..4N+3), `out` receives the patched copy of its first `bytes` bytes.
+   * Returns false (and leaves `out` unused) when nothing changes, so the draw uploads the guest bank as before.
+   *
+   *  - velocity draw (k_16_16 target, IndividualVelocityScale): d = (pos - prev pos) * c1.xy is encoded as
+   *    0.5 + 0.5 * d / max(|d|, 1); bit 1 scales c1.xy by k = min(1, ref / frame time), so the stored motion is the
+   *    one a 30 fps frame would have (the |d| <= 1 MaxVelocity normalization still applies after it).
+   *  - motion blur PS: static v = clamp((pos - prev pos) * c10.xy, -c10.zw, c10.zw), dynamic v = texel.xy * c11.xy +
+   *    c11.zw (no clamp), both then times |v / c10.zw|^2, 5 taps over 0.8 v. Bit 1: c10.xy *= k (the dynamic part
+   *    was scaled at the encode). Bit 2: c11.x/z and c11.y/w shrunk so that the decode range 0.5|c11.xy| is at
+   *    most c10.zw (UE3 builds c11 = (2Mx, -2My, -Mx, My) from the same MaxVelocity, so this is a no-op unless
+   *    the constants are inconsistent). Bit 4: frame time > cut ms = camera cut: c10.xy = 0 and c11 = 0, every
+   *    tap lands on the pixel itself (UE3 resets the previous transforms on a cut, so nothing blurs).
+   */
+  bool PatchMotionBlurConstants(const ShaderEntry& ps, bool velocity_target, const uint32_t* bank, uint32_t bytes,
+                                uint32_t* out) {
+    const int32_t fix = motion_blur_fix_;
+    const uint8_t role = VelocityRole(ps);
+    const bool blur = (role & kRoleMotionBlur) != 0 && bytes >= 12 * 16;
+    const bool writer = (role & kRoleVelocityWriter) != 0 && velocity_target && bytes >= 2 * 16;
+    if (!blur && !writer) return false;
+    const double frame_ms = context_->SwapIntervalMs();
+    const double ref_ms = std::max(1.0, REXCVAR_GET(masseffect_native_motion_blur_ref_ms));
+    const float k = (fix & 1) && frame_ms > ref_ms ? float(ref_ms / frame_ms) : 1.0f;
+    const bool cut = (fix & 4) && frame_ms > REXCVAR_GET(masseffect_native_motion_blur_cut_ms);
+    std::memcpy(out, bank, bytes);
+    const auto get = [&](uint32_t i) { return std::bit_cast<float>(out[i]); };
+    const auto set = [&](uint32_t i, float v) { out[i] = std::bit_cast<uint32_t>(v); };
+    if (writer && !blur) {
+      if (k == 1.0f || cut) return false;  // on a cut the blur draw zeroes everything anyway
+      set(4, get(4) * k);
+      set(5, get(5) * k);
+      return true;
+    }
+    // c10 = words 40-43, c11 = words 44-47.
+    const float before[8] = {get(40), get(41), get(42), get(43), get(44), get(45), get(46), get(47)};
+    bool clamped = false;
+    if (cut) {
+      set(40, 0.0f);
+      set(41, 0.0f);
+      for (uint32_t i = 44; i < 48; ++i) set(i, 0.0f);
+    } else {
+      if (k != 1.0f) {
+        set(40, get(40) * k);
+        set(41, get(41) * k);
+      }
+      if (fix & 2) {
+        for (uint32_t axis = 0; axis < 2; ++axis) {
+          const float range = 0.5f * std::fabs(get(44 + axis));
+          const float max_velocity = std::fabs(get(42 + axis));
+          if (range > max_velocity && range > 0.0f && std::isfinite(range)) {
+            const float shrink = max_velocity / range;
+            set(44 + axis, get(44 + axis) * shrink);
+            set(46 + axis, get(46 + axis) * shrink);
+            clamped = true;
+          }
+        }
+      }
+    }
+    if (std::memcmp(out + 40, bank + 40, 8 * sizeof(uint32_t)) == 0) return false;
+    if (motion_blur_fix_lines_ < 400 && (cut || clamped || k < 0.95f)) {
+      ++motion_blur_fix_lines_;
+      REXLOG_INFO("[native] motion blur fix: PS n{} frame {:.1f} ms, k {:.3f}{}{}: c10 {} {} {} {} -> {} {} {} {}, "
+                  "c11 {} {} {} {} -> {} {} {} {}", ps.number, frame_ms, k, cut ? ", camera cut" : "",
+                  clamped ? ", c11 clamped to MaxVelocity" : "", before[0], before[1], before[2], before[3],
+                  get(40), get(41), get(42), get(43), before[4], before[5], before[6], before[7], get(44), get(45),
+                  get(46), get(47));
+    }
+    return true;
   }
 
   VkShaderModule Module7e3(const ShaderEntry& entry, uint32_t outputs_mask) {
@@ -10655,7 +12421,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         raw.topology != canonical.topology || raw.specialization != canonical.specialization ||
         raw.rasterization != canonical.rasterization || raw.signs_low != canonical.signs_low ||
         raw.signs_high != canonical.signs_high || raw.signs_heaps != canonical.signs_heaps ||
-        raw.fill2 != canonical.fill2 ||
+        raw.fill2 != canonical.fill2 || raw.vs_fold != canonical.vs_fold ||
+        !Equal(raw.vs_values, canonical.vs_values, sizeof(raw.vs_values)) ||
         !Equal(raw.formats, canonical.formats, sizeof(raw.formats))) {
       field = "shaders, input, topology, specialization, rasterization or formats";
     } else {
@@ -11250,7 +13017,12 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       Warn(50, "pipeline fingerprint collision");
       return VK_NULL_HANDLE;
     }
+    // Specialized pipeline still compiling in the background: the generic one (masseffect_native_pipelines_async_specialized).
+    if (VkPipeline generic = VK_NULL_HANDLE; AsyncSpecializedPending(key, entry, p, fingerprint, generic)) {
+      return generic;
+    }
     VkShaderModule vs = (key.specialization & kSpecRectangle) ? ModuleRectangle(*p.vs) : ModuleFor(*p.vs);
+    if (!(key.specialization & kSpecRectangle)) vs = ModuleVsConstants(vs, key, *p.vs);
     VkShaderModule ps = VK_NULL_HANDLE;
     if (key.ps && (key.specialization & kSpecTarget7e3)) {
       const uint32_t mask_7e3 =
@@ -11264,6 +13036,27 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       ps = ModuleFor(*p.ps);
     }
     if (key.ps) ps = ModuleTextureSigns(ps, key, *p.ps);
+    if (key.ps && (key.signs_heaps & kKeyPsRewrites)) {
+      ps = ModulePsDescriptors(ps, key, *p.ps);
+      if (!ps) {
+        Reject(51, "PS descriptor rewrite failed");
+        return VK_NULL_HANDLE;
+      }
+    }
+    if (key.ps && (key.specialization & kSpecRestore7e3)) {
+      ps = ModuleRestore7e3(ps, (key.specialization & kSpecRestore7e3) >> kSpecRestore7e3Displacement, *p.ps);
+      if (!ps) {
+        Reject(51, "PS not supported by the restore-into-7e3 epilogue");
+        return VK_NULL_HANDLE;
+      }
+    }
+    if (key.ps && (key.specialization & kSpecFixed16)) {
+      ps = ModuleFixed16(ps, (key.specialization & kSpecFixed16) >> kSpecFixed16Displacement, *p.ps);
+      if (!ps) {
+        Reject(51, "could not create the k_16_16 encode module");
+        return VK_NULL_HANDLE;
+      }
+    }
     if (key.ps && ((key.specialization & kSpecRasterGridX) ||
                     (key.rasterization & me::native::kNativeMsaa2PhaseProbe))) {
       ps = ModuleGuestFragCoordXY(ps, key, p.vs, p.ps);
@@ -11284,7 +13077,14 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     uint32_t n_colors = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     const auto creation_start = std::chrono::steady_clock::now();
-    if (CreatePipelineVulkan(key, entry, vs, ps, pass_rp_, true, pipeline, n_colors) != VK_SUCCESS) {
+    // masseffect_native_pipelines_async_specialized: found in the Vulkan cache (kept below as usual), or deferred to
+    // the background thread (the draw gets the generic pipeline, nothing is stored under this key yet).
+    const AsyncDecision async = AsyncSpecializedDefer(key, entry, p, vs, ps, fingerprint, pipeline, n_colors);
+    if (async == kAsyncFallback) {
+      return pipeline;
+    }
+    if (async != kAsyncCreated &&
+        CreatePipelineVulkan(key, entry, vs, ps, pass_rp_, true, pipeline, n_colors) != VK_SUCCESS) {
       Reject(53, "could not create a pipeline");
       pipeline = VK_NULL_HANDLE;
     } else {
@@ -11319,7 +13119,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
    */
   VkResult CreatePipelineVulkan(const PipelineKey& key, const VerticesEntry& entry, VkShaderModule vs,
                                VkShaderModule ps, VkRenderPass pass, bool warn, VkPipeline& pipeline,
-                               uint32_t& n_colors_output) {
+                               uint32_t& n_colors_output, VkPipelineCreateFlags flags = 0) {
     const VkSpecializationMapEntry map{0, 0, sizeof(uint32_t)};
     const VkSpecializationInfo specialization{1, &map, sizeof(uint32_t), &key.specialization};
     // Vertex stage: also constant 60 = the outputs the pixel shader reads (ignored by older packages).
@@ -11393,6 +13193,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
 
     VkGraphicsPipelineCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    info.flags = flags;  // FAIL_ON_PIPELINE_COMPILE_REQUIRED for the cache probe of AsyncSpecializedDefer
     info.stageCount = (key.ps || (key.specialization & kSpecDepthFloat24Quantize)) ? 2 : 1;
     info.pStages = stages;
     info.pVertexInputState = &vertices;
@@ -11475,9 +13276,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       }
       written_list_ = std::move(data);  // the writer thread rewrites it unchanged if only the cache changes
     }
-    state_list_.assign(file_list_.size(), kPendingList);
     REXLOG_INFO("[native] C6 prewarm: {} pipelines in the list from {}{}{}", file_list_.size(),
                 path.string(), reason ? ": " : "", reason ? reason : "");
+    MergeShippedList();  // masseffect_native_pipelines_shipped_list (masseffect_pipelines_cold_members.inc)
+    state_list_.assign(file_list_.size(), kPendingList);
   }
 
   // Ring only (SaveCachePipelines): the file's list without the records the thread found missing their
@@ -11508,10 +13310,80 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     return data;
   }
 
+  /*
+   * Ring only, once, as soon as the library is loaded: before the preload and prewarm threads start (TryPrewarm
+   * calls it first) and before NotePipelineCreated compares any key against the list (it calls it too).
+   *
+   * key.vs / key.ps are library positions + 1 (PipelineFor: key.vs = p.vs->number + 1), and those shift whenever
+   * the shader package is rebuilt; the container fingerprints of the record do not. With stale numbers no ring key
+   * ever matched the list (every ring pipeline counted as new and was appended again, the MISMATCH guard never
+   * saw a listed pipeline). Here every record of file_list_ gets the current numbers of its fingerprints (the same
+   * PerFingerprint lookup as PrewarmedLoop), records whose shaders are not in this library are dropped, and so are
+   * records that become identical to an earlier one. index_list_ and state_list_ are rebuilt; the list is saved
+   * renumbered with the next cache save.
+   */
+  void RenumberPipelinesList() {
+    if (renumbered_list_) {
+      return;
+    }
+    const ShadersNative* library = ActiveLibrary();
+    if (!library || !library->loaded()) {
+      return;  // not yet
+    }
+    renumbered_list_ = true;
+    if (file_list_.empty()) {
+      return;
+    }
+    const size_t before = file_list_.size();
+    size_t renumbered = 0, no_shaders = 0, duplicates = 0;
+    std::vector<RegisterPipeline> kept;
+    kept.reserve(before);
+    std::unordered_map<uint64_t, size_t> index;
+    index.reserve(before + session_list_.size());
+    for (const RegisterPipeline& r0 : file_list_) {
+      RegisterPipeline r = r0;
+      // The same conditions as PrewarmedLoop's kListNoShader: a vertex shader entry, and a pixel shader entry
+      // when the key has one. Records without fingerprints (written before they existed) cannot be resolved.
+      const ShaderEntry* vs = library->PerFingerprint(r.vs_fingerprint);
+      const ShaderEntry* ps = r.key.ps ? library->PerFingerprint(r.ps_fingerprint) : nullptr;
+      if (!vs || !vs->vertices || !vs->shader || vs->shader->fingerprint != r.vs_fingerprint ||
+          (r.key.ps && (!ps || ps->vertices || !ps->shader || ps->shader->fingerprint != r.ps_fingerprint))) {
+        ++no_shaders;
+        continue;
+      }
+      const uint32_t number_vs = vs->number + 1;
+      const uint32_t number_ps = r.key.ps ? ps->number + 1 : 0;
+      if (r.key.vs != number_vs || r.key.ps != number_ps) {
+        r.key.vs = number_vs;
+        r.key.ps = number_ps;
+        ++renumbered;
+      }
+      if (!index.emplace(XXH3_64bits(&r.key, sizeof(r.key)), kept.size()).second) {
+        ++duplicates;
+        continue;
+      }
+      kept.push_back(r);
+    }
+    // This session's records (none expected this early) stay marked as already recorded.
+    for (const RegisterPipeline& r : session_list_) {
+      index.emplace(XXH3_64bits(&r.key, sizeof(r.key)), SIZE_MAX);
+    }
+    file_list_ = std::move(kept);
+    index_list_ = std::move(index);
+    state_list_.assign(file_list_.size(), kPendingList);
+    if (renumbered || no_shaders || duplicates) {
+      ++list_no_save_;  // saved renumbered (and without the dropped records) with the next cache save
+    }
+    REXLOG_INFO("[native] C6 prewarm: list renumbered: {} records, {} renumbered, {} without shaders, {} duplicates "
+                "dropped ({} kept)",
+                before, renumbered, no_shaders, duplicates, file_list_.size());
+  }
+
   // Ring only (PipelineFor), with every pipeline it creates: the measurement for the report and the guard,
   // and new ones go to the list.
   void NotePipelineCreated(const PipelineKey& key, const VerticesEntry& entry, const SubmissionDraw& p,
                             bool created, uint64_t ns) {
+    RenumberPipelinesList();  // once: the list's shader numbers must be this library's before comparing keys
     const uint64_t fingerprint = XXH3_64bits(&key, sizeof(key));
     if (const auto it = index_list_.find(fingerprint); it != index_list_.end()) {
       const size_t j = it->second;
@@ -11623,6 +13495,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
 
   // Ring only, on each submission: starts the thread once, as soon as the library is loaded.
   void TryPrewarm() {
+    RenumberPipelinesList();  // once, before the preload and prewarm threads read file_list_
     TryPreloadShaders();
     if (prewarmed_decided_) {
       return;
@@ -11645,25 +13518,59 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     prewarmed_library_ = library;
     prewarmed_eds_ = eds_mode_;  // the ring would not request those of another dynamic state mode
     prewarmed_start_ = std::chrono::steady_clock::now();
+    // masseffect_native_pipelines_prewarm_threads: every thread claims the next record of the list; the records
+    // done are published in order (prewarmed_until_) by PrewarmPublish.
+    const uint32_t threads = uint32_t(std::clamp(REXCVAR_GET(masseffect_native_pipelines_prewarm_threads), 1, 3));
+    prewarm_done_flags_ = std::make_unique<std::atomic<uint8_t>[]>(std::max<size_t>(file_list_.size(), 1));
+    for (size_t i = 0; i < file_list_.size(); ++i) prewarm_done_flags_[i].store(0, std::memory_order_relaxed);
+    const int ring_core = RexSwitchCurrentCore();
+    prewarm_running_.store(threads, std::memory_order_relaxed);
     try {
-      prewarmed_thread_ = std::thread([this] { PrewarmedLoop(); });
+      prewarmed_thread_ = std::thread([this, ring_core] { PrewarmedLoop(0, ring_core); });
       REXLOG_INFO("[native] C6 prewarm: thread created for {} pipelines from the list",
                   file_list_.size());
     } catch (const std::system_error& error) {
       REXLOG_WARN("[native] C6 prewarm: could not create the thread ({}); not prewarming", error.what());
+      return;
     }
+    for (uint32_t k = 1; k < threads; ++k) {
+      try {
+        prewarm_helpers_.emplace_back([this, k, ring_core] { PrewarmedLoop(k, ring_core); });
+      } catch (const std::system_error& error) {
+        REXLOG_WARN("[native] C6 prewarm: could not create extra thread {} ({})", k, error.what());
+        if (PrewarmWorkerEnd()) prewarmed_finished_.store(true, std::memory_order_release);  // counts as ended
+      }
+    }
+    if (threads > 1) REXLOG_INFO("[native] C6 prewarm: {} threads", 1 + prewarm_helpers_.size());
   }
+
+  // Prewarm threads: after state_list_[i] is written, mark it done and advance prewarmed_until_ over every record
+  // done in order (the readers only look at state_list_[j] for j < prewarmed_until_).
+  void PrewarmPublish(size_t i) {
+    prewarm_done_flags_[i].store(1, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(prewarm_publish_mutex_);
+    size_t until = prewarmed_until_.load(std::memory_order_relaxed);
+    const size_t n = file_list_.size();
+    while (until < n && prewarm_done_flags_[until].load(std::memory_order_acquire)) ++until;
+    prewarmed_until_.store(until, std::memory_order_release);
+  }
+
+  // Prewarm threads, when one ends: true for the last one.
+  bool PrewarmWorkerEnd() { return prewarm_running_.fetch_sub(1, std::memory_order_acq_rel) == 1; }
 
   // The thread. It only reads file_list_, the library, the layout and the cache; it writes
   // state_list_[i] before publishing prewarmed_until_ = i + 1, and its atomic counters. Its modules
   // and render pass are its own and it destroys them when done.
-  void PrewarmedLoop() {
-    rex::thread::set_current_thread_name("MASSEFFECT pipeline prewarm");
+  void PrewarmedLoop(uint32_t worker, int ring_core) {
+    rex::thread::set_current_thread_name(worker ? "MASSEFFECT pipeline prewarm+" : "MASSEFFECT pipeline prewarm");
     int32_t priority = -1;
     // The lowest priority the system accepts, and never above the guest's (0x3B): compiling at the priority
     // threads are born with would take the core from the game and the ring. If none is accepted, nothing is
-    // compiled.
+    // compiled. masseffect_native_pipelines_prewarm_priority asks for another one first.
+    const int32_t wanted = REXCVAR_GET(masseffect_native_pipelines_prewarm_priority);
+    if (wanted >= 0 && RexSwitchSetCurrentThreadPriorityOk(int(wanted))) priority = wanted;
     for (const int32_t candidate : {0x3F, 0x3E, 0x3D, 0x3C, 0x3B}) {
+      if (priority >= 0) break;
       if (RexSwitchSetCurrentThreadPriorityOk(int(candidate))) {
         priority = candidate;
         break;
@@ -11672,9 +13579,11 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (priority < 0) {
       REXLOG_WARN("[native] C6 prewarm: the system accepts no priority from 0x3B to 0x3F: not "
                   "prewarming");
-      prewarmed_finished_.store(true, std::memory_order_release);
+      if (PrewarmWorkerEnd()) prewarmed_finished_.store(true, std::memory_order_release);
       return;
     }
+    // The extra threads (masseffect_native_pipelines_prewarm_threads) prefer a core other than the ring's.
+    if (worker) RexSwitchSetCurrentThreadCore(worker == 1 ? (ring_core == 2 ? 1 : 2) : (ring_core == 0 ? 1 : 0));
     prewarmed_priority_.store(priority, std::memory_order_relaxed);
     const ShadersNative& library = *prewarmed_library_;
     std::unordered_map<uint64_t, VkShaderModule> modules;  // (variant << 32) | number
@@ -11746,7 +13655,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       return normal(e);
     };
     const auto pixel = [&](const PipelineKey& key, const ShaderEntry& e) {
-      auto selected = ModuleTextureSigns(pixel_no_half(key, e), key, e);
+      auto selected = ModulePsDescriptors(ModuleTextureSigns(pixel_no_half(key, e), key, e), key, e);
+      if (!selected) return VkShaderModule(VK_NULL_HANDLE);
       if ((key.specialization & kSpecRasterGridX) ||
           (key.rasterization & me::native::kNativeMsaa2PhaseProbe)) {
         selected = ModuleGuestFragCoordXY(selected, key, nullptr, &e);
@@ -11756,13 +13666,20 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         return ModuleDepthQuantize(selected, bool(key.specialization & kSpecDepthFloat24Round));
       return (key.specialization & kSpecDepthFloat24Half) ? ModuleDepthHalf(selected) : selected;
     };
+    // This thread's counts, added to the shared atomics as they change.
     uint32_t done = 0, compiled = 0, no_shader = 0, other_mode = 0, failed = 0;
     uint64_t ns_compiled = 0;
     const size_t n = file_list_.size();
-    for (size_t i = 0; i < n; ++i) {
+    for (;;) {
       if (prewarmed_stop_.load(std::memory_order_relaxed)) {
         break;
       }
+      const size_t i = prewarm_next_.fetch_add(1, std::memory_order_relaxed);
+      if (i >= n) {
+        break;
+      }
+      const uint32_t before[5] = {done, compiled, no_shader, other_mode, failed};
+      const uint64_t ns_before = ns_compiled;
       const RegisterPipeline& r = file_list_[i];
       uint8_t state = kFailedList;
       // Package order changes whenever discovery adds a shader. Prefer the stable container fingerprint;
@@ -11775,9 +13692,12 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           (r.key.ps && (!ps || ps->vertices || !ps->shader || ps->shader->fingerprint != r.ps_fingerprint))) {
         state = kListNoShader;
         ++no_shader;
-      } else if (r.key.fill2 != prewarmed_eds_ ||
+      } else if (r.key.fill2 != prewarmed_eds_ || (r.key.specialization & (kSpecRestore7e3 | kSpecFixed16)) ||
                  ((r.key.specialization & kSpecSignsFolded) &&
-                  !REXCVAR_GET(masseffect_native_fold_texture_signs))) {
+                  !REXCVAR_GET(masseffect_native_fold_texture_signs)) ||
+                 ((r.key.specialization & kSpecVsFolded) &&
+                  !REXCVAR_GET(masseffect_native_fold_vs_constants)) ||
+                 PsDescriptorsRecordSkipped(r.key)) {
         // Another dynamic state mode, or texture signs folded while this session does not fold them: the
         // ring would never ask for this key. (The opposite case cannot be told apart from a pixel shader
         // with nothing to fold, so those records are still prewarmed.)
@@ -11795,7 +13715,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
             it = modules.emplace(module_key, module).first;
           }
           module_vs = it->second;
-        } else module_vs = normal(*vs);
+        } else module_vs = ModuleVsConstants(normal(*vs), r.key, *vs);
         const VkShaderModule module_ps = r.key.ps ? pixel(r.key, *ps) :
             (r.key.specialization & kSpecDepthFloat24Quantize) ?
                 ModuleDepthQuantize(VK_NULL_HANDLE, bool(r.key.specialization & kSpecDepthFloat24Round), true) : VK_NULL_HANDLE;
@@ -11838,13 +13758,13 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         }
       }
       state_list_[i] = state;
-      prewarmed_done_.store(done, std::memory_order_relaxed);
-      prewarmed_compiled_.store(compiled, std::memory_order_relaxed);
-      prewarmed_ns_compiled_.store(ns_compiled, std::memory_order_relaxed);
-      prewarmed_no_shader_.store(no_shader, std::memory_order_relaxed);
-      prewarmed_other_mode_.store(other_mode, std::memory_order_relaxed);
-      prewarmed_failed_.store(failed, std::memory_order_relaxed);
-      prewarmed_until_.store(i + 1, std::memory_order_release);
+      prewarmed_done_.fetch_add(done - before[0], std::memory_order_relaxed);
+      prewarmed_compiled_.fetch_add(compiled - before[1], std::memory_order_relaxed);
+      prewarmed_ns_compiled_.fetch_add(ns_compiled - ns_before, std::memory_order_relaxed);
+      prewarmed_no_shader_.fetch_add(no_shader - before[2], std::memory_order_relaxed);
+      prewarmed_other_mode_.fetch_add(other_mode - before[3], std::memory_order_relaxed);
+      prewarmed_failed_.fetch_add(failed - before[4], std::memory_order_relaxed);
+      PrewarmPublish(i);
     }
     for (const auto& [key, shader_module] : modules) {
       if (shader_module != VK_NULL_HANDLE) {
@@ -11857,6 +13777,15 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         dfn_.vkDestroyRenderPass(device_, pass, nullptr);
       }
     }
+    if (!PrewarmWorkerEnd()) {
+      return;  // another prewarm thread is still working: the last one reports
+    }
+    done = prewarmed_done_.load(std::memory_order_relaxed);
+    compiled = prewarmed_compiled_.load(std::memory_order_relaxed);
+    ns_compiled = prewarmed_ns_compiled_.load(std::memory_order_relaxed);
+    no_shader = prewarmed_no_shader_.load(std::memory_order_relaxed);
+    other_mode = prewarmed_other_mode_.load(std::memory_order_relaxed);
+    failed = prewarmed_failed_.load(std::memory_order_relaxed);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - prewarmed_start_).count();
     REXLOG_INFO("[native] C6 prewarm: {} in {:.1f} s, priority {:#x}: {} of {} pipelines "
@@ -11919,6 +13848,231 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (prewarmed_thread_.joinable()) {
       prewarmed_thread_.join();  // at most, as long as the pipeline being compiled takes
     }
+    for (std::thread& helper : prewarm_helpers_) {
+      if (helper.joinable()) helper.join();  // masseffect_native_pipelines_prewarm_threads
+    }
+  }
+
+  /*
+   * masseffect_native_query_occlusion_depth (docs/occlusion-queries.md section E).
+   *
+   * UE3 issues its occlusion query boxes after the depth prepass and before the base pass. With
+   * masseffect_native_skip_prepass the scene depth holds only the clear when the boxes are drawn, so every box
+   * passes. Here the skipped prepass draws are recorded into a private twin of their depth view (same size,
+   * format and raster grid, so the same render pass formats and pipelines), and the boxes of a view whose twin was
+   * cleared this frame test against the twin. The twin is never sampled, resolved, aliased or published: the
+   * scene depth and the picture are what they are without the option.
+   */
+  struct OcclusionDepth {
+    uint64_t scene_key = 0;  // keys[4] of the scene depth view (without kKeyOcclusionDepth)
+    ImageNative image;
+    uint64_t cleared_serial = 0;  // last guest clear applied to this twin
+    uint64_t prepass_swap = UINT64_MAX;  // Swap ordinal of the last prepass draw recorded into it
+  };
+  struct OcclusionClear {
+    uint32_t base = 0, format = 0, pitch = 0;
+    uint64_t swap = 0;  // Swap ordinal of the clear
+    uint64_t serial = 0;
+    float guest_depth = 0.0f;
+    uint32_t stencil = 0;
+  };
+  enum : uint32_t {
+    kOcclusionPrepass = 0,       // prepass draws recorded into a twin
+    kOcclusionPrepassDropped,    // skipped prepass draws dropped (no clear of the surface this frame, no depth write)
+    kOcclusionBoxes,             // box draws on a twin that received prepass draws this frame
+    kOcclusionBoxesNoPrepass,    // box draws on a twin cleared this frame but without prepass draws yet
+    kOcclusionBoxesScene,        // box draws left on the scene depth (no clear of the surface this frame)
+    kOcclusionClearsNoted,       // whole-surface depth clears reported by the render target code
+    kOcclusionClearsApplied,     // clears recorded into a twin
+    kOcclusionCounts,
+  };
+
+  // Clears are matched by base, format and pitch in samples along X (a 4x MSAA surface has half the pixel pitch):
+  // D3D clears a 1x surface as a 4x rectangle of half the width (NoteDepthClearDraw in the render target code).
+  static uint32_t SamplesPitch(uint32_t pitch, uint32_t surface_info) {
+    return pitch << (((surface_info >> 16) & 3) >= 2 ? 1 : 0);
+  }
+
+  const OcclusionClear* OcclusionDepthClear(uint32_t base, uint32_t format, uint32_t pitch) const {
+    for (const OcclusionClear& c : occlusion_clears_) {
+      if (c.base == base && c.format == format && c.pitch == pitch) return &c;
+    }
+    return nullptr;
+  }
+
+  bool OcclusionDepthClearedThisSwap(uint32_t base, uint32_t format, uint32_t pitch) const {
+    const OcclusionClear* c = OcclusionDepthClear(base, format, pitch);
+    return c && c->swap == swaps_seen_;
+  }
+
+  OcclusionDepth* OcclusionDepthFind(uint64_t scene_key) {
+    for (const std::unique_ptr<OcclusionDepth>& twin : occlusion_depths_) {
+      if (twin->scene_key == scene_key) return twin.get();
+    }
+    return nullptr;
+  }
+
+  // The twin of a scene depth view; created (and moved to GENERAL) on first use. Called from BeginPass, outside
+  // a render pass. nullptr on failure, which turns the option off for the rest of the session.
+  OcclusionDepth* OcclusionDepthFor(uint64_t scene_key, const ImageNative& scene) {
+    OcclusionDepth* twin = OcclusionDepthFind(scene_key);
+    if (twin && twin->image.width == scene.width && twin->image.height == scene.height &&
+        twin->image.format == scene.format && twin->image.raster_grid_x == scene.raster_grid_x) {
+      return twin;
+    }
+    const VkCommandBuffer cmd = context_->CommandsWork();
+    if (!cmd || !me::native::IsSingleSample(uint32_t(scene.sample_count))) {
+      occlusion_depth_on_ = false;
+      REXLOG_WARN("[native] occlusion depth: unsupported scene depth view {:016X}; option off", scene_key);
+      return nullptr;
+    }
+    if (twin) {
+      // The scene view was recreated with another size or format. The old twin may still be in flight: keep it
+      // until shutdown (a few MB, never more than once per view change).
+      occlusion_retired_.push_back(twin->image);
+      twin->image = ImageNative{};
+    } else {
+      occlusion_depths_.push_back(std::make_unique<OcclusionDepth>());
+      twin = occlusion_depths_.back().get();
+      twin->scene_key = scene_key;
+    }
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = scene.format;
+    info.extent = {scene.width, scene.height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;  // cleared inside its passes only
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ImageNative& image = twin->image;
+    VkDeviceSize bytes = 0;
+    if (!rex::ui::vulkan::util::CreateDedicatedAllocationImage(vulkan_device_, info,
+                                                               rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+                                                               image.image, image.memory, nullptr, &bytes)) {
+      image = ImageNative{};
+      occlusion_depth_on_ = false;
+      REXLOG_WARN("[native] occlusion depth: could not allocate {}x{} (format {}); option off", scene.width,
+                  scene.height, uint32_t(scene.format));
+      return nullptr;
+    }
+    VkImageViewCreateInfo info_view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    info_view.image = image.image;
+    info_view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    info_view.format = scene.format;
+    info_view.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+    if (dfn_.vkCreateImageView(device_, &info_view, nullptr, &image.view) != VK_SUCCESS) {
+      DestroyImage(image);
+      occlusion_depth_on_ = false;
+      REXLOG_WARN("[native] occlusion depth: could not create the view; option off");
+      return nullptr;
+    }
+    image.width = scene.width;
+    image.height = scene.height;
+    image.format = scene.format;
+    image.sample_count = VK_SAMPLE_COUNT_1_BIT;
+    image.accepts_target_of_copy = false;
+    image.edram_depth = scene.edram_depth;
+    image.depth_float24_half = scene.depth_float24_half;
+    image.edram_base = scene.edram_base;
+    image.raster_grid_x = scene.raster_grid_x;
+    image.edram_msaa_x = scene.edram_msaa_x;
+    image.edram_msaa_y = scene.edram_msaa_y;
+    image.prepared = true;
+    twin->cleared_serial = 0;  // content undefined: the next draw applies the frame's clear
+    twin->prepass_swap = UINT64_MAX;
+    occlusion_bytes_ += uint64_t(bytes);
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image.image;
+    barrier.subresourceRange = info_view.subresourceRange;
+    barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dfn_.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &barrier);
+    REXLOG_INFO("[native] occlusion depth: twin of depth view {:016X} created, {}x{} format {} ({:.1f} MB; {} "
+                "twins, {:.1f} MB in total)", scene_key, scene.width, scene.height, uint32_t(scene.format),
+                double(bytes) / 1048576.0, occlusion_depths_.size(), double(occlusion_bytes_) / 1048576.0);
+    return twin;
+  }
+
+  // Inside the twin's open pass: applies this frame's guest clear of the surface if the twin has not had it yet.
+  void ApplyOcclusionDepthClear(VkCommandBuffer cmd) {
+    OcclusionDepth* twin = pass_occlusion_depth_;
+    if (!twin || !active_pass_) return;
+    const uint32_t base = uint32_t(twin->scene_key >> 24) & 0xFFF;
+    const uint32_t format = uint32_t(twin->scene_key >> 16) & 0x1;
+    const uint32_t pitch = uint32_t(twin->scene_key) & 0x3FFF;
+    const OcclusionClear* c =
+        OcclusionDepthClear(base, format, pitch << (((twin->scene_key >> 40) & 3) >= 2 ? 1 : 0));
+    if (!c || c->serial == twin->cleared_serial) return;
+    twin->cleared_serial = c->serial;
+    twin->prepass_swap = UINT64_MAX;
+    VkClearAttachment clear{};
+    clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    clear.clearValue.depthStencil.depth =
+        std::clamp(me::native::GuestDepthToNative(c->guest_depth, twin->image.depth_float24_half), 0.0f, 1.0f);
+    clear.clearValue.depthStencil.stencil = c->stencil & 0xFF;
+    const VkClearRect rect{{{0, 0}, {pass_width_, pass_area_height_}}, 0, 1};
+    dfn_.vkCmdClearAttachments(cmd, 1, &clear, 1, &rect);
+    ++occlusion_depth_counts_[kOcclusionClearsApplied];
+  }
+
+  void NoteDepthClear(uint32_t base, uint32_t format, uint32_t pitch, float guest_depth,
+                      uint32_t stencil) override {
+    if (!occlusion_depth_on_) return;
+    ++occlusion_depth_counts_[kOcclusionClearsNoted];
+    OcclusionClear* c = const_cast<OcclusionClear*>(OcclusionDepthClear(base, format, pitch));
+    if (!c) {
+      if (occlusion_clears_.size() >= 16) occlusion_clears_.erase(occlusion_clears_.begin());
+      occlusion_clears_.push_back(OcclusionClear{base, format, pitch});
+      c = &occlusion_clears_.back();
+    }
+    c->swap = swaps_seen_;
+    c->serial = ++occlusion_clear_serial_;
+    c->guest_depth = guest_depth;
+    c->stencil = stencil;
+  }
+
+  void NoteSwap() override { ++swaps_seen_; }
+
+  // Every 10 s with the other ring reports.
+  void ReportOcclusionDepth() {
+    if (!occlusion_depth_on_ && !occlusion_depth_requested_) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_occlusion_).count() < 10) return;
+    last_report_occlusion_ = now;
+    std::array<uint64_t, kOcclusionCounts> d{};
+    for (uint32_t i = 0; i < kOcclusionCounts; ++i) {
+      d[i] = occlusion_depth_counts_[i] - occlusion_depth_previous_[i];
+      occlusion_depth_previous_[i] = occlusion_depth_counts_[i];
+    }
+    const uint64_t swaps = swaps_seen_ - swaps_report_occlusion_;
+    swaps_report_occlusion_ = swaps_seen_;
+    const double per = double(swaps ? swaps : 1);
+    MASSEFFECT_REPORT_RING(
+        "[native] occlusion depth{} ({} Swaps): {:.1f} prepass draws per Swap recorded into it, {:.1f} dropped "
+        "(surface not cleared this frame, or no depth write); box draws per Swap: {:.1f} on it after prepass "
+        "draws, {:.1f} on it without prepass draws, {:.1f} left on the scene depth; clears {} noted, {} applied; "
+        "{} twins, {:.1f} MB",
+        occlusion_depth_on_ ? "" : " (OFF after an error)", swaps, double(d[kOcclusionPrepass]) / per,
+        double(d[kOcclusionPrepassDropped]) / per, double(d[kOcclusionBoxes]) / per,
+        double(d[kOcclusionBoxesNoPrepass]) / per, double(d[kOcclusionBoxesScene]) / per,
+        d[kOcclusionClearsNoted], d[kOcclusionClearsApplied], occlusion_depths_.size(),
+        double(occlusion_bytes_) / 1048576.0);
+  }
+
+  void DestroyOcclusionDepths() {
+    // Shutdown only: the framebuffers on these views were destroyed with the others before.
+    for (const std::unique_ptr<OcclusionDepth>& twin : occlusion_depths_) DestroyImage(twin->image);
+    occlusion_depths_.clear();
+    for (ImageNative& image : occlusion_retired_) DestroyImage(image);
+    occlusion_retired_.clear();
   }
 
   void DestroyImage(ImageNative& image) {
@@ -11955,6 +14109,20 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   bool coherent_upload_ = false;
   uint64_t epoch_upload_ = 0;
   uint64_t frame_ = 0;
+  // masseffect_native_query_occlusion_depth (OcclusionDepth above). Ring thread only.
+  bool occlusion_depth_requested_ = false;  // the cvar
+  bool occlusion_depth_on_ = false;         // the cvar, query mode 2 or 3, and no error so far
+  std::vector<std::unique_ptr<OcclusionDepth>> occlusion_depths_;
+  std::vector<ImageNative> occlusion_retired_;  // twins replaced after a view change, destroyed at shutdown
+  std::vector<OcclusionClear> occlusion_clears_;  // last clear of each depth surface
+  uint64_t occlusion_clear_serial_ = 0;
+  uint64_t occlusion_bytes_ = 0;
+  uint64_t swaps_seen_ = 0;  // guest Swaps (NoteSwap)
+  OcclusionDepth* pass_occlusion_depth_ = nullptr;  // twin bound by the open pass, if any
+  uint32_t pass_area_height_ = 0;  // render area height of the open pass
+  std::array<uint64_t, kOcclusionCounts> occlusion_depth_counts_{}, occlusion_depth_previous_{};
+  uint64_t swaps_report_occlusion_ = 0;
+  std::chrono::steady_clock::time_point last_report_occlusion_{};
   // Fast untiling and its guard (see ReadLevel).
   static constexpr uint32_t kLevelsToCheck = 200;  // it used to be 2000
   static constexpr uint32_t kCheckAOfEach = 64;   // after the first ones, by sampling
@@ -11975,6 +14143,14 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   uint64_t checked_samples_ = 0;  // stable rechecks with both hashes, since start-up
   uint64_t samples_with_the_two_ = 0;  // the same, since the last report line
   uint64_t samples_hits_ = 0;     // decided on the sample alone
+  bool sample_after_change_ = true;  // masseffect_native_texture_sample_after_change (read with the sampling cvar)
+  bool requeue_uploads_ = REXCVAR_GET(masseffect_native_texture_requeue_uploads);  // read when the renderer is created
+  // masseffect_native_glyph_trace: read when the renderer is created; lines left; previous untiled bytes per page.
+  bool glyph_trace_ = REXCVAR_GET(masseffect_native_glyph_trace);
+  int64_t glyph_trace_left_ = REXCVAR_GET(masseffect_native_glyph_trace_lines);
+  std::unordered_map<uint32_t, std::vector<uint8_t>> glyph_trace_pages_;
+  std::unordered_set<uint64_t> glyph_trace_resolved_;
+  uint64_t requeued_uploads_ = 0;  // masseffect_native_texture_requeue_uploads: lost uploads queued again
   uint64_t distinct_samples_ = 0;    // the sample changed and the full path followed
   uint64_t bytes_sample_ = 0;
   uint64_t bytes_saved_sample_ = 0;
@@ -12116,6 +14292,25 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     VkShaderModule module = VK_NULL_HANDLE;  // null: nothing folded, the selected module is used
   };
   std::unordered_map<uint64_t, std::vector<ModuleTextureSignsEntry>> modules_texture_signs_;
+  // masseffect_native_fold_vs_constants
+  struct VsConstantsState {  // ring thread only
+    me::native::VertexConstantsInfo info;
+    bool valid = false;
+    bool over_budget = false;
+    std::vector<std::array<uint32_t, me::native::kVsConstantsMaxComponents + 1>> sets;  // values..., n
+  };
+  std::unordered_map<uint32_t, VsConstantsState> vs_constants_states_;  // by VS number
+  uint64_t vs_constants_analyzed_ = 0;
+  uint64_t vs_constants_sets_logged_ = 0;
+  struct ModuleVsConstantsEntry {
+    uint32_t values[me::native::kVsConstantsMaxComponents] = {};
+    uint32_t vs_fold = 0;
+    VkShaderModule module = VK_NULL_HANDLE;  // null: nothing folded, the selected module is used
+  };
+  std::mutex modules_vs_constants_mutex_;
+  std::unordered_map<const ShaderEntry*, std::vector<ModuleVsConstantsEntry>> modules_vs_constants_;
+  uint64_t vs_constants_modules_ = 0;  // under modules_vs_constants_mutex_
+  uint64_t vs_constants_fold_failures_ = 0;
   uint64_t signs_folded_modules_ = 0;  // under modules_depth_mutex_
   uint64_t signs_fold_failures_ = 0;
   std::unordered_map<const ShaderEntry*, me::native::RectangleShader> shaders_rectangle_;
@@ -12386,6 +14581,64 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   uint64_t me_constant_audit_mismatches_[2] = {};
   uint64_t me_constant_audit_bytes_[2] = {};
   uint64_t constants_vs_epoch_ = UINT64_MAX;
+  // masseffect_native_report_texture_uploads (measurement) and the round-3 switches (docs/ring-cpu-per-draw.md).
+  bool report_tex_up_ = false;
+  enum PrepareKind : uint8_t {
+    kPrepareOther = 0,      // not a texture, unsupported format, outside memory...
+    kPrepareResolved,       // answered by a resolved texture
+    kPrepareChecked,        // already checked this frame
+    kPrepareNotDue,         // its recheck is not due yet
+    kPreparePostponed,      // due, postponed by the per-frame budget
+    kPrepareSameSample,     // recheck: the sample is unchanged
+    kPrepareSameFull,       // recheck: the raw fingerprint is unchanged
+    kPrepareSameData,       // recheck: untiled again, same data
+    kPrepareChanged,        // new data queued for upload
+    kPrepareCreated,        // created (and its data prepared)
+    kPrepareKinds,
+  };
+  uint8_t prepare_kind_ = kPrepareOther;
+  // masseffect_native_texture_coherency (me_texture_coherency.h): -1 = not read yet, 0 off, 1 skip, 2 measure.
+  int32_t coherency_mode_ = -1;
+  bool coherency_early_ = false;
+  bool coherency_linear_ = false;  // masseffect_native_texture_coherency_linear
+  uint64_t coherency_max_undeclared_ = 4;
+  uint64_t coherency_exempted_ = 0, coherency_clean_changed_eligible_ = 0;
+  uint32_t coherency_full_every_ = 8;
+  int64_t coherency_verify_left_ = 0;
+  uint64_t coherency_verified_ = 0;
+  uint64_t coherency_skips_ = 0, coherency_bytes_skipped_ = 0, coherency_guards_ = 0, coherency_early_n_ = 0;
+  uint64_t coherency_clean_equal_ = 0, coherency_clean_changed_ = 0, coherency_dirty_equal_ = 0,
+           coherency_dirty_changed_ = 0, coherency_bytes_clean_equal_ = 0;
+  std::chrono::steady_clock::time_point coherency_report_{};
+  struct CoherencyReported {
+    uint64_t skips = 0, bytes_skipped = 0, guards = 0, early = 0, clean_equal = 0, clean_changed = 0, dirty_equal = 0,
+             dirty_changed = 0, bytes_clean_equal = 0, events = 0, empty = 0, bytes = 0, pages = 0,
+             clean_changed_eligible = 0, exempted = 0;
+    std::array<uint64_t, 4> sources{};
+  } coherency_reported_;
+  std::array<uint64_t, kPrepareKinds> prepare_n_{}, prepare_ns_{};
+  std::array<uint64_t, 7> up_ns_{};  // uploads stage parts on the timed draws
+  uint64_t up_timed_ = 0, up_bindings_ = 0, up_dedupe_hits_ = 0, up_copies_ = 0, up_bytes_copied_ = 0;
+  std::array<uint64_t, 2> up_constants_uploads_{}, up_constants_bytes_{}, up_constants_same_{};
+  struct TexUpReported {
+    std::array<uint64_t, kPrepareKinds> prepare_n{}, prepare_ns{};
+    std::array<uint64_t, 7> up_ns{};
+    uint64_t up_timed = 0, up_bindings = 0, up_dedupe_hits = 0, up_copies = 0, up_bytes_copied = 0;
+    std::array<uint64_t, 2> uploads{}, bytes{}, same{}, same_hits{};
+    std::array<uint64_t, DrawsVulkan::kInvalidationKinds + 1> invalidations{};
+    uint64_t samplers_cache = 0, samplers_fetch = 0, failures_generation = 0, failures_expired = 0, failures_other = 0;
+    uint64_t dedupe_after = 0;
+  } tex_up_reported_;
+  std::chrono::steady_clock::time_point tex_up_report_{};
+  bool constants_same_ = false;  // masseffect_native_constants_same_content
+  int64_t constants_same_verify_left_ = 0;
+  uint64_t constants_same_verified_ = 0;
+  std::array<uint64_t, 2> constants_same_hits_{};
+  std::array<uint32_t, kRegistersConstants> shadow_vs_{}, shadow_ps_{};
+  std::array<bool, 2> shadow_valid_{};
+  bool dedupe_after_copy_ = false;  // masseffect_native_dedupe_hash_after_copy
+  int64_t dedupe_after_verify_left_ = 0;
+  uint64_t dedupe_after_uses_ = 0;
   VkDeviceSize constants_vs_offset_ = 0;
   uint64_t constants_ps_generation_ = UINT64_MAX;
   uint64_t constants_ps_epoch_ = UINT64_MAX;
@@ -12549,6 +14802,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   std::array<uint64_t, 19> sub_ns_{};  // C6 substages, measurement only
   std::array<uint64_t, 19> sub_n_{};
   uint64_t sub_samples_ = 0;
+  // masseffect_native_report_stages: values at the previous "C6 stages" line.
+  std::array<uint64_t, kStagesDraw> stages_reported_{};
+  uint32_t stages_calls_reported_ = 0;
+  uint64_t stages_drawn_reported_ = 0;
   std::chrono::steady_clock::time_point sub_next_{};
   uint32_t stats_pass_ = UINT32_MAX;
   VkCommandBuffer pass_commands_ = VK_NULL_HANDLE;
@@ -12707,6 +14964,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   std::array<uint64_t, kGpuCategories> draws_per_category_{};
   bool inv_tex_size_ = false;
   bool fold_signs_ = false;  // masseffect_native_fold_texture_signs, read once per frame
+  bool fold_vs_ = false;     // masseffect_native_fold_vs_constants, read once per frame
+  uint32_t vs_constants_max_values_ = 4;
   bool pcf_cheap_ = false;                    // a single shadow map sample
   // Deduplication of vertex uploads within the frame.
   DedupeVertices dedupe_;
@@ -12717,6 +14976,27 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   // The same module with OpExecutionMode EarlyFragmentTests (masseffect_native_z_early).
   std::unordered_map<const ShaderEntry*, VkShaderModule> modules_z_early_;
   std::unordered_map<uint64_t, VkShaderModule> modules_7e3_;
+  // Restore into 7e3: (PS number << 4 | slot mask) -> TransformRestore7e3 succeeds on the library SPIR-V.
+  std::unordered_map<uint64_t, bool> restore_7e3_supported_;
+  // Restore into 7e3: (selected module, slot mask) -> module with the epilogue (VK_NULL_HANDLE = failed).
+  std::map<std::pair<VkShaderModule, uint32_t>, VkShaderModule> modules_restore_7e3_;
+  uint64_t restore_7e3_modules_ = 0;
+  // masseffect_native_velocity_16_16 (read once at construction: the cvar is init-only).
+  const bool velocity_16_16_ = REXCVAR_GET(masseffect_native_velocity_16_16) != 0;
+  // k_16_16 encode: (selected module, slot mask) -> module with the epilogue (the selected module itself when the
+  // shader stores none of those outputs, or when the transform failed and the draw keeps the plain output).
+  std::map<std::pair<VkShaderModule, uint32_t>, VkShaderModule> modules_fixed16_;
+  uint64_t fixed16_modules_ = 0;
+  std::unordered_set<uint64_t> fixed16_blend_logged_;
+  // masseffect_diag_velocity: PS number -> is the UE3 motion blur shader (by container content).
+  std::unordered_map<uint32_t, uint8_t> motion_blur_ps_;  // VelocityRole bits
+  // masseffect_native_motion_blur_frame_fix, read once per frame; patched PS constant bank of the current draw.
+  int32_t motion_blur_fix_ = 0;
+  uint32_t motion_blur_fix_lines_ = 0;
+  // masseffect_native_motion_blur_source_guard / masseffect_diag_blur_source (docs/image-defects-feros.md 3.8).
+  bool motion_blur_source_check_ = false;
+  uint64_t motion_blur_rebinds_ = 0;
+  std::array<uint32_t, kRegistersConstants> constants_ps_patched_{};
   std::unordered_set<uint32_t> biases_color_recorded_;
   uint64_t draws_ps_useless_ = 0;     // no color and a PS that does not discard
   uint64_t draws_ps_required_ = 0;  // no color, but the PS is needed
@@ -12773,7 +15053,147 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     uint64_t valid_until = 0;  // last frame it is valid without going back to PrepareTexture
     uint32_t width = 0;  // host image size, for 1/size
     uint32_t height = 0;
+    uint64_t copies = 0;  // generation_copies_ when filled (masseffect_native_texture_copy_verify)
+    // masseffect_native_texture_inval_by_address: generation_images_ and the address bucket's generation when
+    // filled, the bucket of the fetch's base, and whether PrepareTexture took the resolved-texture path.
+    uint64_t generation_images = 0;
+    uint32_t generation_address = 0;
+    uint16_t bucket = 0;
+    bool resolved = false;
   };
+  // Every invalidation that is not tied to one address: both rules see it.
+  void BumpTexturesAll() {
+    ++generation_textures_;
+    ++generation_images_;
+  }
+  // 1024 buckets of 4 KB pages (texture bases are 4 KB aligned).
+  static uint32_t BucketAddress(uint32_t address) {
+    return uint32_t(((address & 0x1FFFFFFFu) >> 12) * 0x9E3779B1u) >> 22;
+  }
+  // Whether a cache entry is still valid as far as the invalidations go (the frame or recheck horizon is checked
+  // apart). Old rule: no invalidation at all since it was filled. masseffect_native_texture_inval_by_address: no
+  // invalidation of every entry, none in its address bucket, and none at all for resolved-texture entries.
+  bool GenerationValid(const CacheSampler& e) const {
+    if (!inval_by_address_) return e.generation == generation_textures_;
+    return e.generation_images == generation_images_ && e.generation_address == generation_address_[e.bucket] &&
+           (!e.resolved || e.generation == generation_textures_);
+  }
+  // Fills the invalidation fields of an entry PrepareTexture just computed.
+  void FillGenerations(CacheSampler& e, const uint32_t* fetch) {
+    e.generation = generation_textures_;
+    e.generation_images = generation_images_;
+    e.bucket = uint16_t(BucketAddress(fetch[1] & 0xFFFFF000u));
+    e.generation_address = generation_address_[e.bucket];
+    e.resolved = prepared_resolved_;
+    e.copies = generation_copies_;
+    e.frame = frame_;
+  }
+  // masseffect_native_texture_copy_verify: copies seen, hits still to check, results, and the fallback.
+  uint64_t generation_copies_ = 0;
+  int64_t copy_verify_left_ = -1;  // -1 = not initialized yet
+  uint64_t copy_verified_ = 0, copy_verify_reported_ = 0;
+  bool copy_invalidation_forced_ = false;
+  // masseffect_native_texture_inval_by_address and masseffect_native_texture_frames_verify: the same kind of check.
+  bool inval_by_address_ = false;
+  uint64_t generation_images_ = 0;
+  std::array<uint32_t, 1024> generation_address_{};
+  bool prepared_resolved_ = false;  // set by PrepareTexture: the fetch was answered by a resolved texture
+  int64_t address_verify_left_ = 0, frames_verify_left_ = 0;
+  uint64_t address_verified_ = 0, frames_verified_ = 0;
+  bool address_reported_ = false, frames_reported_ = false;
+  std::array<uint64_t, DrawsVulkan::kInvalidationKinds + 1> invalidations_{};  // by reason (+ untargeted)
+  enum : uint8_t { kVerifyCopy = 1, kVerifyAddress = 2, kVerifyFrames = 4 };
+  bool CopyVerifyDue(const CacheSampler& entry) {
+    if (copy_verify_left_ < 0) {
+      copy_verify_left_ = REXCVAR_GET(masseffect_native_invalidate_textures_each_copy)
+                              ? 0 : int64_t(std::max<int32_t>(0, REXCVAR_GET(masseffect_native_texture_copy_verify)));
+      if (copy_verify_left_ > 0)
+        REXLOG_INFO("[native] C6: texture caches kept across copies; the first {} hits across a copy are checked "
+                    "against PrepareTexture", copy_verify_left_);
+    }
+    return copy_verify_left_ > 0 && entry.copies != generation_copies_;
+  }
+  // Which of the checks want this hit run through PrepareTexture instead (0: take it). Each check looks at the hits
+  // its rule allows and the old rule would refuse.
+  uint8_t VerifyDue(const CacheSampler& entry) {
+    uint8_t due = CopyVerifyDue(entry) ? kVerifyCopy : 0;
+    if (address_verify_left_ > 0 && inval_by_address_ && entry.generation != generation_textures_)
+      due |= kVerifyAddress;
+    if (frames_verify_left_ > 0 && cache_between_frames_ && entry.frame != frame_) due |= kVerifyFrames;
+    return due;
+  }
+  // The values PrepareTexture just gave (the old behavior) against the cached ones the new behavior would have used.
+  void CheckCopyVerify(const uint8_t on[2], const CacheSampler ref[2], uint32_t slot, uint32_t heap, uint32_t sampler,
+                       uint32_t width, uint32_t height, const uint32_t* fetch) {
+    for (int k = 0; k < 2; ++k) {
+      const CacheSampler* e = &ref[k];
+      const uint8_t due = on[k];
+      if (!due) continue;
+      const bool equal =
+          e->slot == slot && e->heap == heap && e->sampler == sampler && e->width == width && e->height == height;
+      if ((due & kVerifyCopy) && copy_verify_left_ > 0) {
+        --copy_verify_left_;
+        ++copy_verified_;
+        if (!equal) {
+          REXLOG_ERROR("[native] DIFFERENCE: texture cache kept across a copy ({} cache) gave slot {:08X} heap {} "
+                       "sampler {} {}x{}, PrepareTexture gives slot {:08X} heap {} sampler {} {}x{} (fetch {:08X} "
+                       "{:08X} {:08X}); the per-copy invalidation is back on",
+                       k ? "per-fetch" : "register", e->slot, e->heap, e->sampler, e->width, e->height, slot, heap,
+                       sampler, width, height, fetch[0], fetch[1], fetch[2]);
+          copy_invalidation_forced_ = true;
+          copy_verify_left_ = 0;
+          BumpTexturesAll();
+        }
+      }
+      if ((due & kVerifyAddress) && address_verify_left_ > 0) {
+        --address_verify_left_;
+        ++address_verified_;
+        if (!equal) {
+          REXLOG_ERROR("[native] DIFFERENCE: texture cache kept across an invalidation of another address ({} cache, "
+                       "{} entry) gave slot {:08X} heap {} sampler {} {}x{}, PrepareTexture gives slot {:08X} heap {} "
+                       "sampler {} {}x{} (fetch {:08X} {:08X} {:08X}); masseffect_native_texture_inval_by_address is "
+                       "off from now on",
+                       k ? "per-fetch" : "register", e->resolved ? "resolved" : "ordinary", e->slot, e->heap,
+                       e->sampler, e->width, e->height, slot, heap, sampler, width, height, fetch[0], fetch[1],
+                       fetch[2]);
+          inval_by_address_ = false;
+          address_verify_left_ = 0;
+          BumpTexturesAll();
+        }
+      }
+      if ((due & kVerifyFrames) && frames_verify_left_ > 0) {
+        --frames_verify_left_;
+        ++frames_verified_;
+        if (!equal) {
+          REXLOG_ERROR("[native] DIFFERENCE: texture cache kept across frames ({} cache) gave slot {:08X} heap {} "
+                       "sampler {} {}x{}, PrepareTexture gives slot {:08X} heap {} sampler {} {}x{} (fetch {:08X} "
+                       "{:08X} {:08X}); the cross-frame cache is off from now on",
+                       k ? "per-fetch" : "register", e->slot, e->heap, e->sampler, e->width, e->height, slot, heap,
+                       sampler, width, height, fetch[0], fetch[1], fetch[2]);
+          cache_between_frames_ = false;
+          frames_verify_left_ = 0;
+          BumpTexturesAll();
+        }
+      }
+    }
+    if (copy_verify_left_ == 0 && copy_verify_reported_ != copy_verified_) {
+      copy_verify_reported_ = copy_verified_;
+      REXLOG_INFO("[native] C6: texture caches across copies: {} hits checked against PrepareTexture, {}",
+                  copy_verified_, copy_invalidation_forced_ ? "a DIFFERENCE (per-copy invalidation back on)"
+                                                           : "all equal (check finished)");
+    }
+    if (address_verify_left_ == 0 && address_verified_ && !address_reported_) {
+      address_reported_ = true;
+      REXLOG_INFO("[native] C6: texture caches by address: {} hits checked against PrepareTexture, {}",
+                  address_verified_, inval_by_address_ ? "all equal (check finished)" : "a DIFFERENCE (switched off)");
+    }
+    if (frames_verify_left_ == 0 && frames_verified_ && !frames_reported_) {
+      frames_reported_ = true;
+      REXLOG_INFO("[native] C6: texture caches across frames: {} hits checked against PrepareTexture, {}",
+                  frames_verified_, cache_between_frames_ ? "all equal (check finished)" : "a DIFFERENCE (switched off)");
+    }
+  }
+
   bool cache_between_frames_ = true;  // masseffect_native_cache_textures_between_frames
   bool mipmaps_ = true;                 // masseffect_native_mipmaps
   std::array<CacheSampler, 16> cache_samplers_{};
@@ -12829,12 +15249,14 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   uint64_t ns_pipelines_ = 0;  // creating pipelines (C6 report)
   std::unordered_set<uint32_t> warned_;
   // Pipeline prewarm (PrewarmedLoop). file_list_ and state_list_ are sized before the thread
-  // starts and never change size; the thread writes state_list_[i] before publishing
+  // starts (RenumberPipelinesList compacts them once, before it) and never change size afterwards;
+  // the thread writes state_list_[i] before publishing
   // prewarmed_until_ > i. Anything not atomic and not marked otherwise belongs to the ring only.
   std::vector<RegisterPipeline> file_list_;         // the list read at start-up (walked by the thread)
   std::vector<uint8_t> state_list_;                   // kList* of each record of file_list_
   std::unordered_map<uint64_t, size_t> index_list_;   // XXH3 of the key -> index (SIZE_MAX: from this session)
   std::vector<RegisterPipeline> session_list_;          // this session's new ones
+  bool renumbered_list_ = false;  // RenumberPipelinesList done (ring only)
   uint32_t list_no_save_ = 0;
   std::vector<uint8_t> writer_list_;                 // guarded by writer_mutex_
   std::thread prewarmed_thread_;
@@ -12862,6 +15284,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   uint64_t prewarmed_ring_ = 0, prewarmed_slow_ring_ = 0, ns_prewarmed_ring_ = 0;
   uint64_t ring_of_list_ = 0, ns_ring_of_list_ = 0;
   uint64_t new_ring_ = 0, ns_new_ring_ = 0, ring_to_list_ = 0;
+
+#include "masseffect_pipelines_cold_members.inc"  // cold-start pipeline hitches (docs/cold-start-hitches.md)
+#include "me_draw_cache_members.inc"  // per-component draw cache (docs/frame-coherence.md)
+#include "masseffect_ps_descriptors_members.inc"  // pixel shader descriptor and clamp rewrites (docs/scene-shader-cost.md)
 };
 
 }  // namespace

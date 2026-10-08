@@ -75,6 +75,58 @@ All of this is in `sdk/src/core/guest_memory_switch.cpp` and `memory_switch.cpp`
 - **`pread` is emulated** with `lseek` plus `read`, with one lock per descriptor spread over 64 stripes, so two different
   files do not wait for each other (the game reads its data from several threads).
 
+## Guest memory page size
+
+`sdk/src/core/guest_memory_switch.cpp` (`kWindowAlign`, `GridDown`, `RexGmLayoutSummary`, `RexGmTlbBenchmark`). The
+kernel facts are **read in the Atmosphère (Mesosphère) sources**; the effect on the game is **not measured yet**.
+
+- **What decides the page size.** Every mapping system call ends in `KPageTable::MapContiguous`, which picks the
+  largest descriptor (1 GB, 32 MB contiguous, 2 MB block, 64 KB contiguous, 4 KB page) for which the virtual and the
+  physical address are congruent: it climbs the sizes while `(virt & (size - 1)) == (phys & (size - 1))`. This holds
+  for `svcSetHeapSize` (maps the heap page group), `svcMapProcessCodeMemory` (`MapPageGroupImpl` of the source's
+  pages) and `svcMapProcessMemory` (`MakeAndOpenPageGroup` on the source, `MapPageGroup` on the destination).
+  After a map it runs `MergePages` at both ends, so a block split by a single-page unmap can be merged again when the
+  page comes back. Unmapping part of a block first runs `SeparatePages`, which needs a new page table.
+- **The heap is physically in large blocks.** The kernel allocates the heap from the page heap largest block first
+  (blocks of 4 KB, 64 KB, 2 MB, 4 MB, 32 MB, 512 MB, 1 GB, each aligned to its size), and the heap region is 2 MB
+  aligned, so a 2 MB-aligned `memalign` normally sits on a 2 MB-aligned physical block. This is assumed, not
+  measured; the profile line below checks it when `svcQueryPhysicalAddress` (0x54) is allowed.
+- **The window was mapped with 4 KB pages (found in the code).** `virtmemFindAslr(size, kBlockSize)` and
+  `virtmemFindCodeMemory(sz, align)` take a *guard size* as their second argument, not an alignment. The window
+  base was therefore only page aligned (a console log shows base `0x...6F76238000`, 0x38000 past a 2 MB boundary, not
+  even 64 KB aligned), and with a 2 MB-aligned backing no view was congruent: every guest access went through 4 KB
+  pages, and every first touch of a cold page was also a TLB miss (the A57 L2 TLB holds 1024 entries: 4 MB of reach
+  with 4 KB pages). Write watching was not the cause: in play there are few watched pages.
+- **`guest_memory_large_pages`** (init only, default 0):
+  - `1`: the window base is aligned to 32 MB and each chunk's code alias to its alignment. Every view whose base
+    minus its mapping offset is a multiple of 2 MB becomes block-mappable: 0x00000000, 0x40000000, 0x7F000000,
+    0x80000000, 0x90000000, 0xA0000000, 0xC0000000 and the raw physical view. **0xE0000000 cannot be**: it mirrors
+    mapping offset 0x100001000 (the 360's 4 KB shift), so it is 4 KB out of phase with every other physical view.
+    The ports for Windows and macOS remove the shift with a per-access `+0x1000` for addresses at or above
+    0xE0000000 (`REX_PHYS_HOST_OFFSET`); on Switch that would be a change to the generated code, not a setting.
+  - `2`: as `1`, and the chunk grid of the physical range (mapping offsets from 0x100000000) is shifted by 4 KB, so
+    0xE0000000 is the block-mappable view and 0xA0000000, 0xC0000000, 0x7F000000 and the raw view (used by the native
+    renderer) are not. Which mode wins depends on which view the hot data lives in: A/B both.
+  - Watched pages keep the old mechanism (one 4 KB unmap each). Only the 2 MB block that holds a watched page loses
+    its block mapping.
+- **Profile line.** Every profiler report has a `guest pages:` line: the mode, the window base modulo 2 MB, the
+  kernel memory blocks inside the window (`svcQueryMemory`: count, sizes, how many start 2 MB aligned), how many
+  chunk aliases are 2 MB-congruent, and per view (offset from the window base) the MB mapped and its 2 MB granules as
+  `va-congruent/pa-eligible/total (watched)`. *va-congruent*: the window address and the heap address of its backing
+  agree modulo 2 MB. *pa-eligible*: `svcQueryPhysicalAddress` says the granule is physically contiguous over 2 MB and
+  congruent, which by the rule above means a 2 MB block (a `-` means the call is not allowed for this process; then
+  only the va column is available). With mode 0, va-congruent should be 0 everywhere; with mode 1 it should equal the
+  total in every view but 0xE0000000 (offset `e0000000`).
+- **`guest_memory_tlb_benchmark = <MB>`** (init only, default 0; loads per run in
+  `guest_memory_tlb_benchmark_loads`, default 2,000,000): at start-up, a random dependent chain over that many MB and
+  over its first 8 MB, read through the heap, a code alias, and the same memory mapped with `svcMapProcessMemory` at
+  a 2 MB-congruent address (`pm+0`), a 64 KB-congruent one (`pm+64K`) and a 4 KB-congruent one (`pm+4K`, what the
+  window had). The log lines `TLB benchmark over N MB: ns/load ...` give the TLB cost per cold load as `pm+4K - pm+0`.
+  It takes a few seconds and the memory is returned afterwards.
+- **Risks.** A watched page inside a block-mapped 2 MB region makes the kernel split the block, which needs a page
+  table from the kernel; if that ever fails, `Protect: failure 0x...` appears in the log. The window reservation is
+  32 MB larger in address space (not memory).
+
 ## Exceptions
 
 `sdk/src/core/exception_handler_switch.cpp`, all **measured**:
@@ -141,9 +193,98 @@ All of this is in `sdk/src/core/guest_memory_switch.cpp` and `memory_switch.cpp`
   starved, fill its blocking queue and stall the thread that feeds the GPU. A stationary Eden Prime comparison with
   a four-frame texture recheck interval gave about 26 fps with either logger; this does not establish a performance
   improvement, but there is no reason to opt into the known queue-starvation risk.
+- **Non-blocking log (`log_nonblocking`, off by default, under test).** With the synchronous file sink, the thread
+  that logs writes to the SD card itself, and every warn line flushes (`flush_on(warn)`): stack sampling in a Feros
+  firefight put ~14 % of the ring thread's time in frames over 45 ms inside `fsdev_write`/`fsdev_seek`, at only
+  ~27 lines/s. With the setting on (`sdk/src/core/log_nonblocking.cpp`, `log_ring.h`) the logging thread formats the
+  line with its own copy of the formatter and copies it into a lock-free multi-producer ring
+  (`log_nonblocking_buffer_kb`, 2 MB): no lock, no stdio, no waiting; a full ring drops the line and the writer later
+  logs `[log] N lines (M bytes) dropped`. `flush()` only wakes the writer. The writer is a libnx `threadCreate`
+  thread ("log writer" in the profiler) at `0x2C` (`log_nonblocking_priority`; 0x2A until 2026-10-08, which put
+  it above the audio output and XMA threads at `0x2B`. It is now below them, level with presentation and ring and
+  above the guest threads; it runs for microseconds per batch and otherwise waits in the fs service, and if it is ever
+  starved the ring only drops lines) with core mask 0-1 (core 2 belongs to the main thread under `masseffect_exclusive_core`).
+  Every `log_nonblocking_interval_ms` (250), or within 20 ms of a flush request or a half-full ring, it writes the
+  queue in 256 KB `fwrite`s with one `fflush`, and rotates like `rotating_file_sink`. `FlushLogging()` drains it
+  synchronously; the crash paths (`RexSwitchCrashLog`: `abort`, `exit`, `std::terminate`, fatal faults) drain it
+  after writing `rex_crash.log`, waiting at most ~300 ms for the writer and never rotating. A thread suspended in
+  the middle of a `log()` call holds back (does not lose) the lines queued after it.
 - **Fibers.** devkitA64 has no `ucontext`, so fibers switch contexts in assembly (`fiber_switch.cpp`).
 - **Timers.** Never read `cntvct_el0` directly: it faults on Horizon (the game started to a black screen and ended in
   `std::terminate`). Use libnx's `armGetSystemTick`.
+
+## Audio: the 344.5 Hz comb (2026-10-08)
+
+A steady buzz under the gameplay sound, seen in the spectra of the console captures (`run/me1/manual8/spec.png`,
+`spec2.png`) as evenly spaced horizontal lines up to ~15 kHz.
+
+**Measurement** (audio of the captures, 48 kHz AAC, Welch spectrum with 2^17-point windows, harmonic-comb fit from 340
+to 349 Hz in 0.01 Hz steps, then synchronous folding of the signal resampled to 44.1 kHz):
+
+- The comb is at **344.53 Hz = 44100 / 128** (fit 344.52-344.55 Hz on every clip), with weaker odd harmonics of
+  172.27 Hz = 44100 / 256. Its lines stand 13-34 dB above the local floor (mean over harmonics 3-40). Nothing at
+  187.5 Hz (48000 / 256, one frame of the game's mixer) or 46.9 Hz (one 1024-sample audout buffer): 1-3 dB, noise.
+- Folded at 128 samples of 44.1 kHz, the periodic part is one fixed waveform (a slow ramp with a single step, about
+  260 LSB peak to peak, -42 dBFS) that stays the same (correlation 0.98-1.00 second to second) for the whole 20 s of
+  the clips 06:29 and 09:30; in the 06:50 clip it is absent for 15 s and then appears and stays. It is mostly in the
+  mid channel (34 dB vs 14 dB in the side): a mono source.
+- It is in every capture of 2026-10-08, **including those taken before** `log_nonblocking`, `heap_free_bitmap`,
+  `guest_memory_large_pages`, indirect dispatch mode 2, dcbt prefetch and the new hot natives were enabled
+  (`run/me1/user_rec`, `old_rec`). The audio code itself (`sdk/src/audio/*`) has not changed since 2026-10-04.
+
+**What it is.** One 128-sample block of a 44.1 kHz mono voice repeated endlessly. 128 samples is one XMA subframe and
+one 256-byte block of an XMA context's output buffer (`kOutputBytesPerBlock`); 44.1 kHz is the rate of the voice before
+the game's mixer resamples it to 48 kHz. So it is not an output underrun: the audout side reports 0 "requests without
+data" (`rex_profile.log`, "audio:" line), and an underrun there would comb at 187.5 or 46.9 Hz. Either our XMA context
+writes the same block again and again (a loop whose start and end are the same frame, subframe skip/end handling), or
+a voice stays enabled on a context that stopped producing and the game's voice keeps rendering its last block.
+
+**Not the cause** (by the evidence above): the log writer priority (it was above audio, now below, see "Threads"), large
+pages (every view of the guest window maps the same backing pages, so a block written through the physical view is
+the block read through the virtual one; and the comb predates them), the native mixer DSP (it works on 256-float
+frames at 48 kHz, which would comb at 187.5 Hz).
+
+**Diagnostics added** (`audio_xma_diag`, on by default, measurement only, `sdk/src/audio/xma_context.cpp`):
+
+- `[xma] repeat: context N wrote the same non-silent block 17 times in a row; <state>`: our decoder is the repeater.
+- `[xma] stall: context N kicked K times in M ms without producing ...; <state>`: the game still kicks a context that
+  has produced nothing for a second (once per silence); a voice on it may be replaying its last block.
+- `[xma] one-frame loop: context N; <state>`: a loop whose start and end offsets are the same frame.
+- `<state>` gives rate id, mono/stereo, input buffers and packet counts, read offset, output buffer valid / block count /
+  read / write offsets, padding, subframe decode count, loop count / start / end / subframe skip / end, error, pending
+  subframes. The 10 s report's "audio:" line ends with `XMA: blocks written, repeated-block runs, stalls of 1 s or more`
+  (counters 58, 56, 57).
+- To hear what the decoder delivers, `audio_dump_xma_s = 20` writes `xma_<context>_<n>_output_<hz>.wav` next to the
+  NRO: if the comb is in an output dump, the decoder is the source; if no dump has it while the capture does, the
+  repeat is in the game's voice.
+
+**Cause found (console log `run/me1/manual9/masseffect_326.log`) and fixed (`audio_xma_loop_zero_end_off`, default
+true).** Every `[xma] repeat` line comes from a context with `loop count 255 start 0 end 0 subframe skip 0 end 0` at
+read offset 32 (about 25 contexts, mono and stereo, ordinary sounds; some have both input buffers valid with the same
+packet count, i.e. XAudio2 loops a buffer by resubmitting it).
+
+- Semantics. `loop_start` / `loop_end` are the bit offsets, from the start of the input buffer and counting the 32-bit
+  packet headers, of the frames holding the loop start / end samples (`XMA_LOOP_DATA` LoopStartOffset / LoopEndOffset
+  in the XDK's `xma2defs.h`; Xenia's `XMA_CONTEXT_DATA` comments "XMASetLoopData ... frame offset in bits");
+  `loop_subframe_end` / `loop_subframe_skip` cut the end frame and the start frame at 128-sample subframes; loop count
+  255 = `XMA_INFINITE_LOOP` / `XAUDIO2_LOOP_INFINITE`, 0 = no loop. (XAudio2's LoopBegin / LoopLength in samples are
+  the API side; XAudio2 converts them to these frame offsets. "LoopLength 0 = whole buffer" is an XAudio2 rule, not a
+  context rule.) A frame never starts inside a packet header, so an end offset below 32 matches no frame: the
+  hardware never takes such a loop and the context just plays its buffers.
+- The bug. Xenia (canary `xma_context_new.cc`, `UpdateLoopStatus`) clamps both offsets to `max(32, offset)`, which makes
+  the first frame of every buffer the loop end. Canary checks the loop before decoding and then advances normally, so
+  there it only truncates frame 0 to `loop_subframe_end + 1` subframes. This fork decodes the loop-end frame and then
+  jumps back without advancing, so it decoded frame 0 forever and wrote only its first subframe (`(0 + 1) << stereo`
+  blocks) each time: one 128-sample block repeated, 44100 / 128 = 344.5 Hz.
+- The fix (`ActiveLoopEnd` in `sdk/src/audio/xma_context.cpp`): a loop is active only if loop count > 0 and
+  `loop_end >= 32`; otherwise neither the loop-end detection in `Decode` nor `UpdateLoopStatus` fires. Real loops
+  (end >= 32, including start = end >= 32) keep the old code. `audio_xma_loop_zero_end_off = false` restores the old
+  path for A/B. With `audio_xma_diag` on, `[xma] loop off: context N has loop count 255 with start 0 end 0 ...` is
+  logged once per context and sound (at most 50 lines) when a context at offset 32 takes the fixed path.
+- To check on the console: no `[xma] repeat` / `[xma] one-frame loop` lines with `start 0 end 0` (the "repeated-block
+  runs" counter 56 near 0), `[xma] loop off` lines present, the 344.5 Hz comb gone from the capture spectrum, and
+  looping ambiences / music still loop (if one now stops after one pass, the game relied on whole-buffer looping in the
+  context, and the zero-end case would need to loop the buffer instead).
 
 ## Clocks
 

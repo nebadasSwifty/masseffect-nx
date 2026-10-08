@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <climits>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -42,11 +44,106 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
+REXCVAR_DEFINE_BOOL(heap_free_bitmap, false, "Memory",
+                    "BaseHeap::AllocRange searches a free-page bitmap (64 pages per load) instead of reading one "
+                    "page-table entry per page; the chosen address is the same as the page-table scan. Removes the "
+                    "per-call scan over the used top of the physical heap (XPhysicalAlloc / MmAllocatePhysicalMemoryEx)");
+REXCVAR_DEFINE_BOOL(heap_free_bitmap_verify, false, "Memory",
+                    "With heap_free_bitmap: also run the page-table scan on every AllocRange, use its result and log "
+                    "any difference (diagnostic, costs the full scan)");
+
 namespace rex::memory {
 
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
   return rex::round_up(value, page_size) >> page_size_shift;
 }
+
+namespace {
+
+// The original first-fit scan of BaseHeap::AllocRange over the page table (one entry per page), kept verbatim for
+// heap_free_bitmap = false and for heap_free_bitmap_verify. Returns the base page number or UINT_MAX.
+uint32_t LinearFindFreeRange(const std::vector<PageEntry>& page_table, uint32_t low_page_number,
+                             uint32_t max_base_page_number, uint32_t page_count, uint32_t page_scan_stride,
+                             bool top_down) {
+  uint32_t start_page_number = UINT_MAX;
+  uint32_t end_page_number = UINT_MAX;
+  if (top_down) {
+    max_base_page_number -= max_base_page_number % page_scan_stride;
+    for (int64_t base_page_number = max_base_page_number; base_page_number >= low_page_number;
+         base_page_number -= page_scan_stride) {
+      if (page_table[base_page_number].state != 0) {
+        // Base page not free, skip to next usable page.
+        continue;
+      }
+      // Check requested range to ensure free.
+      start_page_number = uint32_t(base_page_number);
+      end_page_number = uint32_t(base_page_number) + page_count - 1;
+      assert_true(end_page_number < page_table.size());
+      bool any_taken = false;
+      for (uint32_t page_number = uint32_t(base_page_number);
+           !any_taken && page_number <= end_page_number; ++page_number) {
+        bool is_free = page_table[page_number].state == 0;
+        if (!is_free) {
+          // At least one page in the range is used, skip to next.
+          // We know we'll be starting at least before this page.
+          any_taken = true;
+          if (page_count > page_number) {
+            // Not enough space left to fit entire page range. Breaks outer
+            // loop.
+            base_page_number = -1;
+          } else {
+            base_page_number = page_number - page_count;
+            base_page_number -= base_page_number % page_scan_stride;
+            base_page_number += page_scan_stride;  // cancel out loop logic
+          }
+          break;
+        }
+      }
+      if (!any_taken) {
+        // Found our place.
+        break;
+      }
+      // Retry.
+      start_page_number = end_page_number = UINT_MAX;
+    }
+  } else {
+    for (uint32_t base_page_number = low_page_number; base_page_number <= max_base_page_number;
+         base_page_number += page_scan_stride) {
+      if (page_table[base_page_number].state != 0) {
+        // Base page not free, skip to next usable page.
+        continue;
+      }
+      // Check requested range to ensure free.
+      start_page_number = base_page_number;
+      end_page_number = base_page_number + page_count - 1;
+      bool any_taken = false;
+      for (uint32_t page_number = base_page_number; !any_taken && page_number <= end_page_number;
+           ++page_number) {
+        bool is_free = page_table[page_number].state == 0;
+        if (!is_free) {
+          // At least one page in the range is used, skip to next.
+          // We know we'll be starting at least after this page.
+          any_taken = true;
+          base_page_number = rex::round_up(page_number + 1, page_scan_stride);
+          base_page_number -= page_scan_stride;  // cancel out loop logic
+          break;
+        }
+      }
+      if (!any_taken) {
+        // Found our place.
+        break;
+      }
+      // Retry.
+      start_page_number = end_page_number = UINT_MAX;
+    }
+  }
+  if (end_page_number == UINT_MAX) {
+    return UINT_MAX;
+  }
+  return start_page_number;
+}
+
+}  // namespace
 
 /**
  * Memory map:
@@ -1211,6 +1308,120 @@ void BaseHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType hea
   host_address_offset_ = host_address_offset;
   page_table_.resize(heap_size / page_size);
   unreserved_page_count_ = uint32_t(page_table_.size());
+  free_bits_.assign((page_table_.size() + 63) / 64, 0);
+  if (!page_table_.empty()) {
+    UpdateFreeBits(0, uint32_t(page_table_.size()) - 1);
+  }
+}
+
+void BaseHeap::UpdateFreeBits(uint32_t first_page, uint32_t last_page) {
+  const uint32_t page_count = uint32_t(page_table_.size());
+  if (!page_count || first_page >= page_count) {
+    return;
+  }
+  last_page = std::min(last_page, page_count - 1);
+  for (uint32_t page = first_page; page <= last_page; ++page) {
+    const uint64_t bit = uint64_t(1) << (page & 63);
+    if (page_table_[page].state == 0) {
+      free_bits_[page >> 6] |= bit;
+    } else {
+      free_bits_[page >> 6] &= ~bit;
+    }
+  }
+}
+
+int64_t BaseHeap::FindHighestFreePage(uint32_t page, uint32_t low) const {
+  int64_t p = page;
+  while (p >= int64_t(low)) {
+    const uint32_t word = uint32_t(p >> 6);
+    const uint32_t bit = uint32_t(p & 63);
+    const uint64_t mask = bit == 63 ? ~uint64_t(0) : ((uint64_t(1) << (bit + 1)) - 1);
+    const uint64_t bits = free_bits_[word] & mask;
+    if (bits) {
+      const int64_t q = (int64_t(word) << 6) + 63 - __builtin_clzll(bits);
+      return q >= int64_t(low) ? q : -1;
+    }
+    p = (int64_t(word) << 6) - 1;
+  }
+  return -1;
+}
+
+uint32_t BaseHeap::FindLowestFreePage(uint32_t page, uint32_t high) const {
+  uint64_t p = page;
+  while (p <= high) {
+    const uint32_t word = uint32_t(p >> 6);
+    const uint64_t bits = free_bits_[word] & (~uint64_t(0) << (p & 63));
+    if (bits) {
+      const uint64_t q = (uint64_t(word) << 6) + __builtin_ctzll(bits);
+      return q <= high ? uint32_t(q) : UINT_MAX;
+    }
+    p = (uint64_t(word) + 1) << 6;
+  }
+  return UINT_MAX;
+}
+
+uint32_t BaseHeap::FindLowestUsedPage(uint32_t first_page, uint32_t last_page) const {
+  uint64_t p = first_page;
+  while (p <= last_page) {
+    const uint32_t word = uint32_t(p >> 6);
+    const uint64_t bits = ~free_bits_[word] & (~uint64_t(0) << (p & 63));
+    if (bits) {
+      const uint64_t q = (uint64_t(word) << 6) + __builtin_ctzll(bits);
+      return q <= last_page ? uint32_t(q) : UINT_MAX;
+    }
+    p = (uint64_t(word) + 1) << 6;
+  }
+  return UINT_MAX;
+}
+
+uint32_t BaseHeap::FindFreeRangeBitmap(uint32_t low_page_number, uint32_t max_base_page_number,
+                                       uint32_t page_count, uint32_t page_scan_stride,
+                                       bool top_down) const {
+  // Same candidate sequence as LinearFindFreeRange; only the skips over used pages are done on whole bitmap words.
+  if (top_down) {
+    // Candidates are multiples of the stride, from the top down.
+    int64_t base = int64_t(max_base_page_number) - int64_t(max_base_page_number % page_scan_stride);
+    while (base >= int64_t(low_page_number)) {
+      if (!IsPageFreeBit(uint32_t(base))) {
+        // The linear scan steps down one stride at a time while the base page is used: the next candidate it
+        // accepts as a base is the highest stride multiple at or below the highest free page.
+        const int64_t q = FindHighestFreePage(uint32_t(base), low_page_number);
+        if (q < 0) {
+          return UINT_MAX;
+        }
+        base = q - q % page_scan_stride;
+        continue;
+      }
+      const uint32_t used = FindLowestUsedPage(uint32_t(base), uint32_t(base) + page_count - 1);
+      if (used == UINT_MAX) {
+        return uint32_t(base);
+      }
+      if (page_count > used) {
+        return UINT_MAX;
+      }
+      base = int64_t(used - page_count);
+      base -= base % page_scan_stride;
+    }
+    return UINT_MAX;
+  }
+  // Bottom-up: candidates are low_page_number + k * stride until the first collision, then stride multiples.
+  uint64_t base = low_page_number;
+  while (base <= max_base_page_number) {
+    if (!IsPageFreeBit(uint32_t(base))) {
+      const uint32_t q = FindLowestFreePage(uint32_t(base), max_base_page_number);
+      if (q == UINT_MAX) {
+        return UINT_MAX;
+      }
+      base += (uint64_t(q) - base + page_scan_stride - 1) / page_scan_stride * page_scan_stride;
+      continue;
+    }
+    const uint32_t used = FindLowestUsedPage(uint32_t(base), uint32_t(base) + page_count - 1);
+    if (used == UINT_MAX) {
+      return uint32_t(base);
+    }
+    base = rex::round_up(used + 1, page_scan_stride);
+  }
+  return UINT_MAX;
 }
 
 void BaseHeap::Dispose() {
@@ -1400,6 +1611,10 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
     stream->Read(addr, page_size_);
   }
 
+  if (!page_table_.empty()) {
+    UpdateFreeBits(0, uint32_t(page_table_.size()) - 1);
+  }
+
   if (reconcile_host_pages && !page_table_.empty()) {
     if (!SyncHostPageAccess(0, uint32_t(page_table_.size()) - 1)) {
       return false;
@@ -1412,6 +1627,9 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
 void BaseHeap::Reset() {
   // TODO(DrChat): protect pages.
   std::memset(page_table_.data(), 0, sizeof(PageEntry) * page_table_.size());
+  if (!page_table_.empty()) {
+    UpdateFreeBits(0, uint32_t(page_table_.size()) - 1);
+  }
   // TODO(Triang3l): Remove access callbacks from pages if this is a physical
   // memory heap.
 }
@@ -1542,6 +1760,7 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
   }
 
+  UpdateFreeBits(start_page_number, end_page_number);
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
     return false;
   }
@@ -1591,81 +1810,34 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   // Find a free page range.
   // The base page must match the requested alignment, so we first scan for
   // a free aligned page and only then check for continuous free pages.
-  // TODO(benvanik): optimized searching (free list buckets, bitmap, etc).
-  uint32_t start_page_number = UINT_MAX;
-  uint32_t end_page_number = UINT_MAX;
+  // heap_free_bitmap: the same first-fit search on the free-page bitmap.
   uint32_t page_scan_stride = alignment >> page_size_shift_;
   uint32_t max_base_page_number = high_page_number + 1 - page_count;
-  if (top_down) {
-    max_base_page_number -= max_base_page_number % page_scan_stride;
-    for (int64_t base_page_number = max_base_page_number; base_page_number >= low_page_number;
-         base_page_number -= page_scan_stride) {
-      if (page_table_[base_page_number].state != 0) {
-        // Base page not free, skip to next usable page.
-        continue;
-      }
-      // Check requested range to ensure free.
-      start_page_number = uint32_t(base_page_number);
-      end_page_number = uint32_t(base_page_number) + page_count - 1;
-      assert_true(end_page_number < page_table_.size());
-      bool any_taken = false;
-      for (uint32_t page_number = uint32_t(base_page_number);
-           !any_taken && page_number <= end_page_number; ++page_number) {
-        bool is_free = page_table_[page_number].state == 0;
-        if (!is_free) {
-          // At least one page in the range is used, skip to next.
-          // We know we'll be starting at least before this page.
-          any_taken = true;
-          if (page_count > page_number) {
-            // Not enough space left to fit entire page range. Breaks outer
-            // loop.
-            base_page_number = -1;
-          } else {
-            base_page_number = page_number - page_count;
-            base_page_number -= base_page_number % page_scan_stride;
-            base_page_number += page_scan_stride;  // cancel out loop logic
-          }
-          break;
+  uint32_t start_page_number;
+  if (REXCVAR_GET(heap_free_bitmap)) {
+    start_page_number = FindFreeRangeBitmap(low_page_number, max_base_page_number, page_count,
+                                            page_scan_stride, top_down);
+    if (REXCVAR_GET(heap_free_bitmap_verify)) {
+      const uint32_t linear = LinearFindFreeRange(page_table_, low_page_number, max_base_page_number,
+                                                  page_count, page_scan_stride, top_down);
+      if (linear != start_page_number) {
+        static std::atomic<uint32_t> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+          REXSYS_ERROR(
+              "BaseHeap::AllocRange heap_free_bitmap mismatch: heap {:08X} pages {}..{} count {} stride {} "
+              "top_down {}: bitmap {:#x} page table {:#x} (using the page table)",
+              heap_base_, low_page_number, max_base_page_number, page_count, page_scan_stride, top_down,
+              start_page_number, linear);
         }
+        start_page_number = linear;
       }
-      if (!any_taken) {
-        // Found our place.
-        break;
-      }
-      // Retry.
-      start_page_number = end_page_number = UINT_MAX;
     }
   } else {
-    for (uint32_t base_page_number = low_page_number; base_page_number <= max_base_page_number;
-         base_page_number += page_scan_stride) {
-      if (page_table_[base_page_number].state != 0) {
-        // Base page not free, skip to next usable page.
-        continue;
-      }
-      // Check requested range to ensure free.
-      start_page_number = base_page_number;
-      end_page_number = base_page_number + page_count - 1;
-      bool any_taken = false;
-      for (uint32_t page_number = base_page_number; !any_taken && page_number <= end_page_number;
-           ++page_number) {
-        bool is_free = page_table_[page_number].state == 0;
-        if (!is_free) {
-          // At least one page in the range is used, skip to next.
-          // We know we'll be starting at least after this page.
-          any_taken = true;
-          base_page_number = rex::round_up(page_number + 1, page_scan_stride);
-          base_page_number -= page_scan_stride;  // cancel out loop logic
-          break;
-        }
-      }
-      if (!any_taken) {
-        // Found our place.
-        break;
-      }
-      // Retry.
-      start_page_number = end_page_number = UINT_MAX;
-    }
+    start_page_number = LinearFindFreeRange(page_table_, low_page_number, max_base_page_number,
+                                            page_count, page_scan_stride, top_down);
   }
+  uint32_t end_page_number =
+      start_page_number == UINT_MAX ? UINT_MAX : start_page_number + page_count - 1;
   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
     // Out of memory.
     REXSYS_ERROR("BaseHeap::Alloc failed to find contiguous range");
@@ -1703,6 +1875,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
   }
 
+  UpdateFreeBits(start_page_number, end_page_number);
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
     return false;
   }
@@ -1746,6 +1919,7 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
     page_entry.state &= ~memory::kMemoryAllocationCommit;
   }
 
+  UpdateFreeBits(start_page_number, end_page_number);
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
     return false;
   }
@@ -1808,6 +1982,7 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
     unreserved_page_count_++;
   }
 
+  UpdateFreeBits(base_page_number, end_page_number);
   if (!SyncHostPageAccess(base_page_number, end_page_number)) {
     return false;
   }

@@ -50,3 +50,10 @@ the edition overlays or the test tooling.
     the loading movie thread owns the Direct3D device, the rendering thread does not read commands; with the game's
     256 KB buffer the game thread could fill it before the movie stopped and spin forever. Do not set it back to 256.
     Checked: 12 launches out of 12 reached the title (before: black in 1 of 6, once 3 in a row).
+
+## Never read cntvct_el0 on the Switch (2026-10-07)
+
+`mrs x, cntvct_el0` traps on Horizon (EC 0x18). A timing helper (`me_ring_partition.h`) read it when the ring thread
+started, even with its cvar off; the ring thread died, the game kept running and every frame stayed black. Use
+`cntpct_el0` (libnx `armGetSystemTick`, 19.2 MHz). `tools/edition.sh` now refuses to build if the sources read
+`cntvct_el0`. Also: never create `std::thread` from SDK/guest threads (std::system_error at start).

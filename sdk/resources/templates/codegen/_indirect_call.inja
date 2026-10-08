@@ -7,6 +7,16 @@
 // REX_THUNK_RESERVE_SIZE) range; out-of-bounds targets and in-bounds
 // unregistered slots fall back to rex::runtime::ResolveIndirectFunction,
 // which queries the global FunctionDispatcher across every loaded module.
+//
+// REX_INDIRECT_DISPATCH (compile definition, default 0) selects the hit path:
+//   0  legacy: the per-module table above (one 8-byte slot per guest instruction)
+//   1  compact 1 MB hash table of function entry points (rex/ppc/indirect_dispatch.h)
+//   2  per-call-site inline cache, misses through the compact table
+// Targets the compact table does not hold take the legacy path unchanged
+// (rex_indirect_legacy_). REX_INDIRECT_DISPATCH_VERIFY=1 also computes the
+// legacy result at every call and compares (cvar indirect_dispatch_verify_calls).
+// This block is copied verbatim into an existing pch by tools/pch_indirect_dispatch.py:
+// keep it free of template syntax.
 //=============================================================================
 
 #ifdef REXGLUE_ENABLE_PROFILING
@@ -16,8 +26,14 @@
 #define REX_PROFILE_INDIRECT_DISPATCH()
 #endif
 
+#ifndef REX_INDIRECT_DISPATCH
+#define REX_INDIRECT_DISPATCH 0
+#endif
+
 #define REX_LOOKUP_FUNC(x, y) \
   (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))
+
+#if REX_INDIRECT_DISPATCH == 0
 
 #define REX_CALL_INDIRECT_FUNC(x)                                                          \
   do {                                                                                     \
@@ -36,3 +52,80 @@
     }                                                                                      \
     rex_indirect_func_(ctx, base);                                                         \
   } while (0)
+
+#else  // REX_INDIRECT_DISPATCH != 0
+
+#include <rex/ppc/indirect_dispatch.h>
+
+// The legacy lookup (identical to the REX_INDIRECT_DISPATCH == 0 macro), for targets the compact table lacks.
+[[maybe_unused]] static inline PPCFunc* rex_indirect_legacy_(PPCContext& ctx, uint8_t* base, uint32_t target) {
+  PPCFunc* fn = nullptr;
+  if ((uint32_t)(target - REX_CODE_BASE) < REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE) [[likely]] {
+    fn = REX_LOOKUP_FUNC(base, target);
+  }
+  if (!fn) [[unlikely]] {
+    ctx.last_indirect_target = target;
+    fn = rex::runtime::ResolveIndirectFunction(target);
+  }
+  return fn;
+}
+
+// Out of line (one copy per translation unit): compact-table probe, inline-cache refill, legacy fallback.
+[[maybe_unused, gnu::noinline]] static PPCFunc* rex_indirect_miss_(PPCContext& ctx, uint8_t* base,
+                                                                    uint32_t target, uint64_t* ic) {
+  if (PPCFunc* fn = rex::runtime::indirect::Find(target, ic)) {
+    return fn;
+  }
+  return rex_indirect_legacy_(ctx, base, target);
+}
+
+#if defined(REX_INDIRECT_DISPATCH_VERIFY) && REX_INDIRECT_DISPATCH_VERIFY
+#define REX_INDIRECT_VERIFY_(fn, target) \
+  fn = rex::runtime::indirect::Verify(target, fn, rex_indirect_legacy_(ctx, base, target))
+#else
+#define REX_INDIRECT_VERIFY_(fn, target) ((void)0)
+#endif
+
+#if REX_INDIRECT_DISPATCH == 1
+
+// Home slot of the compact table inline; a different key there (probe, absent target) goes out of line.
+#define REX_CALL_INDIRECT_FUNC(x)                                                                    \
+  do {                                                                                               \
+    REX_PROFILE_INDIRECT_DISPATCH();                                                                 \
+    uint32_t rex_indirect_target_ = (uint32_t)(x);                                                   \
+    uint64_t rex_indirect_entry_ = rex::runtime::indirect::LoadEntry(                                \
+        &rex::runtime::indirect::g_table[rex::runtime::indirect::Slot(rex_indirect_target_)]);       \
+    PPCFunc* rex_indirect_func_;                                                                     \
+    if ((uint32_t)rex_indirect_entry_ == rex_indirect_target_) [[likely]] {                          \
+      rex_indirect_func_ = rex::runtime::indirect::Decode(rex_indirect_entry_);                      \
+    } else {                                                                                         \
+      rex_indirect_func_ = rex_indirect_miss_(ctx, base, rex_indirect_target_, nullptr);             \
+    }                                                                                                \
+    REX_INDIRECT_VERIFY_(rex_indirect_func_, rex_indirect_target_);                                  \
+    rex_indirect_func_(ctx, base);                                                                   \
+  } while (0)
+
+#elif REX_INDIRECT_DISPATCH == 2
+
+// One 8-byte cache per call site ({guest target, host offset}, zero = target 0 -> legacy trap path).
+#define REX_CALL_INDIRECT_FUNC(x)                                                                    \
+  do {                                                                                               \
+    REX_PROFILE_INDIRECT_DISPATCH();                                                                 \
+    static uint64_t rex_indirect_ic_;                                                                \
+    uint32_t rex_indirect_target_ = (uint32_t)(x);                                                   \
+    uint64_t rex_indirect_entry_ = rex::runtime::indirect::LoadEntry(&rex_indirect_ic_);             \
+    PPCFunc* rex_indirect_func_;                                                                     \
+    if ((uint32_t)rex_indirect_entry_ == rex_indirect_target_) [[likely]] {                          \
+      rex_indirect_func_ = rex::runtime::indirect::Decode(rex_indirect_entry_);                      \
+    } else {                                                                                         \
+      rex_indirect_func_ = rex_indirect_miss_(ctx, base, rex_indirect_target_, &rex_indirect_ic_);   \
+    }                                                                                                \
+    REX_INDIRECT_VERIFY_(rex_indirect_func_, rex_indirect_target_);                                  \
+    rex_indirect_func_(ctx, base);                                                                   \
+  } while (0)
+
+#else
+#error "REX_INDIRECT_DISPATCH must be 0, 1 or 2"
+#endif
+
+#endif  // REX_INDIRECT_DISPATCH

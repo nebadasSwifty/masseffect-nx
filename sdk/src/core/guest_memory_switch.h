@@ -189,6 +189,29 @@ int RexGmProtectionMode(void);
  */
 uint32_t RexGmLastResult(void);
 
+/*
+ * Large pages for the window (see docs/platform-notes.md, "Guest memory page size"). Init only:
+ * ignored once RexGmInit has run. 0 = off (as before), 1 = window and shadows 2 MB aligned (every
+ * view but 0xE0000000 can get 2 MB blocks), 2 = as 1 with the physical chunk grid shifted by 4 KB
+ * so that 0xE0000000 is the congruent view instead of 0xA0000000/0xC0000000/raw.
+ */
+void RexGmConfigure(int large_pages_mode);
+int RexGmLargePagesMode(void);
+
+/*
+ * Writes a one-line summary of how the window is mapped (kernel memory blocks, 2 MB granules per
+ * view that can be block-mapped). Returns the length written. Takes the lock briefly.
+ */
+size_t RexGmLayoutSummary(char* buf, size_t cap);
+
+/*
+ * Startup micro-benchmark: random dependent loads over `bytes` (and over its first 8 MB) through
+ * the heap, a code alias, and process-memory mappings that allow 2 MB, 64 KB and 4 KB pages.
+ * Each result line is passed to `emit`. Takes a few seconds; call from an init thread.
+ */
+typedef void (*RexGmEmitFn)(const char* line);
+void RexGmTlbBenchmark(size_t bytes, size_t loads, RexGmEmitFn emit);
+
 #define REX_GM_ERR_NOMEM    0xFFFF0001u  /* memalign of the backing store failed */
 #define REX_GM_ERR_NOCODEVA 0xFFFF0002u  /* no free space left in the code region */
 

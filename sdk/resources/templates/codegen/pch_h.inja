@@ -275,6 +275,20 @@ extern PPCFuncMapping PPCFuncMappings[];
        : __builtin_bswap64(*(volatile u64*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr))))
 
 //=============================================================================
+// Cache hints (dcbt / dcbtst with the codegen option dcbt_prefetch)
+//=============================================================================
+// Host prefetch of the guest effective address; never faults (PRFM). Compile with REX_DCBT_PREFETCH=0 to drop
+// them again without regenerating.
+
+#if !defined(REX_DCBT_PREFETCH) || REX_DCBT_PREFETCH
+#define REX_DCBT(ea) __builtin_prefetch((const void*)REX_RAW_ADDR(ea), 0, 3)
+#define REX_DCBTST(ea) __builtin_prefetch((const void*)REX_RAW_ADDR(ea), 1, 3)
+#else
+#define REX_DCBT(ea) ((void)(ea))
+#define REX_DCBTST(ea) ((void)(ea))
+#endif
+
+//=============================================================================
 // Function Dispatch
 //=============================================================================
 

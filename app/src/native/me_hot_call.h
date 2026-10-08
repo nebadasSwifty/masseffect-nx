@@ -10,6 +10,8 @@
 
 #include "me_hot_common.h"
 
+#include <rex/ppc/indirect_dispatch.h>
+
 namespace me::hot {
 
 inline constexpr uint64_t kImageBase = 0x82000000ull;
@@ -21,6 +23,13 @@ inline constexpr uint64_t kThunkReserve = 0x10000ull;
 // The caller sets ctx.lr / r1 / the argument registers exactly as the original function does before the `bctrl`.
 inline void CallIndirect(PPCContext& ctx, uint8_t* base, uint32_t target) {
   PPCFunc* fn;
+#if defined(REX_INDIRECT_DISPATCH) && REX_INDIRECT_DISPATCH != 0
+  // Same compact table as the generated code (MASSEFFECT_INDIRECT_DISPATCH); nullptr = take the legacy path below.
+  if ((fn = rex::runtime::indirect::Lookup(target))) [[likely]] {
+    fn(ctx, base);
+    return;
+  }
+#endif
   if (uint32_t(target - uint32_t(kCodeBase)) < kCodeSize + kThunkReserve) [[likely]] {
     fn = *reinterpret_cast<PPCFunc**>(base + (kImageBase + kImageSize + (uint64_t(target) - kCodeBase) * 2));
   } else {
