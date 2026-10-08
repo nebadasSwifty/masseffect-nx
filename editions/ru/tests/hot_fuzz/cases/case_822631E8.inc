@@ -1,14 +1,16 @@
-// ORIG: sub_822631E8 sub_822634D8
+// ORIG: sub_82262EC0 sub_822631B0
 // NATIVE: n_822631E8.h
-// sub_822631E8: 4x4 float matrix inverse. The two constants it reads (1.0f, the compare constant 0.0f) and the 64-byte
+// Russian edition copy of tests/hot_fuzz/cases/case_822631E8.inc (RU sub_82262EC0 / sub_822631B0, English sub_822631E8 /
+// sub_822634D8); the guest constants come from the RU n_822631E8.h.
+// sub_82262EC0: 4x4 float matrix inverse. The two constants it reads (1.0f, the compare constant 0.0f) and the 64-byte
 // identity block live outside the fuzz window, so the generator writes them into arena A and the native wrapper writes
 // the same bytes into arena B (the harness only copies the window).
 // Special float values (+-inf, quiet/signalling NaNs with random payloads and signs, +-0, denormals, huge values that
 // overflow) are generated on purpose: a NaN determinant or NaN result must make the native version delegate to the
 // original, because the NaN sign/payload depends on the compiled operand order (console guard failure 2026-10-09:
 // "memory +0 native=0x7f original=0xff" from a -inf input).
-extern "C" void __imp__sub_822631E8(PPCContext&, uint8_t*);
-extern "C" void __imp__sub_822634D8(PPCContext&, uint8_t*);
+extern "C" void __imp__sub_82262EC0(PPCContext&, uint8_t*);
+extern "C" void __imp__sub_822631B0(PPCContext&, uint8_t*);
 namespace {
 namespace c822631E8 {
 
@@ -16,7 +18,7 @@ uint32_t g_one = 0x3F800000, g_cmp = 0, g_ident[16];  // host-order bit patterns
 uint64_t n_gen = 0, n_det0 = 0, n_cmp_eq = 0, n_nan = 0, n_inf = 0, n_alias = 0;
 struct Stat {
   ~Stat() {
-    std::printf("   [822631E8 coverage: gen=%llu det==0 branch=%llu det==cmp(nonzero)=%llu nan-det=%llu inf-det=%llu dst-overlaps-src=%llu]\n",
+    std::printf("   [82262EC0 coverage: gen=%llu det==0 branch=%llu det==cmp(nonzero)=%llu nan-det=%llu inf-det=%llu dst-overlaps-src=%llu]\n",
                 (unsigned long long)n_gen, (unsigned long long)n_det0, (unsigned long long)n_cmp_eq,
                 (unsigned long long)n_nan, (unsigned long long)n_inf, (unsigned long long)n_alias);
   }
@@ -113,7 +115,7 @@ void gen(fuzz::Rng& r, uint8_t* base, PPCContext& ctx) {
     tmp.r1.u64 = ctx.r1.u64 - 0x2000;  // scratch area, away from the data
     tmp.r3.u64 = src;
     tmp.fpscr.csr = ctx.fpscr.getcsr();
-    __imp__sub_822634D8(tmp, base);
+    __imp__sub_822631B0(tmp, base);
     const double det = tmp.f1.f64;
     if (det != det) n_nan++;
     if (std::isinf(det)) n_inf++;
@@ -128,6 +130,6 @@ void gen(fuzz::Rng& r, uint8_t* base, PPCContext& ctx) {
   n_gen++;
 }
 }  // namespace c822631E8
-fuzz::Registrar reg_822631E8({"sub_822631E8", __imp__sub_822631E8, c822631E8::nat, me::hot::n_822631E8::Writes,
+fuzz::Registrar reg_822631E8({"sub_82262EC0", __imp__sub_82262EC0, c822631E8::nat, me::hot::n_822631E8::Writes,
                               me::hot::n_822631E8::kCmp, 0x40000000, 0x20000, c822631E8::gen});
 }  // namespace
