@@ -15,11 +15,19 @@
 // Not reproduced (dead scratch, checked by liveness.py: callers only read r3 after the call): f0-f13, r0, r4-r12,
 // and the stack scratch below r1 (the 64-byte temporary, the callee's f28-f31 spills, lr/back-chain words).
 // Residual difference (impossible in practice): a destination that points into the callee-owned stack frame itself.
+// NaN results: the sign and payload of a NaN depend on which operand the FPU returns when NaNs meet (AArch64 returns
+// the first NaN operand of the instruction the compiler emitted; a fresh invalid-operation NaN is +default NaN and
+// fneg flips it), so they are only reproducible bit-exactly by running the very same compiled code. Whenever the
+// determinant or any of the 16 results is NaN (NaN inputs, inf*0, inf-inf, overflow to +-inf followed by a
+// subtraction), nothing has been written yet and the call is delegated to the original (__imp__sub_82262EC0, the
+// unpatched entry). NaN-free results are fully determined by IEEE rounding, which both paths share.
 #pragma once
 
 #include <cmath>
 
 #include "../me_hot_common.h"
+
+extern "C" void __imp__sub_82262EC0(PPCContext&, uint8_t*);
 
 namespace me::hot::n_822631E8 {
 
@@ -78,6 +86,10 @@ inline void Native(PPCContext& ctx, uint8_t* base) {
     d13 = double(float(std::fma(d12, d31, -d13)));
     d0 = double(float(std::fma(d0, d30, d13)));
     d1 = double(float(-std::fma(d11, d29, -d0)));
+  if (d1 != d1) [[unlikely]] {  // NaN determinant: every result is NaN, see the header
+    __imp__sub_82262EC0(ctx, base);
+    return;
+  }
   if (d1 == double(LdF32(base, kR - 15532))) {
     // singular: copy the constant block, 8 bytes at a time exactly as the original (ld/std pairs, no byte swap needed)
     for (uint32_t i = 0; i < 64; i += 8) {
@@ -233,6 +245,12 @@ inline void Native(PPCContext& ctx, uint8_t* base) {
     o[15] = float(f0);
     f0 = -f12;
     o[14] = float(f0);
+  bool nan = false;
+  for (int i = 0; i < 16; ++i) nan |= (o[i] != o[i]);
+  if (nan) [[unlikely]] {  // NaN sign/payload is operand-order dependent, see the header
+    __imp__sub_82262EC0(ctx, base);
+    return;
+  }
   uint32_t w[16];
   for (int i = 0; i < 16; ++i) std::memcpy(&w[i], &o[i], 4);
   for (int i = 0; i < 16; ++i) St32(base, dst + 4 * i, w[i]);
