@@ -59,7 +59,7 @@ REXCVAR_DEFINE_BOOL(input_touch_debug, false, "Input",
 REXCVAR_DEFINE_BOOL(input_rumble_dynamic, true, "Input",
                     "Rumble: the Joy-Con frequency follows the Xbox motor speed (and weak values are lifted), as an "
                     "eccentric motor does; false = fixed 160/320 Hz, only the strength changes");
-REXCVAR_DEFINE_DOUBLE(input_touch_camera_sensitivity, 2.5, "Input",
+REXCVAR_DEFINE_DOUBLE(input_touch_camera_sensitivity, 4.0, "Input",
                       "Touch camera: full right stick at 1000/sensitivity screen pixels per second of finger speed");
 REXCVAR_DEFINE_DOUBLE(input_touch_camera_deadzone, 20.0, "Input",
                       "Touch camera: finger speeds below this many pixels per second give no stick");

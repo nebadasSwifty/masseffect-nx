@@ -83,7 +83,7 @@ input_rumble = true
 #  - Coordinates are 1280x720 screen pixels (the touch panel's own space, whatever the render resolution).
 # input_touch = true
 # input_touch_camera = true
-# input_touch_camera_sensitivity = 2.5
+# input_touch_camera_sensitivity = 4.0
 # input_touch_camera_deadzone = 20.0          # finger pixels per second ignored
 # input_touch_camera_min_stick = 8000         # first stick value past the deadzone (skips the game's deadzone)
 # input_touch_camera_smoothing_ms = 40.0      # 0 = raw finger speed

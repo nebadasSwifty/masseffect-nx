@@ -142,3 +142,4 @@ Log of 38 touches: still taps moved 31-44 px between touch-down and lift (finger
 camera drag; one took 566 ms. Defaults changed: tap_max_move 30 -> 70 px, tap_max_ms 300 -> 500 ms. A 180 degree turn
 needed too many swipes: camera_sensitivity 1.0 -> 2.5 (full stick at 400 px/s of finger speed).
 Second session (same day, new defaults): taps on the reply lines select the right reply (user confirmed); camera speed OK.
+Third session (2026-10-09): turning still needed long swipes; camera_sensitivity 2.5 -> 4.0 (full stick at 250 px/s).
