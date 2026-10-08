@@ -91,6 +91,11 @@ for src in "$HERE"/cpu/test_*.cpp; do
       # NEON audio conversion against the scalar loop it replaces (copies of the SDK code).
       std=c++23; strict=(-w)
       case "$(uname -m)" in arm64|aarch64) ;; *) report SKIP "$name" "needs NEON (ARM host)"; continue ;; esac ;;
+    test_audio_output)
+      # NEON output stage of the Switch audio system (SDK header) against the scalar code it replaced. No FP
+      # contraction, like the SDK build (clang's default would fuse the scalar reference's multiply-adds).
+      std=c++23; strict=(-Wall -Werror -ffp-contract=off)
+      extra_inc=(-I"$SDK/include") ;;
     test_native_copy_vertices)
       case "$(uname -m)" in arm64|aarch64) ;; *) report SKIP "$name" "needs NEON (ARM host)"; continue ;; esac ;;
     test_native_fragcoord_xy_spirv)

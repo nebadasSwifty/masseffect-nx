@@ -145,10 +145,72 @@ __attribute__((noinline)) inline void MulPhase(uint8_t* base, uint32_t buffer, u
   }
 }
 
-// Phase 2 (FZ=0): the scalar recurrence, per channel, in double like fmadds.
+// Phase 2 (FZ=0): the scalar recurrence, per channel, in double like fmadds:
+//   y = (float)fma(a, y, x[j]), kept as double between steps.
+// The recurrence is serial within a channel (latency bound: fma + two conversions per sample), but the channels are
+// independent, so two channels share one float64x2 lane pair and up to three pairs run interleaved. FMLA / FCVTN /
+// FCVTL on the vector unit round exactly like the scalar FMADD / FCVT (IEEE fma, same FPCR), so every lane is
+// bit-identical to the one-channel scalar loop (tests/audio_dsp).
+template <int P>
+inline void ChainPairs(uint8_t* base, uint32_t state_address, uint32_t ch0, float64x2_t a2, const float* x,
+                       float* y) {
+  float64x2_t s[P];
+  const float* xa[P];
+  const float* xb[P];
+  float* ya[P];
+  float* yb[P];
+  for (int p = 0; p < P; ++p) {
+    const uint32_t c = ch0 + 2 * p;
+    const float s0 = LoadBEf(base, state_address + 4 * c);
+    const float s1 = LoadBEf(base, state_address + 4 * (c + 1));
+    s[p] = vcvt_f64_f32(vset_lane_f32(s1, vdup_n_f32(s0), 1));
+    xa[p] = x + size_t(c) * kFloatsPerChannel;
+    xb[p] = xa[p] + kFloatsPerChannel;
+    ya[p] = y + size_t(c) * kFloatsPerChannel;
+    yb[p] = ya[p] + kFloatsPerChannel;
+  }
+  for (uint32_t j = 0; j < kFloatsPerChannel; j += 4) {
+    for (int p = 0; p < P; ++p) {
+      const float32x4_t va = vld1q_f32(xa[p] + j);
+      const float32x4_t vb = vld1q_f32(xb[p] + j);
+      const float32x4_t lo = vzip1q_f32(va, vb);  // a0 b0 a1 b1
+      const float32x4_t hi = vzip2q_f32(va, vb);  // a2 b2 a3 b3
+      const float32x2_t r0 = vcvt_f32_f64(vfmaq_f64(vcvt_f64_f32(vget_low_f32(lo)), a2, s[p]));
+      s[p] = vcvt_f64_f32(r0);
+      const float32x2_t r1 = vcvt_f32_f64(vfmaq_f64(vcvt_high_f64_f32(lo), a2, s[p]));
+      s[p] = vcvt_f64_f32(r1);
+      const float32x2_t r2 = vcvt_f32_f64(vfmaq_f64(vcvt_f64_f32(vget_low_f32(hi)), a2, s[p]));
+      s[p] = vcvt_f64_f32(r2);
+      const float32x2_t r3 = vcvt_f32_f64(vfmaq_f64(vcvt_high_f64_f32(hi), a2, s[p]));
+      s[p] = vcvt_f64_f32(r3);
+      const float32x4_t q01 = vcombine_f32(r0, r1);  // a0 b0 a1 b1
+      const float32x4_t q23 = vcombine_f32(r2, r3);  // a2 b2 a3 b3
+      vst1q_f32(ya[p] + j, vuzp1q_f32(q01, q23));
+      vst1q_f32(yb[p] + j, vuzp2q_f32(q01, q23));
+    }
+  }
+  for (int p = 0; p < P; ++p) {
+    const uint32_t c = ch0 + 2 * p;
+    const float32x2_t f = vcvt_f32_f64(s[p]);
+    StoreBEf(base, state_address + 4 * c, vget_lane_f32(f, 0));
+    StoreBEf(base, state_address + 4 * (c + 1), vget_lane_f32(f, 1));
+  }
+}
+
 __attribute__((noinline)) inline void ChainPhase(uint8_t* base, uint32_t state_address,
                                                   uint32_t channels, double a, const float* x, float* y) {
-  for (uint32_t ch = 0; ch < channels; ++ch) {
+  const float64x2_t a2 = vdupq_n_f64(a);
+  uint32_t ch = 0;
+  for (; ch + 6 <= channels; ch += 6) ChainPairs<3>(base, state_address, ch, a2, x, y);
+  if (ch + 4 <= channels) {
+    ChainPairs<2>(base, state_address, ch, a2, x, y);
+    ch += 4;
+  }
+  if (ch + 2 <= channels) {
+    ChainPairs<1>(base, state_address, ch, a2, x, y);
+    ch += 2;
+  }
+  for (; ch < channels; ++ch) {  // odd channel: the scalar loop
     double state = double(LoadBEf(base, state_address + 4 * ch));
     const float* xc = x + size_t(ch) * kFloatsPerChannel;
     float* yc = y + size_t(ch) * kFloatsPerChannel;

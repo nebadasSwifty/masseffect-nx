@@ -115,12 +115,8 @@ bool SwitchAudioDriver::MixFrameInto(float* stereo_out, const StereoFold& fold, 
     frame = frames_queued_.front();
     frames_queued_.pop();
   }
-  std::array<float, kChannelSamples * 2> folded;
-  conversion::sequential_6_BE_to_interleaved_2_LE(folded.data(), frame, kChannelSamples, fold,
-                                                  gain);
-  for (size_t i = 0; i < folded.size(); ++i) {
-    stereo_out[i] += folded[i];
-  }
+  // Fold and accumulate in one pass (same results as folding into a temporary and adding it).
+  conversion::sequential_6_BE_fold_add_interleaved_2_LE(stereo_out, frame, kChannelSamples, fold, gain);
   {
     std::lock_guard<std::mutex> guard(frames_mutex_);
     frames_unused_.push(frame);
@@ -322,14 +318,11 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
   if (REXCVAR_GET(audio_mute)) {
     std::memset(samples, 0, kBufferBytes);
   } else {
-    for (size_t i = 0; i < output.mix.size(); ++i) {
-      const float value = std::isfinite(output.mix[i]) ? output.mix[i] : 0.0f;
-      const float magnitude = std::fabs(value);
-      pico = std::max(pico, magnitude);
-      saturated += magnitude > 1.0f ? 1 : 0;
-      samples[i] = static_cast<s16>(std::lrint(std::clamp(value, -1.0f, 1.0f) * 32767.0f));
-      pcm_nonzero |= samples[i] != 0;
-    }
+    // NEON on the console, the same results as the scalar loop (tests/cpu/test_audio_output.cpp).
+    const conversion::MixStats stats = conversion::mix_to_s16(samples, output.mix.data(), output.mix.size());
+    pico = stats.peak;
+    saturated = stats.saturated;
+    pcm_nonzero = stats.nonzero;
   }
   RexSwitchPerfAdd(21, saturated);
   RexSwitchPerfAdd(22, pico >= 0.98f ? 1 : 0);
