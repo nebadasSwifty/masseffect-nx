@@ -319,13 +319,25 @@ inline void RunWrites(const PPCContext& ctx, me::hot::Writes& w) {
   const int32_t count = ctx.r6.s32;
   if (count < INT32_MIN + 8) return;  // declined
   w.Add(ctx.r7.u32, 52);
-  const uint64_t bytes = uint64_t(Blocks(count)) * 32 + 16;
+  // Block k stores 16-byte vectors at (dst + 32k) & ~15 and (dst + 32k + 16) & ~15: exactly [dst & ~15, + 32 * blocks).
+  // Stereo adds the same extent 1024 bytes higher; when the two overlap (more than 32 blocks) they are declared as one
+  // range (the guard handles overlapping ranges too, but one range is simpler to read in a DIFFERENCE line).
+  const uint64_t bytes = uint64_t(Blocks(count)) * 32;
+  const uint32_t lo = ctx.r5.u32 & ~0xFu;
+  if (kStereo && bytes > 1024) {
+    if (bytes + 1024 > me::hot::Writes::kMaxBytes) {
+      w.overflow = true;
+      return;
+    }
+    w.Add(lo, uint32_t(bytes + 1024));
+    return;
+  }
   if (bytes > me::hot::Writes::kMaxBytes) {
     w.overflow = true;
     return;
   }
-  w.Add(ctx.r5.u32 & ~0xFu, uint32_t(bytes));
-  if constexpr (kStereo) w.Add((ctx.r5.u32 + 1024) & ~0xFu, uint32_t(bytes));
+  w.Add(lo, uint32_t(bytes));
+  if constexpr (kStereo) w.Add(lo + 1024, uint32_t(bytes));
 }
 
 }  // namespace detail

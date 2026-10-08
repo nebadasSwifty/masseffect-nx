@@ -19,6 +19,7 @@
 // every direct call site of a hooked function for reads of volatile registers after the call.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -102,6 +103,48 @@ struct Writes {
     r[n++] = {addr, len};
   }
 };
+
+// Snapshot / rollback of the declared write ranges for the guard (me_hot_guest.cpp Check) and the fuzzer's replay of it
+// (tests/hot_fuzz/main.cpp). The ranges may overlap (e.g. two output planes whose rounded extents touch): every copy of
+// all ranges is taken before any range is written back, so an overlap is copied consistently (2026-10-09: the guard
+// copied the native result of range 1 after restoring range 0 over their common bytes and reported a false DIFFERENCE
+// for sub_82B2D780).
+inline size_t TotalBytes(const Writes& w) {
+  size_t total = 0;
+  for (int i = 0; i < w.n; ++i) total += w.r[i].len;
+  return total;
+}
+// Copies every range, in order, into out (TotalBytes(w) bytes).
+inline void SaveRanges(const Writes& w, const uint8_t* base, uint8_t* out) {
+  for (int i = 0; i < w.n; ++i) {
+    std::memcpy(out, Raw(base, w.r[i].addr), w.r[i].len);
+    out += w.r[i].len;
+  }
+}
+// Writes a SaveRanges copy back. Overlapping bytes get the same value from every range that holds them, as long as the
+// copy was taken in one SaveRanges call.
+inline void RestoreRanges(const Writes& w, uint8_t* base, const uint8_t* from) {
+  for (int i = 0; i < w.n; ++i) {
+    std::memcpy(Raw(base, w.r[i].addr), from, w.r[i].len);
+    from += w.r[i].len;
+  }
+}
+// First byte where the current memory differs from a SaveRanges copy: returns false when equal, else the range index and
+// the offset in it.
+inline bool FirstRangeDiff(const Writes& w, const uint8_t* base, const uint8_t* ref, int* range, uint32_t* offset) {
+  for (int i = 0; i < w.n; ++i) {
+    const uint8_t* now = Raw(base, w.r[i].addr);
+    if (std::memcmp(now, ref, w.r[i].len) != 0) {
+      uint32_t k = 0;
+      while (now[k] == ref[k]) ++k;
+      *range = i;
+      *offset = k;
+      return true;
+    }
+    ref += w.r[i].len;
+  }
+  return false;
+}
 
 // Volatile registers that must be identical after the replacement (bit n = register n). r1, r13-r31, f14-f31,
 // v14-v31 and the FPSCR are always compared.

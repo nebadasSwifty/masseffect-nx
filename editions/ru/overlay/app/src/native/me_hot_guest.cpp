@@ -118,14 +118,9 @@ void Check(Hook& h, PPCContext& ctx, uint8_t* base) {
     h.orig(ctx, base);
     return;
   }
-  size_t total = 0;
-  for (int i = 0; i < w.n; ++i) total += w.r[i].len;
+  const size_t total = TotalBytes(w);
   std::vector<uint8_t> before(total), native_out(total);
-  size_t off = 0;
-  for (int i = 0; i < w.n; ++i) {
-    std::memcpy(before.data() + off, Raw(base, w.r[i].addr), w.r[i].len);
-    off += w.r[i].len;
-  }
+  SaveRanges(w, base, before.data());
   const uint32_t hw_before = ctx.fpscr.getcsr();
   const uint32_t csr_before = ctx.fpscr.csr;
   const PPCContext in = ctx;  // inputs for the report
@@ -135,12 +130,9 @@ void Check(Hook& h, PPCContext& ctx, uint8_t* base) {
     return;
   }
   const uint32_t hw_native = nat.fpscr.getcsr();
-  off = 0;
-  for (int i = 0; i < w.n; ++i) {
-    std::memcpy(native_out.data() + off, Raw(base, w.r[i].addr), w.r[i].len);
-    std::memcpy(Raw(base, w.r[i].addr), before.data() + off, w.r[i].len);  // roll back
-    off += w.r[i].len;
-  }
+  // All ranges are copied before any is rolled back: declared ranges may overlap (me_hot_common.h SaveRanges).
+  SaveRanges(w, base, native_out.data());
+  RestoreRanges(w, base, before.data());  // roll back
   ctx.fpscr.setcsr(hw_before);
   ctx.fpscr.csr = csr_before;
   h.orig(ctx, base);  // the call for real
@@ -149,17 +141,14 @@ void Check(Hook& h, PPCContext& ctx, uint8_t* base) {
   std::string diff = CompareRegs(h.cmp, nat, ctx);
   if (diff.empty() && hw_native != hw_orig) diff = fmt::format("hardware FPCR native={:#x} original={:#x}", hw_native, hw_orig);
   if (diff.empty()) {
-    off = 0;
-    for (int i = 0; i < w.n && diff.empty(); ++i) {
-      const uint8_t* now = Raw(base, w.r[i].addr);
-      for (uint32_t k = 0; k < w.r[i].len; ++k) {
-        if (now[k] != native_out[off + k]) {
-          diff = fmt::format("memory {:#010x} (+{} of range {:#010x}+{}) native={:#04x} original={:#04x}",
-                             w.r[i].addr + k, k, w.r[i].addr, w.r[i].len, native_out[off + k], now[k]);
-          break;
-        }
-      }
-      off += w.r[i].len;
+    int ri = 0;
+    uint32_t k = 0;
+    if (FirstRangeDiff(w, base, native_out.data(), &ri, &k)) {
+      size_t off = 0;
+      for (int i = 0; i < ri; ++i) off += w.r[i].len;
+      diff = fmt::format("memory {:#010x} (+{} of range {:#010x}+{}) native={:#04x} original={:#04x}",
+                         w.r[ri].addr + k, k, w.r[ri].addr, w.r[ri].len, native_out[off + k],
+                         *Raw(base, w.r[ri].addr + k));
     }
   }
   const uint64_t n = h.checks.fetch_add(1, std::memory_order_relaxed) + 1;
