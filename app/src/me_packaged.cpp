@@ -115,6 +115,18 @@ extern "C" void __libnx_initheap(void) {
   if (envHasHeapOverride()) {
     addr = envGetHeapOverrideAddr();
     size = envGetHeapOverrideSize();
+    // hbloader's heap leaves only ~2 MB of the application pool to the kernel (pool 3281/3285 MB in use). Page
+    // tables for new mappings, GPU and display buffer queues and file-system work then hit svc::ResultLimitReached
+    // (0x10801) at start: refused display dequeues/queues, failed shader-package and game-package reads ("Disc Read
+    // Error"), sys-ftpd unable to read its config (2026-10-10, mostly the EN edition). Give kRelease back.
+    constexpr size_t kRelease = 0x4000000;  // 64 MB
+    if (size > kRelease * 8) {
+      void* shrunk = nullptr;
+      if (R_SUCCEEDED(svcSetHeapSize(&shrunk, size - kRelease))) {
+        addr = shrunk;  // the heap region does not move; take the kernel's answer anyway
+        size -= kRelease;
+      }
+    }
   } else {
     u64 available = 0, used = 0;
     svcGetInfo(&available, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
@@ -124,6 +136,8 @@ extern "C" void __libnx_initheap(void) {
     // hbloader leaves 96 MB for the system's automatic gameplay recording when the NACP enables it (VideoCapture 2),
     // which tools/build_nsp.sh and tools/build_full_nsp.py both set. (No services yet here to read the NACP.)
     if (size > 0x6000000) size -= 0x6000000;
+    // The same 64 MB for the kernel as on the NRO path above.
+    if (size > 0x4000000 * 8) size -= 0x4000000;
     if (R_FAILED(svcSetHeapSize(&addr, size))) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
   }
   fake_heap_start = static_cast<char*>(addr);
