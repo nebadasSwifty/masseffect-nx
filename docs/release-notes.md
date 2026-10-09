@@ -1,5 +1,23 @@
 Native Nintendo Switch port of Mass Effect (Xbox 360), work in progress.
 
+### What's Changed in v0.2.1
+
+**Please rebuild your shader package.** Packages made with the browser installer before this release missed shaders:
+the values in the settings menu and the bar under its title did not draw, and two other game shaders were missing.
+
+- **Installer:** builds every shader of your discs (31,128 of 31,128 on the Russian release with both DLC). It no longer
+  skips shaders it cannot make: it retries once and otherwise stops with an error instead of writing an incomplete
+  package. Fixed the browser shader translator crashing after many shaders on computers with few CPU cores.
+- **Installer:** can install the full NSP straight to the console over USB from Chrome or Edge (Sphaira, Install ->
+  USB); nothing is saved on the computer.
+- **New companion app for macOS:** [Switch USB Installer](https://github.com/nebadasSwifty/switch-usb-installer) - drag
+  an NSP onto it to install it over USB with Sphaira.
+- The game itself is the same as v0.2.0.
+
+**How to update:** open [the installer](https://nebadasSwifty.github.io/masseffect-nx/) again and build the package from
+your discs, then replace the files on the SD card (at least `masseffect_shaders.mesp` and `masseffect_shaders.mesp.idx`),
+or install the new full NSP.
+
 ### What's Changed in v0.2.0
 
 **Performance**
