@@ -9,7 +9,10 @@
 
 async function createModule(url, extra = {}) {
   const factory = (await import(/* @vite-ignore */ url)).default;
-  return factory(extra);
+  // The module finds its .wasm next to the .mjs; keep the .mjs URL's ?v= cache tag on it, so a new .mjs never runs
+  // with an old cached .wasm.
+  const search = new URL(url).search;
+  return factory({ locateFile: (path) => new URL(path, url).href.replace(/\?.*$/, '') + search, ...extra });
 }
 
 function describeError(e) {
@@ -17,8 +20,19 @@ function describeError(e) {
   return String(e.message ?? e).split('\n')[0].slice(0, 300);
 }
 
-/** Runs callMain and separates "the program ended with exit status N" from "the instance crashed". */
+// A module built without stackSave/stackRestore (an older site build) leaks its stack on every callMain; such an
+// instance is replaced after this many calls, well before its 4 MB stack runs out (~14,500 calls).
+const CALLS_WITHOUT_STACK_RESTORE = 4000;
+
+/**
+ * Runs callMain and separates "the program ended with exit status N" from "the instance crashed".
+ * Emscripten's callMain copies argv onto the stack and never pops it; the stack pointer is put back after each
+ * call, so one instance can run main any number of times (the translator runs once per shader).
+ */
 function runMain(module, args) {
+  const canRestore = typeof module.stackSave === 'function' && typeof module.stackRestore === 'function';
+  const sp = canRestore ? module.stackSave() : 0;
+  if (!canRestore) module.unrestoredCalls = (module.unrestoredCalls ?? 0) + 1;
   try {
     const code = module.callMain(args);
     return { code: typeof code === 'number' ? code : 0, crashed: false };
@@ -27,7 +41,14 @@ function runMain(module, args) {
       return { code: e.status, crashed: false };
     }
     return { code: -1, crashed: true, error: describeError(e) };
+  } finally {
+    if (canRestore) module.stackRestore(sp);
   }
+}
+
+/** True when an instance without stack restore has made enough calls that it should be replaced. */
+function worn(module) {
+  return (module?.unrestoredCalls ?? 0) >= CALLS_WITHOUT_STACK_RESTORE;
 }
 
 function tryUnlink(FS, path) {
@@ -92,6 +113,7 @@ export class ScanHandler {
           transfer.push(bytes.buffer);
         }
       }
+      if (worn(m)) this.module = null; // everything found so far was sent; a fresh instance starts with an empty /out
       post({ type: 'scanned', id, name, ok: r.code === 0, reason: r.code === 0 ? '' : `scanner exit ${r.code}`, containers, summary }, transfer);
     } catch (e) {
       post({ type: 'scanned', id, name, ok: false, reason: describeError(e), containers: [] });
@@ -154,11 +176,12 @@ export class ShaderHandler {
         this.hlsl = null;
         return fail('translate', `translator crashed (${r.error})`);
       }
+      if (worn(h)) this.hlsl = null; // the next job gets a fresh instance (the outputs below are read first)
       let produced = null;
       try { if (h.FS.readdir(out).includes(`${stem}.hlsl`)) produced = h.FS.readFile(`${out}/${stem}.hlsl`); } catch { /* none */ }
       removeTree(h.FS, out);
       if (!produced) {
-        const why = this.log.find((l) => /rejected|unknown|produced nothing|truncated/.test(l)) ?? `translator exit ${r.code}`;
+        const why = this.log.find((l) => /rejected|unknown|produced nothing|truncated|not a shader container/.test(l)) ?? `translator exit ${r.code}`;
         return fail('translate', why.trim());
       }
       hlslBytes = produced;
