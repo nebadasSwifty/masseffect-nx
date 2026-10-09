@@ -21,7 +21,7 @@ Rather than emulating the Xbox 360 hardware at runtime, the original PowerPC mac
 
 You can assemble your complete Switch installation package entirely in your desktop browser using the client-side installer: **https://nebadasswifty.github.io/masseffect-nx/** (available in English and Russian).
 
-1. **Select game files:** Open the installer and point it to your Xbox 360 disc image (`.iso`), multi-disc ISOs, or extracted game directory (containing `default.xex`).
+1. **Select game files:** Open the installer and point it to your Xbox 360 disc image (`.iso`) or extracted game directory (containing `default.xex`). For the Russian two-disc release choose **both** images (Disc 1 and Disc 2) together: the installer takes the intact copy of every file (Feros from Disc 1, Ilos and the ending from Disc 2) and checks every package.
 2. **Build package:** Click **Create masseffect-nx.zip**. The browser unpacks Unreal Engine packages (`*.xxx`), translates Xenos microcode to SPIR-V shaders, bundles the Switch executable, and packages everything locally. **Nothing is uploaded to the internet.**
 3. **Copy to SD card:** Extract the resulting `masseffect-nx.zip` into `sdmc:/switch/` so files reside in `/switch/masseffect-nx/`.
 4. **Install launcher forwarder:** Download `masseffect-nx-forwarder.nsp` and install it via your preferred homebrew manager (DBI, Sphaira, etc.). Ensure your forwarder is configured for **39-bit address space** so the process receives full application memory.
@@ -32,13 +32,14 @@ You can assemble your complete Switch installation package entirely in your desk
 sdmc:/switch/masseffect-nx/
   ├── masseffect-nx.nro          (native game executable)
   ├── masseffect.toml           (runtime configuration file)
+  ├── masseffect_prewarm_list.bin (pipeline prewarm list of your edition)
   ├── masseffect_shaders.mesp   (compiled SPIR-V shader library)
   ├── masseffect_shaders.mesp.idx (shader database index)
-  └── game_root/                (extracted game data: CookedXbox360, Movies, Maps)
+  └── game_root/                (your disc's files: default.xex, Layer0/, Layer1/)
 ```
 
 > [!NOTE]
-> **Incremental Updates:** When a new release of `masseffect-nx` is published, you do not need to re-copy the large ~7 GB `game_root/` folder. Simply open the installer page and select **Create masseffect-nx-update.zip**, which produces a lightweight zip containing only the updated binary, config, and shader library.
+> **Incremental Updates:** When a new release of `masseffect-nx` is published, you do not need to re-copy the large ~7 GB `game_root/` folder. Simply open the installer page and select **Create masseffect-nx-update.zip**, which produces a lightweight zip containing only the updated binary, config, pipeline prewarm list and shader library.
 
 > [!CAUTION]
 > **Vulkan Pipeline Stutter:** When entering a new planet or graphical scene for the first time, brief stutter may occur while new Vulkan pipeline state objects are compiled by the Switch GPU driver. These pipelines are saved to the SD card and subsequent loads will be noticeably smoother.

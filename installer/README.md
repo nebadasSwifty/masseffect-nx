@@ -86,7 +86,11 @@ whole game as one application, or a small **update** for an NSP installed earlie
   * **Every source** (folder, one ISO, merged ISOs) then gets the check on all packages (`disc.packageCheck.scope`
     in `config.js`, `'maps'` limits it to `Maps/*.xxx`). Bad or same-GUID packages are listed in a warning in step 2
     with advice (choose both disc images together; for merged discs: re-get the images) and in the Details log.
-    It does not block unless `disc.packageCheck.block` is `true`.
+    It does not block unless `disc.packageCheck.block` is `true`. Packages that are broken on every copy of an
+    edition and never read by the game (`disc.packageCheck.known`, per edition; today only
+    `Layer0/MEInit/GlobalTlk_ES.xxx`, the Spanish text table, junk on both RU discs) are copied as they are and shown
+    as a short note instead (log: `known, not used by the game`); they never warn or block. On the English edition
+    the same file is a normal finding (the Spanish text is used there).
 * **DLC packages.** `js/stfs.js` is a port of `tools/stfs_extract.py`: it reads the STFS header, the file table and
   the hash tables with `Blob.slice()` and returns each file as a Blob made of slices of the package (fragmented files
   follow the hash chain). Packages of another title or content type, SVOD packages and damaged blocks (SHA-1) are
@@ -260,7 +264,10 @@ node --test installer/test/          # Node 20+
   `dlc_enable = true` toml edit, the 1 GiB shader package refusal; the edition's prewarm list in the full and the
   update zip, its manifest check, and installing without it when the release has none.
 * `real-disc.test.js` (optional, read-only; `MASSEFFECT_TEST_ISO`, `MASSEFFECT_TEST_DISC`): the parser on a real image
-  against the extracted disc, file by file (names, sizes, bytes of `default.xex` and of files beyond 4 GiB).
+  against the extracted disc, file by file (names, sizes, bytes of `default.xex` and of files beyond 4 GiB). With
+  `MASSEFFECT_TEST_RU_DISC1`/`_DISC2` (the two RU images): the merge takes `BIOA_WAR00` from Disc 1 and `BIOA_LOS00`
+  from Disc 2, and the merged set has 0 bad packages, 0 same-GUID groups and `GlobalTlk_ES.xxx` as its only known
+  broken file (2026-10-09: passes, ~3 s).
 * `nsp.test.js`, `nsp_crypto.test.js`: the key file parser and RomFS primitives; AES (FIPS-197), ECB, XTS, CTR,
   SHA-256, RSA-PSS and base64 against Node's OpenSSL.
 * `nsp_python.test.js` (needs `python3` with `cryptography`, else skipped): synthetic inputs (`test/nsp_fixtures.js`),

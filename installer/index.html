@@ -56,7 +56,7 @@
       <label><input type="radio" name="format" value="iso" checked> <span data-i18n="format_iso">Disc image (.iso)</span></label>
       <label><input type="radio" name="format" value="folder"> <span data-i18n="format_folder">XEX format (folder)</span></label>
     </div>
-    <p class="hint" id="format-hint" data-i18n="format_hint_iso">The disc image of the Xbox 360 game (single or two discs). It is read in place and never loaded as a whole.</p>
+    <p class="hint" id="format-hint" data-i18n="format_hint_iso">The disc image of the Xbox 360 game. The Russian release has two discs: choose both images (Disc 1 and Disc 2) together, because Feros, Ilos and the ending are complete only across both. It is read in place and never loaded as a whole.</p>
     <div class="drop" id="drop" tabindex="0">
       <button class="btn" id="pick" type="button" data-i18n="pick_iso">Choose .iso file(s)</button>
       <span class="or" data-i18n="drop_or">or drop it here</span>
@@ -174,6 +174,7 @@
 <pre class="tree">/switch/masseffect-nx/
   masseffect-nx.nro
   masseffect.toml               (settings)
+  masseffect_prewarm_list.bin   (pipeline prewarm list of your edition)
   masseffect_shaders.mesp       (the game's shaders, made from your disc)
   masseffect_shaders.mesp.idx   (index of the shader file)
   game_root/                    (the files of your disc)
@@ -188,8 +189,9 @@
     <h2 data-i18n="privacy_title">Privacy</h2>
     <p data-i18n="privacy_desc" data-i18n-html="true">
       The page reads your disc with your browser's own file access, makes the shaders on your computer with WebAssembly and
-      writes the zip to your disk. The only network traffic is loading this page and downloading the build
-      (<code>masseffect-nx.nro</code>) and <code>masseffect.toml</code> from this site. No game data is uploaded, and there is no tracking.
+      writes the zip to your disk. The only network traffic is loading this page and downloading the build of your edition
+      (installed as <code>masseffect-nx.nro</code>), <code>masseffect.toml</code> and the pipeline prewarm list of the edition
+      (installed as <code>masseffect_prewarm_list.bin</code>) from this site. No game data is uploaded, and there is no tracking.
       Nothing from the game is distributed with the port.
     </p>
   </section>

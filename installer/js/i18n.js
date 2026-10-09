@@ -13,7 +13,7 @@ export const TRANSLATIONS = {
     step_1_title: 'Choose your game',
     format_iso: 'Disc image (.iso)',
     format_folder: 'XEX format (folder)',
-    format_hint_iso: 'The disc image of the Xbox 360 game (single or two discs). It is read in place and never loaded as a whole.',
+    format_hint_iso: 'The disc image of the Xbox 360 game. The Russian release has two discs: choose both images (Disc 1 and Disc 2) together, because Feros, Ilos and the ending are complete only across both. It is read in place and never loaded as a whole.',
     format_hint_folder: 'The extracted disc: the folder that contains default.xex next to the game\'s folders (Layer0, Layer1...). It is read in place.',
     pick_iso: 'Choose .iso file(s)',
     pick_folder: 'Choose folder',
@@ -131,7 +131,7 @@ export const TRANSLATIONS = {
     nsp_instruction: 'Install the NSP with your CFW title installer to launch Mass Effect from the HOME menu. It uses 39-bit application mode and needs the files above on the SD card. You can also launch the NRO with a title override (hold R while starting an installed game).',
 
     privacy_title: 'Privacy',
-    privacy_desc: 'The page reads your disc with your browser\'s own file access, makes the shaders on your computer with WebAssembly and writes the zip to your disk. The only network traffic is loading this page and downloading the build (<code>masseffect-nx.nro</code>), <code>masseffect.toml</code> and the pipeline prewarm list (<code>masseffect_prewarm_list.bin</code>) from this site. No game data is uploaded, and there is no tracking. Nothing from the game is distributed with the port.',
+    privacy_desc: 'The page reads your disc with your browser\'s own file access, makes the shaders on your computer with WebAssembly and writes the zip to your disk. The only network traffic is loading this page and downloading the build of your edition (installed as <code>masseffect-nx.nro</code>), <code>masseffect.toml</code> and the pipeline prewarm list of the edition (installed as <code>masseffect_prewarm_list.bin</code>) from this site. No game data is uploaded, and there is no tracking. Nothing from the game is distributed with the port.',
 
     credits_title: 'Credits & Acknowledgments',
     credits_bioware: '<strong>BioWare & Electronic Arts</strong> — Original creators of Mass Effect. This is an unofficial, non-commercial fan project.',
@@ -200,7 +200,7 @@ export const TRANSLATIONS = {
     step_1_title: 'Выберите вашу игру',
     format_iso: 'Образ диска (.iso)',
     format_folder: 'Папка XEX (распакованный диск)',
-    format_hint_iso: 'Образ диска игры для Xbox 360 (один или два файла .iso). Читается напрямую с диска и не загружается в память целиком.',
+    format_hint_iso: 'Образ диска игры для Xbox 360. У русского издания два диска: выберите оба образа (Disc 1 и Disc 2) вместе, потому что Ферос, Илос и финал целы только на двух дисках вместе. Читается напрямую с диска и не загружается в память целиком.',
     format_hint_folder: 'Распакованный диск: папка, содержащая default.xex рядом с игровыми папками (Layer0, Layer1...). Читается напрямую.',
     pick_iso: 'Выбрать файл(ы) .iso',
     pick_folder: 'Выбрать папку',
@@ -318,7 +318,7 @@ export const TRANSLATIONS = {
     nsp_instruction: 'Установите NSP через ваш установщик тайтлов в CFW, чтобы запускать Mass Effect прямо из главного меню HOME. Форвардер использует 39-битное адресное пространство и требует наличия указанных файлов на SD-карте. Вы также можете запускать NRO через Title Override (зажав R при запуске любой установленной игры).',
 
     privacy_title: 'Конфиденциальность',
-    privacy_desc: 'Страница читает ваш диск через стандартный доступ к файлам браузера, компилирует шейдеры на вашем компьютере с помощью WebAssembly и записывает zip на ваш диск. Единственный сетевой трафик — загрузка этой страницы и скачивание сборки (<code>masseffect-nx.nro</code>), <code>masseffect.toml</code> и списка прогрева конвейеров (<code>masseffect_prewarm_list.bin</code>) с этого сайта. Данные игры никуда не отправляются. Игра не распространяется вместе с портом.',
+    privacy_desc: 'Страница читает ваш диск через стандартный доступ к файлам браузера, компилирует шейдеры на вашем компьютере с помощью WebAssembly и записывает zip на ваш диск. Единственный сетевой трафик — загрузка этой страницы и скачивание сборки для вашего издания (устанавливается как <code>masseffect-nx.nro</code>), <code>masseffect.toml</code> и списка прогрева конвейеров этого издания (устанавливается как <code>masseffect_prewarm_list.bin</code>) с этого сайта. Данные игры никуда не отправляются. Игра не распространяется вместе с портом.',
 
     credits_title: 'Благодарности',
     credits_bioware: '<strong>BioWare & Electronic Arts</strong> — Оригинальные создатели Mass Effect. Это неофициальный некоммерческий фанатский проект.',

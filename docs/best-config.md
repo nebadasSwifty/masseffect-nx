@@ -197,7 +197,8 @@ Code defaults, listed as comments in the toml: `audio_xma_loop_zero_end_off = tr
 
 Left off (commented in the toml as experimental): `masseffect_native_texture_coherency` (mode 1 switched itself off on
 Bink planes in ru_glob2; the fix is not measured yet, so 0), `guest_memory_large_pages`, `masseffect_native_velocity_16_16`,
-the IO block cache (`masseffect_io_bcache_*`, wrong data in ru_glob3), `input_rumble` (pending the user's check),
+the IO block cache (`masseffect_io_bcache_*`, wrong data in ru_glob3), `input_rumble` (pending the user's check;
+turned on later in the shipped toml: no fps cost, Therum 2026-10-08),
 the 1280x720-only EDRAM options.
 
 Build-time defaults (not toml keys):
@@ -209,6 +210,16 @@ Build-time defaults (not toml keys):
 | hot natives `masseffect_hot_field_iter` (EN sub_8245FF18), `masseffect_hot_sprite_render` (EN sub_8264E178) | registered, on through `masseffect_hot_guest = true` | same | EN: fuzzed against the EN generated code, 200,000 iterations each, 0 failures (tests/hot_fuzz/cases/case_8245FF18.inc, case_8264E178.inc) |
 | `app/function_order.ld` | RU order translated to EN names (1657 entries, 30 without an EN match dropped) | RU profile | stale entries are harmless |
 | `masseffect_shader_dump_dir` (debug cvar) | added | had it | |
+
+## Shipped defaults 2026-10-09 (both editions)
+
+Added to `app/masseffect.toml` and made the code defaults (commit "native: console-verified night reworks on by
+default"), evidence in "2026-10-09 night" below: `masseffect_native_constants_dirty`, `masseffect_native_vertex_arena`,
+`masseffect_hot_audio_resampler`, `masseffect_hot_audio_resampler_stereo`, `masseffect_hot_crt_memset` (all `true`;
+A/B on the Citadel spacewalk with 0 verification differences, then all five on together in ru_integ7 with
+`run/me1/tour_base_night.toml`). Not yet run on the EN build: check the first EN build with the same route.
+Their self-checks stay on (`masseffect_native_constants_dirty_verify` 4096, `masseffect_native_vertex_arena_verify_n`
+4096 and 1 in `_verify_every` 64, hot guards): a DIFFERENCE switches the feature off for the session.
 
 ## 2026-10-08 locations on build ru_glob8 (shipped-default set + DLC on)
 | Location | Swaps per 10 s while playing | Frames over 100 ms | Notes |
