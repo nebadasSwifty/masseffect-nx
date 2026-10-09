@@ -15,9 +15,19 @@
  *   masseffect_hlsl <input folder> <output folder> <shader_common.h>
  *
  * Exit status: 0 if every container was translated, 2 if some were skipped, 1 on a usage/IO error.
+ *
+ * Deterministic input: the same bytes give the same HLSL natively and in the browser (WebAssembly).
+ *   * A container that fails the runtime's layout checks (container_check.h) is refused with
+ *     "not a shader container"; the game ignores such a container too.
+ *   * The translator reads instructions by the addresses of the control flow, which can point past the end
+ *     of a container's microcode (two such Direct3D shaders on the RU discs). Every container is followed
+ *     by kZeroPadding zero bytes, so those reads see zeros: before, they saw whatever the heap held
+ *     (zeros natively in practice, other data in WebAssembly, where the result differed or the
+ *     translation threw).
  */
 
 #include "XenosRecomp/shader_recompiler.h"
+#include "tools/container_check.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +38,10 @@
 #include <vector>
 
 namespace {
+
+// More than the farthest read past the microcode: a control flow address (12 bits) + count (3 bits),
+// 12 bytes per instruction, is at most 49,236 bytes after the start of the microcode.
+constexpr size_t kZeroPadding = 64 * 1024;
 
 std::vector<uint8_t> ReadAll(const std::filesystem::path& path) {
   std::vector<uint8_t> data;
@@ -93,12 +107,19 @@ int main(int argc, char** argv) try {
       ++skipped;
       continue;
     }
+    if (const char* problem = shader_container::LayoutProblem(data.data(), data.size())) {
+      std::printf("  %s: not a shader container: %s\n", name.c_str(), problem);
+      ++skipped;
+      continue;
+    }
+    std::vector<uint8_t> padded(data.size() + kZeroPadding, 0);
+    std::memcpy(padded.data(), data.data(), data.size());
 
     std::printf("  %s\n", name.c_str());
     std::fflush(stdout);
     ShaderRecompiler recompiler;
     try {
-      recompiler.recompile(data.data(), include);
+      recompiler.recompile(padded.data(), include);
     } catch (const std::exception& error) {
       std::printf("  %s: translation rejected: %s\n", name.c_str(), error.what());
       ++skipped;

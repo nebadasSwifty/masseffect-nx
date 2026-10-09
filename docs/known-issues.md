@@ -140,7 +140,9 @@ about 1.4 fps. Artifacts reported by the user with these settings have not yet b
   start problems in the sweep. The map override of the game's configuration does not always select the level (several maps start
   in the Normandy intro), so real per-location tests need saves.
 - Textures and shaders per location have not been fully checked (the closing milestone).
-- 60 of 30,191 shader containers do not build (0.2 %), and one depth-only vertex shader (1383 draws seen) is unidentified.
+- Every shader container builds: the old "60 of 30,191 do not build" were 56 scan false matches the game ignores (the scanner
+  now drops them, see shaders/README.md) and 4 terrain VS fixed in the translator (docs/dlc.md). RU discs + both DLC: all
+  31,128 containers build in the web installer. One depth-only vertex shader (1383 draws seen) is unidentified.
 - Shader identity proofs are strict, but "zero rejected draws" does not prove coverage: a skipped draw before the check is not counted.
 
 ### 15. Unexplained "Disc Read Error" dialog (open)

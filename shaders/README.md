@@ -101,10 +101,14 @@ A **container** is what the Xbox 360 shader compiler writes. All fields are big-
 | 8 | physical size (microcode and the literal constants of the definition table) |
 
 The container is `virtual size + physical size` bytes. `ue3_shader_scan` accepts a candidate when the
-signature matches, `24 <= virtual <= 0x40000`, `0 < physical <= 0x40000` and the whole container fits in the
-buffer, then writes it as `vs_<h>.bin` or `ps_<h>.bin`, where `h` is the 64-bit FNV-1a of the container
-(only a file name; the stage prefix is what the later steps read). Duplicates are written once.
-On a complete disc this finds 403,857 containers, **30,191 distinct**.
+signature matches, `24 <= virtual <= 0x40000`, `0 < physical <= 0x40000`, the whole container fits in the
+buffer and its header passes the runtime's layout checks (`shaders/tools/container_check.h`, the same as
+`Read()` in `masseffect_native_shaders.cpp`: the shader header and the microcode lie inside the container and the
+header inside the virtual part). It writes it as `vs_<h>.bin` or `ps_<h>.bin`, where `h` is the 64-bit FNV-1a of
+the container (only a file name; the stage prefix is what the later steps read). Duplicates are written once.
+On a complete disc this found 403,857 containers, **30,191 distinct** before the layout check; the check drops the
+random package bytes that only look like a container (the 56 "crashing containers" below were such matches).
+RU discs + both DLC: 30,830 distinct (240 false matches dropped), plus 298 from `shaders/runtime_containers`.
 
 ## Step 2: container -> HLSL
 
@@ -141,12 +145,24 @@ Sonic `UNLEASHED_RECOMP` blocks of upstream are left alone (they are never compi
 the same as before the cleanup: it was compared on 443 containers (identical except for generated temporary
 names that depend on the header length), and DXC gives the same SPIR-V for the old and new `shader_common.h`.
 
-**Containers that do not make it.** On the complete disc, 56 of the 30,191 containers crash the translator
-(SIGSEGV/SIGBUS, probably malformed false positives of the scan) and 4 vertex shaders translate but DXC
-rejects them (`redefinition of parameter 'iBlendWeight0'`). They are left out: the package then has **30,131**
-shaders. None of the 56 crashing containers is in the project's production package either. An installer must
-treat a failed container as "skip it", never as a fatal error. (`build_shader_spirv.sh` refuses to pack
-unless `ALLOW_FAILURES=1`, so a regression is noticed.)
+**Containers that do not make it.** Before 2026-10-09 the scan also wrote false matches: random package bytes
+with the signature and plausible sizes whose header offsets point outside the "container". XenosRecomp trusts every
+offset, so those crashed the translator (SIGSEGV/SIGBUS natively, "memory access out of bounds" in WebAssembly):
+56 on the EN disc, 238 on the RU discs + DLC. The game ignores such containers anyway (`Read()` refuses them), so
+nothing was lost, but the web installer counted them as skipped shaders. Now the scanner drops them and
+`masseffect_hlsl` refuses any that still arrive ("not a shader container: <reason>").
+
+The translator also reads instructions by the control-flow addresses, which in two Direct3D shaders of the RU discs
+(`ps_704e1d4ddb6f6a33`, `vs_cc4bf1218fb29544`) point past the end of the microcode. Those reads used to see
+whatever followed the container in memory: zeros natively (in practice), other data in WebAssembly, where the
+translation threw. `masseffect_hlsl` now puts 64 KB of zeros after every container, so the output is the same
+everywhere: on all 31,128 containers of the RU discs + DLC the native and the WebAssembly translator give
+byte-identical HLSL.
+
+The 4 terrain vertex shaders that DXC used to reject (`redefinition of parameter 'iBlendWeight0'`) are fixed in the
+translator (`docs/dlc.md`). Nothing is known to fail any more, so `installer/config.js` `knownShaderFailures` is
+empty: the web installer refuses to write a package when any container fails, and `build_shader_spirv.sh`
+refuses to pack unless `ALLOW_FAILURES=1`.
 
 ## Step 3: HLSL -> SPIR-V
 

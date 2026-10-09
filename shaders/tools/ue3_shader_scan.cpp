@@ -3,6 +3,8 @@
 // what Mass Effect's packages use), scan the result for 2008 shader
 // containers (0x102A11xx with coherent virtual/physical sizes) and write each distinct one
 // as {vs,ps}_<fnv64>.bin, the same naming as app/src/me_shader_dump.cpp, so both sources merge.
+// A match whose header fails the runtime's layout checks (container_check.h) is random package data, not a
+// shader: it is counted as a false match and not written.
 //   usage: ue3_shader_scan <output folder> <package files...>
 // No dependencies: the LZO1X decoder is below.
 #include <algorithm>
@@ -14,6 +16,8 @@
 #include <fstream>
 #include <set>
 #include <vector>
+
+#include "container_check.h"
 
 namespace {
 
@@ -127,7 +131,7 @@ int main(int argc, char** argv) {
   const std::filesystem::path outdir = argv[1];
   std::filesystem::create_directories(outdir);
   std::set<uint64_t> seen;
-  size_t packages = 0, chunks = 0, bad_blocks = 0, found = 0, written = 0;
+  size_t packages = 0, chunks = 0, bad_blocks = 0, found = 0, written = 0, false_matches = 0;
   for (int a = 2; a < argc; ++a) {
     std::ifstream f(argv[a], std::ios::binary);
     std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), {});
@@ -177,6 +181,10 @@ int main(int argc, char** argv) {
         if ((sig & 0xFFFFFF00u) != 0x102A1100u) continue;
         const uint32_t vs = BE(&b[i + 4]), ps = BE(&b[i + 8]);
         if (vs < 24 || vs > 0x40000 || ps == 0 || ps > 0x40000 || i + vs + ps > b.size()) continue;
+        if (shader_container::LayoutProblem(&b[i], vs + ps)) {
+          ++false_matches;
+          continue;
+        }
         ++found;
         const uint64_t h = Fnv(&b[i], vs + ps);
         if (!seen.insert(h).second) continue;
@@ -192,7 +200,8 @@ int main(int argc, char** argv) {
       }
     }
   }
-  std::printf("%zu packages, %zu chunks, %zu bad blocks, %zu containers seen, %zu distinct, %zu new files\n",
-              packages, chunks, bad_blocks, found, seen.size(), written);
+  std::printf("%zu packages, %zu chunks, %zu bad blocks, %zu containers seen, %zu distinct, %zu new files, "
+              "%zu false matches dropped\n",
+              packages, chunks, bad_blocks, found, seen.size(), written, false_matches);
   return 0;
 }
