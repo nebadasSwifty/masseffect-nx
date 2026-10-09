@@ -120,7 +120,9 @@ Every `masseffect_mem_report_s` seconds (default 60; 0 = off), the ring thread l
       | shader objects seen 9432, by address 5845, by code 1186, entry of object 9432; paired packets 2210, missing pairs 3
       | targets 41 + depths 17; resolved 64 (~23 MB GPU), clips 3 (2 MB), sleeping 10 (35 MB); read-backs 12 (96 KB, 0 released); restore sites 310
       | textures 950 (95 MB GPU; 0 uploads pending, 0 KB); views 1012, samplers 61, framebuffers 140 (+0 retired), passes 52;
-        pipelines 1386 (list 651 + 735 new); modules 905, variants 2400 (61000 KB source copies), tracked codes 2100 (40000 KB owned),
+        pipelines 1386 (list 651 + 735 new); modules 905, variants 2400 (0 KB source copies, 61000 KB shared),
+        tracked codes 2100 (1900 distinct: 800 library, 150 owned 3600 KB, 950 dropped 36000 KB; 1100 drops 41000 KB so far,
+        40 remade 12 ms max 900 us, 0 mismatches), driver module SPIR-V 3100 modules 75 MB,
         rectangle VS 12 (900 KB); library SPIR-V resident 1800 shaders (190 MB); vertex inputs 1300;
         staging 41000 KB (5300 reused, 9 allocated, 0 failed); diag tables 4000/3900/120 (0 resets); draws dropped (memory) 0
 ```
@@ -148,7 +150,7 @@ left alone).
 | `rectangle_data_` | Capped now: persistent, any buffer above 4 MB released after its draw (3.2). |
 | `indices_`, `indices16_`, `converted_` | Bounded: grow-only, but the count is 16 bits, so at most 65,535 indices (≤ 384 KB). |
 | `pipelines_` | Kept. 1,386 after the 10-map tour, about 170 B each in the map. The real cost is in the driver: NVK pipeline objects and the in-memory `VkPipelineCache`, whose serialized size was 56 MB (`pipelines.bin`). Evicting live pipelines would recompile them on the ring (hitches), and the count grows only with new shader/state pairs. Saving is capped (`masseffect_native_pipelines_save_cache_cap_mb`). |
-| `modules_` and the transform variants (`modules_depth_half_`, `_depth_quantize_`, `_fragcoord_xy_`, `_texture_signs_`, `_ps_descriptors_`, `_vs_constants_`, `_7e3_`, `_restore_7e3_`, `_fixed16_`, `_alpha_only_`, `_z_early_`, `_rectangle_`), `codes_modules_depth_` | Kept, measured in `[mem]` (`variants`, `source copies`, `owned`). They follow the pipelines. Each variant entry keeps a full SPIR-V copy (`original`) as its exact dedupe key. Replacing it with hash + source module would save that memory but changes the collision guarantee, so it is a follow-up. `vs_constants` is limited per VS (`masseffect_native_fold_vs_constants_max_values`). |
+| `modules_` and the transform variants (`modules_depth_half_`, `_depth_quantize_`, `_fragcoord_xy_`, `_texture_signs_`, `_ps_descriptors_`, `_vs_constants_`, `_7e3_`, `_restore_7e3_`, `_fixed16_`, `_alpha_only_`, `_z_early_`, `_rectangle_`), `codes_modules_depth_` | Kept (they follow the pipelines), but their CPU SPIR-V is no longer copied per entry and transformed code is freed when idle: see 4.1.1. `vs_constants` is limited per VS (`masseffect_native_fold_vs_constants_max_values`). |
 | Library SPIR-V (`Shader::spirv_lazy`, `masseffect_shader_library.cpp`) | Kept, measured now (`library SPIR-V resident`). Each shader read on demand stays resident because `Spirv()` promises the vector never moves, and modules borrow it (`codes_modules_depth_`). It is bounded by the shaders the game uses, but that set grows with every new map. Eviction needs the borrowers converted first, so it is a follow-up. |
 | `ShadersNative::Data::cache` (raw microcode hash → entry, `masseffect_native_shaders.cpp`) | Capped now: cleared at 65,536 entries (a miss only redoes the lookup). |
 | `created_per_address_`, `key_per_shape_`, `words_per_shape_` (texture-creation diagnostics, not gated) | Capped now: all three cleared together at 16,384 entries. Each zone load adds new addresses. |
@@ -159,6 +161,78 @@ left alone).
 | `session_list_`, `index_list_`, `file_list_` | Bounded by the pipelines (one 456 B record each). The saved file is capped at 8192 records. |
 | Vertex arena tables, draw cache arena, dedupe, sampler cache, PS descriptor plans | Fixed-size tables or library-bounded (see `me_vertex_arena.h`, `me_draw_cache.h`). |
 | `occlusion_retired_` | Only with `masseffect_native_query_occlusion_depth` (off); grows once per view change. |
+
+### 4.1.1 Shader code of the transform variants (2026-10-09, branch `perf/variant-memory`)
+
+The `[mem]` line of a long tour on the memory-fix build read: `modules 829, variants 4627 (107787 KB source copies),
+tracked codes 2638 (63093 KB owned), library SPIR-V resident 2064 shaders (48 MB)`.
+
+**What those were.**
+
+- *Tracked codes* (`codes_modules_depth_`, VkShaderModule -> CPU SPIR-V): every pixel shader module that a later
+  transform may start from. Library modules (`ModuleFor`) borrowed the library vector. Every module made by a
+  transform owned a full copy of its output: no colour writes (`ModuleAlphaOnly`), 7e3 outputs (`Module7e3`), early Z
+  (`ModuleZEarly`), texture signs, PS descriptor rewrites, restore into 7e3, k_16_16 encode, FragCoord XY, plus the
+  prewarm's own copies of the first three. Owned code was not a duplicate of the library (it is transformed), but it was
+  only ever read again when a *new* variant was built on that module (and once by `InputsMaskPS`).
+- *Source copies*: every entry of `modules_depth_half_`, `_depth_quantize_`, `_fragcoord_xy_`, `_texture_signs_` and
+  `_ps_descriptors_` copied the whole SPIR-V it was made from (`original`), as the exact collision guard of its hash
+  bucket. That source is always a tracked code (library or owned), so all 107 MB were duplicates of code that was
+  resident anyway: one copy per variant entry (4627 entries). Nothing reads the copy
+  after `vkCreateShaderModule` except the equality test of later lookups.
+
+**What changed** (`masseffect_native_draws.cpp`, `ShaderCode` and the functions next to `RegistrarModuleCode`;
+`masseffect_ps_descriptors_members.inc`):
+
+1. **Interned code.** Every tracked code is a `ShaderCode` held by `shared_ptr`. Registering code first looks for a
+   live `ShaderCode` with the same XXH3, size and words (`codes_by_hash_`), and shares it if there is one. So two live
+   `ShaderCode`s never hold the same words, and pointer equality is exactly the old full-content comparison. Library
+   code is borrowed (one `ShaderCode` per library vector, `codes_library_`).
+2. **Variant entries key on the `ShaderCode`** (`CodePtr source`) instead of a copy. The `shared_ptr` keeps the
+   source alive as long as the entry exists, so a pointer can never be reused for other content (this matters for the
+   prewarm, whose modules are forgotten and destroyed when it finishes). The hash of a lookup is the stored one, so
+   the buckets are the same as before, and the per-lookup XXH3 of the whole source is gone.
+3. **Idle transformed code is dropped and made again on demand.** Every owned `ShaderCode` records its parent
+   `ShaderCode` and the transform that made it (a `std::function` with the transform's parameters: signs, bits and
+   cleared words, slots, mode, 7e3 mask). Once per `[mem]` report the ring frees the words of owned code unused for
+   `masseffect_native_shader_code_drop_idle_s` (120 s). When a new variant needs them, `CodeWordsLocked` runs the
+   same transform on the parent's words (recursively, if the parent was dropped too). The transforms are pure
+   functions of their input and parameters (their tables are keyed by SPIR-V ids, never by pointers). The result is
+   still checked: size and XXH3 must equal the stored ones. A mismatch logs `[native] shader code ... could not be
+   made again`, counts in `mismatches`, switches dropping off for the session, and the transform that asked is
+   handled as "no tracked SPIR-V". That path already existed and rejects the draw or skips the optional fold. It
+   never uses wrong code.
+4. **Driver copies are counted.** Mesa's `vk_shader_module_create` allocates `sizeof(module) + codeSize` and keeps the
+   SPIR-V in every `VkShaderModule`. `CreateModuleCounted` adds up what the persistent tables handed to it
+   (`driver module SPIR-V N modules M MB`, cumulative, the prewarm's temporary modules excluded).
+
+**The `[mem]` fields:** `variants N (0 KB source copies, S KB shared)`, where S is what the copies would have been.
+`tracked codes T (D distinct: L library, O owned K KB, X dropped Y KB; drops so far, remade R in ms / max us,
+mismatches)`.
+
+**Expected saving** on the tour above: the 107 MB of source copies go entirely. Of the 63 MB owned, what stays is
+the code used in the last 2 minutes plus the prewarm-only sources until they idle out. Expected: a few MB, so
+**about 150-165 MB** in total. The cost is about 150 B per distinct code. The ring spends well under 1 ms per
+report on the drop pass. A pipeline miss whose source was dropped pays one transform pass per dropped level (the
+same work its first creation did, typically below 1 ms per level), next to an NVK compile of tens of ms. Watch
+`remade ... max us`.
+
+**Image:** identical by construction. The modules, the pipelines and the variant lookups produce exactly what they did
+before. The only new failure path is the checked one in point 3. `masseffect_native_shader_code_drop_idle_s = 0`
+keeps every owned code, which is the old retention. Interning and sharing have no switch, because they change no
+result.
+
+**Not done: dropping `VkShaderModule`s after their pipelines exist (point 3 of the request).** Vulkan allows it, and it
+would free the driver copies counted above. But module handles are the identity keys of the whole chain:
+`codes_modules_depth_`, `masks_inputs_ps_`, `modules_restore_7e3_` / `modules_fixed16_` `{selected, slots}`, the
+variant entries, and `modules_` / `_7e3_` / `_alpha_only_` / `_z_early_`. NVK reuses freed handle addresses, so a
+destroyed module whose handle comes back as a different module would make those tables return a stale result,
+which means wrong shaders. The safe route is a follow-up: give modules a non-Vulkan identity (the interned
+`ShaderCode` + transform key already is one), and either recreate the `VkShaderModule` just for pipeline creation
+from `CodeWordsLocked` and destroy it right after, or pass the code to `vkCreateGraphicsPipelines` through
+`VkShaderModuleCreateInfo` in `VkPipelineShaderStageCreateInfo::pNext` (`VK_KHR_maintenance5`; upstream NVK
+supports it, so check that the Switch build exposes it). The `driver module SPIR-V` counter gives its size: it should be about the library modules plus the
+variant outputs, so tens of MB.
 
 ### 4.2 Render targets (`masseffect_native_targets.cpp`)
 
@@ -215,8 +289,10 @@ console test of its own:
    (`masseffect_native_textures_pool.h`), which should remove the largest source of variable-size memalign churn.
    Measure `largest free block` after 1–2 h against the pool-off run, plus fps and image. Why the pool is off is not
    documented. Check the image (textures, black patches) before adopting it.
-3. If `library SPIR-V resident` or `variants ... source copies` reach hundreds of MB, implement their eviction
-   (4.1 follow-ups).
+3. If `library SPIR-V resident` reaches hundreds of MB, implement its eviction (4.1 follow-up).
+4. **`perf/variant-memory` (4.1.1):** the same tour, then compare `variants ... shared`, `owned`, `dropped`, `remade`
+   (count and max us; no hitch should line up with a `remade` increase) and `mismatches` (must stay 0). Check the
+   image on the usual capture points. A/B with `masseffect_native_shader_code_drop_idle_s = 0` for the hitch check.
 
 ## 6. New cvars
 
@@ -225,3 +301,4 @@ console test of its own:
 | `masseffect_mem_report_s` | 60 | Seconds between `[mem]` lines; 0 = off. |
 | `masseffect_mem_report_probe` | true | Measure the largest free block (about 12 malloc/free pairs per line). |
 | `masseffect_mem_emergency_reserve_mb` | 32 | `operator new` emergency reserve; 0 = off. |
+| `masseffect_native_shader_code_drop_idle_s` | 120 | Free the CPU SPIR-V of transformed pixel shader modules unused for this long (checked once per `[mem]` report, so only while `masseffect_mem_report_s` > 0) and make it again on demand; 0 = keep it (old retention). 4.1.1. |

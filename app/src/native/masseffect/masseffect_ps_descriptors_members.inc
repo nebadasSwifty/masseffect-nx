@@ -287,7 +287,7 @@
 
   // --- The module (ring and prewarm) -------------------------------------------------------------------------------
   struct ModulePsDescriptorsEntry {
-    std::vector<uint32_t> original;
+    CodePtr source;  // interned: pointer equality is content equality (docs/memory-growth.md 4.1.1)
     uint32_t bits = 0;
     uint64_t cleared = 0;
     VkShaderModule module = VK_NULL_HANDLE;  // null: failed (B or C) or nothing changed (A only: selected is used)
@@ -314,21 +314,21 @@
         for (uint32_t h = 0; h < 3; ++h) cleared |= uint64_t(1) << (h * 16 + registers[k]);
     }
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
-    const auto source = codes_modules_depth_.find(selected);
-    if (source == codes_modules_depth_.end()) {
+    const CodePtr source = TrackedCodeLocked(selected);
+    if (!source) {
       if (++psd_failures_ <= 8)
         REXLOG_ERROR("[native] PS descriptors: PS n{} final module has no tracked SPIR-V", ps.number);
       return (bits & (kKeyPsCombined | kKeyPsNoMask)) ? VK_NULL_HANDLE : selected;
     }
-    const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
-    const uint64_t hash = XXH3_64bits_withSeed(&cleared, sizeof(cleared),
-                                               XXH3_64bits(code.data(), code.size() * sizeof(uint32_t)) ^ bits);
+    const uint64_t hash = XXH3_64bits_withSeed(&cleared, sizeof(cleared), source->hash ^ bits);
     auto& bucket = modules_ps_descriptors_[hash];
     for (const auto& entry : bucket) {
-      if (entry.bits == bits && entry.cleared == cleared && entry.original == code)
+      if (entry.bits == bits && entry.cleared == cleared && entry.source == source)
         return entry.failed ? VK_NULL_HANDLE : (entry.module ? entry.module : selected);
     }
-    std::vector<uint32_t> current = code, next;
+    const CodeWordsPtr words = CodeWordsLocked(source);
+    if (!words) return (bits & (kKeyPsCombined | kKeyPsNoMask)) ? VK_NULL_HANDLE : selected;  // logged
+    std::vector<uint32_t> current = *words, next;
     std::string reason;
     bool failed = false, changed = false;
     uint32_t removed = 0, combined = 0, separate = 0, bounds = 0;
@@ -371,14 +371,14 @@
       VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
       info.codeSize = current.size() * sizeof(uint32_t);
       info.pCode = current.data();
-      if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) {
+      if (CreateModuleCounted(info, &module) != VK_SUCCESS) {
         module = VK_NULL_HANDLE;
         failed = (bits & (kKeyPsCombined | kKeyPsNoMask)) != 0;
         reason = "vkCreateShaderModule failed";
       }
     }
     ModulePsDescriptorsEntry entry;
-    entry.original = code;
+    entry.source = source;
     entry.bits = bits;
     entry.cleared = cleared;
     entry.module = module;
@@ -395,8 +395,28 @@
       REXLOG_INFO("[native] PS descriptors: PS n{} rewritten ({} modules so far): bits {:X}, {} masks removed, {} "
                   "fetches combined ({} kept separate), {} clamp bounds from the shared block",
                   ps.number, psd_modules_, bits >> 24, removed, combined, separate, bounds);
-    ModuleCodeDepth tracked;
-    tracked.owned = std::move(current);
-    codes_modules_depth_.insert_or_assign(module, std::move(tracked));
+    // The same steps as above, without the statistics: what makes the words again once they were dropped.
+    const auto remake = [bits, cleared](const std::vector<uint32_t>& input, std::vector<uint32_t>& output) {
+      std::vector<uint32_t> words_now = input, words_next;
+      std::string why;
+      if (bits & kKeyPsNoMask) {
+        me::native::IndexMaskStats masks;
+        if (!me::native::DropIndexMasks(words_now, cleared, words_next, masks, why)) return false;
+        words_now.swap(words_next);
+      }
+      if (bits & kKeyPsCombined) {
+        me::native::CombinedFetchStats fetches;
+        if (!me::native::CombineTexture2DFetches(words_now, words_next, fetches, why)) return false;
+        words_now.swap(words_next);
+      }
+      if (bits & kKeyPsFltBounds) {
+        me::native::FltBoundsStats clamps;
+        std::string why_a;
+        if (me::native::ReadFltBoundsFromShared(words_now, words_next, clamps, why_a)) words_now.swap(words_next);
+      }
+      output = std::move(words_now);
+      return true;
+    };
+    codes_modules_depth_.insert_or_assign(module, OwnedCodeLocked(std::move(current), source, remake));
     return module;
   }

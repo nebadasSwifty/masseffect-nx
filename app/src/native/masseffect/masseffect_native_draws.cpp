@@ -104,6 +104,8 @@ REXCVAR_DEFINE_BOOL(masseffect_native_sort_updates_texture, true, "Mass Effect",
 #include <type_traits>
 #include <utility>
 #include <fstream>
+#include <functional>
+#include <memory>
 #include <set>
 #include <string>
 #include <system_error>  // the bind thread
@@ -1122,6 +1124,18 @@ REXCVAR_DEFINE_INT32(masseffect_native_fold_vs_constants_max_values, 4, "MASSEFF
                      "its compared constants one vertex shader may be specialized for; after that its constants "
                      "stay dynamic (bounds the pipeline count)")
     .range(1, 64);
+/*
+ * docs/memory-growth.md 4.1.1: the SPIR-V that pixel shader transforms (texture signs, PS descriptors, restore into
+ * 7e3, k_16_16, FragCoord XY, 7e3 outputs, no colour writes, early Z) produced is kept only while it is used. Once
+ * per [mem] report, the words of such code unused for this many seconds are freed; a new variant that starts from
+ * it makes them again with the same transform (checked against the stored hash). 0 = keep them all (the old
+ * retention). The modules, pipelines and the image are the same either way.
+ */
+REXCVAR_DEFINE_INT32(masseffect_native_shader_code_drop_idle_s, 120, "MASSEFFECT",
+                     "Native renderer: free the CPU SPIR-V of transformed pixel shader modules unused for this many "
+                     "seconds (checked once per [mem] report) and make it again when a new variant needs it; "
+                     "0 = keep it for the session")
+    .range(0, 86400);
 REXCVAR_DEFINE_BOOL(masseffect_native_z_early, true, "MASSEFFECT",
                     "Native renderer: for draws that test depth but do NOT "
                     "write it (smoke, particles, glass, decals), declares EarlyFragmentTests in the "
@@ -11181,21 +11195,48 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       }
     }
     const auto vector_bytes = [](const std::vector<uint32_t>& v) { return uint64_t(v.capacity()) * 4; };
-    uint64_t variants = 0, variant_bytes = 0, owned_bytes = 0, codes = 0;
+    // docs/memory-growth.md 4.1.1. `shared` = what the per-entry source copies would have been (none are made).
+    uint64_t variants = 0, shared_bytes = 0, codes = 0, distinct = 0, borrowed = 0, owned = 0, owned_bytes = 0;
+    uint64_t dropped_now = 0, dropped_now_bytes = 0, dropped = 0, dropped_bytes = 0, remade = 0, remade_us = 0;
+    uint64_t remade_max_us = 0, mismatches = 0;
     {
       std::lock_guard<std::mutex> lock(modules_depth_mutex_);
+      DropIdleCodesLocked();
+      const auto count = [&](const CodePtr& source) {
+        ++variants;
+        if (source) shared_bytes += uint64_t(source->words) * 4;
+      };
       for (const auto& [hash, bucket] : modules_depth_half_)
-        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+        for (const auto& e : bucket) count(e.source);
       for (const auto& [hash, bucket] : modules_depth_quantize_)
-        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+        for (const auto& e : bucket) count(e.source);
       for (const auto& [hash, bucket] : modules_fragcoord_xy_)
-        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+        for (const auto& e : bucket) count(e.source);
       for (const auto& [hash, bucket] : modules_texture_signs_)
-        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+        for (const auto& e : bucket) count(e.source);
       for (const auto& [hash, bucket] : modules_ps_descriptors_)
-        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
-      for (const auto& [handle, code] : codes_modules_depth_) owned_bytes += vector_bytes(code.owned);
+        for (const auto& e : bucket) count(e.source);
       codes = codes_modules_depth_.size();
+      for (const auto& [hash, weak] : codes_by_hash_) {
+        const CodePtr code = weak.lock();
+        if (!code) continue;
+        ++distinct;
+        if (code->library) {
+          ++borrowed;
+        } else if (code->owned) {
+          ++owned;
+          owned_bytes += vector_bytes(*code->owned);
+        } else {
+          ++dropped_now;
+          dropped_now_bytes += uint64_t(code->words) * 4;
+        }
+      }
+      dropped = codes_dropped_;
+      dropped_bytes = codes_dropped_bytes_;
+      remade = codes_remade_;
+      remade_us = codes_remade_us_;
+      remade_max_us = codes_remade_max_us_;
+      mismatches = codes_remade_mismatches_;
     }
     {
       std::lock_guard<std::mutex> lock(modules_vs_constants_mutex_);
@@ -11210,13 +11251,18 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                                  modules_fixed16_.size();
     out += fmt::format(
         " | textures {} ({} MB GPU; {} uploads pending, {} KB); views {}, samplers {}, framebuffers {} (+{} retired), "
-        "passes {}; pipelines {} (list {} + {} new); modules {}, variants {} ({} KB source copies), tracked codes {} "
-        "({} KB owned), rectangle VS {} ({} KB); library SPIR-V resident {} shaders ({} MB); vertex inputs {}; "
+        "passes {}; pipelines {} (list {} + {} new); modules {}, variants {} (0 KB source copies, {} KB shared), "
+        "tracked codes {} ({} distinct: {} library, {} owned {} KB, {} dropped {} KB; {} drops {} KB so far, "
+        "{} remade {} ms max {} us, {} mismatches), driver module SPIR-V {} modules {} MB, rectangle VS {} ({} KB); "
+        "library SPIR-V resident {} shaders ({} MB); vertex inputs {}; "
         "staging {} KB ({} reused, {} allocated, {} failed); diag tables {}/{}/{} ({} resets); draws dropped (memory) {}",
         textures_.size(), bytes_textures_ >> 20, pending, pending_bytes >> 10, views_.size(), samplers_.size(),
         framebuffers_.size(), fb_retired_.size(), passes_.size(), pipelines_.size(), file_list_.size(),
-        session_list_.size(), other_modules, variants, variant_bytes >> 10, codes, owned_bytes >> 10,
-        shaders_rectangle_.size(), rectangle_bytes >> 10, library_shaders, library_bytes >> 20,
+        session_list_.size(), other_modules, variants, shared_bytes >> 10, codes, distinct, borrowed, owned,
+        owned_bytes >> 10, dropped_now, dropped_now_bytes >> 10, dropped, dropped_bytes >> 10, remade,
+        remade_us / 1000, remade_max_us, mismatches, module_code_count_.load(std::memory_order_relaxed),
+        module_code_bytes_.load(std::memory_order_relaxed) >> 20, shaders_rectangle_.size(), rectangle_bytes >> 10,
+        library_shaders, library_bytes >> 20,
         inputs_cache_.size(), StagingBytes() >> 10, staging_reused_, staging_allocations_, staging_failures_,
         created_per_address_.size(), key_per_shape_.size(), words_per_shape_.size(), diag_created_resets_,
         draws_dropped_memory_);
@@ -12012,23 +12058,202 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     info.codeSize = it->second.words.size()*sizeof(uint32_t); info.pCode = it->second.words.data();
     VkShaderModule module = VK_NULL_HANDLE;
-    if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
+    if (CreateModuleCounted(info, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
     modules_rectangle_.emplace(&entry, module);
     return module;
   }
 
+  /*
+   * docs/memory-growth.md 4.1.1: the CPU SPIR-V of the shader modules the pixel shader transforms start from
+   * (codes_modules_depth_) and the source keys of the transform variant tables.
+   *
+   * One ShaderCode per distinct content ("interned"): a module whose words equal those of a live ShaderCode
+   * shares it, so two live ShaderCodes never hold the same words. The variant tables key their entries by the
+   * ShaderCode they were made from (a shared_ptr, which also keeps it alive), so comparing the pointers is
+   * exactly the full-content comparison they did before, without a copy of the source per variant entry.
+   *
+   * Library code is borrowed: the library keeps every Spirv() vector for the whole session. Code made by a
+   * transform is owned. An owned code unused for masseffect_native_shader_code_drop_idle_s is dropped (only its
+   * words; the ShaderCode stays) and made again from its parent with the same transform when a new variant
+   * needs it. The transforms are pure functions of their input words and parameters; the words made again are
+   * checked against the stored XXH3 and size. Everything here runs under modules_depth_mutex_.
+   */
+  using RemakeCode = std::function<bool(const std::vector<uint32_t>& input, std::vector<uint32_t>& output)>;
+  struct ShaderCode {
+    const std::vector<uint32_t>* library = nullptr;     // borrowed library storage
+    std::shared_ptr<const std::vector<uint32_t>> owned;  // the words when not borrowed; null while dropped
+    std::shared_ptr<ShaderCode> parent;                  // the input of `remake`
+    RemakeCode remake;                                   // empty: the words are never dropped
+    uint64_t hash = 0;                                   // XXH3_64bits of the words
+    size_t words = 0;
+    int64_t used_s = 0;                                  // steady clock, seconds: last use
+  };
+  using CodePtr = std::shared_ptr<ShaderCode>;
+  using CodeWordsPtr = std::shared_ptr<const std::vector<uint32_t>>;
+
+  static int64_t CodeClockS() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  // The words of a code: borrowed, owned, or made again from its parent. Null only if they cannot be made again
+  // (not expected: logged, and dropping is switched off for the rest of the session).
+  CodeWordsPtr CodeWordsLocked(const CodePtr& code) {
+    if (!code) return nullptr;
+    code->used_s = CodeClockS();
+    if (code->library) return CodeWordsPtr(CodeWordsPtr(), code->library);  // non-owning alias
+    if (code->owned) return code->owned;
+    if (!code->parent || !code->remake) return nullptr;
+    const auto start = std::chrono::steady_clock::now();
+    const CodeWordsPtr input = CodeWordsLocked(code->parent);
+    auto output = std::make_shared<std::vector<uint32_t>>();
+    const bool ok = input && code->remake(*input, *output);
+    const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - start).count());
+    ++codes_remade_;
+    codes_remade_us_ += us;
+    codes_remade_max_us_ = std::max(codes_remade_max_us_, us);
+    if (!ok || output->size() != code->words ||
+        XXH3_64bits(output->data(), output->size() * sizeof(uint32_t)) != code->hash) {
+      codes_drop_broken_ = true;
+      if (++codes_remade_mismatches_ <= 16)
+        REXLOG_ERROR("[native] shader code {:016X} ({} words) could not be made again ({}); the transform that "
+                     "needs it is not applied, and idle shader code is no longer dropped", code->hash, code->words,
+                     ok ? fmt::format("{} words, other content", output->size()) : std::string("transform failed"));
+      return nullptr;
+    }
+    output->shrink_to_fit();
+    code->owned = std::move(output);
+    return code->owned;
+  }
+
+  // The live ShaderCode with exactly these words, if any.
+  CodePtr FindCodeLocked(uint64_t hash, const std::vector<uint32_t>& words) {
+    const auto [first, last] = codes_by_hash_.equal_range(hash);
+    for (auto it = first; it != last; ++it) {
+      CodePtr candidate = it->second.lock();
+      if (!candidate || candidate->words != words.size()) continue;
+      if (candidate->library == &words) return candidate;
+      const CodeWordsPtr existing = CodeWordsLocked(candidate);
+      if (existing && *existing == words) return candidate;
+    }
+    return nullptr;
+  }
+
+  CodePtr LibraryCodeLocked(const std::vector<uint32_t>& code) {
+    if (const auto it = codes_library_.find(&code); it != codes_library_.end()) {
+      it->second->used_s = CodeClockS();
+      return it->second;
+    }
+    const uint64_t hash = XXH3_64bits(code.data(), code.size() * sizeof(uint32_t));
+    CodePtr result = FindCodeLocked(hash, code);
+    if (!result) {
+      result = std::make_shared<ShaderCode>();
+      result->hash = hash;
+      result->words = code.size();
+      codes_by_hash_.emplace(hash, result);
+    }
+    if (!result->library) {  // same words as a transform's output: borrow them from the library from now on
+      result->library = &code;
+      result->owned.reset();
+    }
+    result->used_s = CodeClockS();
+    codes_library_.emplace(&code, result);
+    return result;
+  }
+
+  // Code made by `remake` from `parent` (both may be empty: then it is never dropped).
+  CodePtr OwnedCodeLocked(std::vector<uint32_t>&& words, CodePtr parent, RemakeCode remake) {
+    const uint64_t hash = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+    if (CodePtr existing = FindCodeLocked(hash, words)) return existing;
+    auto result = std::make_shared<ShaderCode>();
+    result->hash = hash;
+    result->words = words.size();
+    auto owned = std::make_shared<std::vector<uint32_t>>(std::move(words));
+    owned->shrink_to_fit();
+    result->owned = std::move(owned);
+    if (parent && remake) {
+      result->parent = std::move(parent);
+      result->remake = std::move(remake);
+    }
+    result->used_s = CodeClockS();
+    codes_by_hash_.emplace(hash, result);
+    return result;
+  }
+
+  CodePtr TrackedCodeLocked(VkShaderModule module) {
+    const auto it = codes_modules_depth_.find(module);
+    return it == codes_modules_depth_.end() ? nullptr : it->second;
+  }
+
   // Track the CPU code of the ACTUAL final module, including a failed optional
   // variant's fallback. Normal PS modules borrow immutable library storage;
-  // only locally transformed/diagnostic modules own a copy. Prewarm removes its
+  // only locally transformed/diagnostic modules own their code. Prewarm removes its
   // ephemeral handles before destroying them, so Vulkan handle reuse is safe.
   void RegistrarModuleCode(VkShaderModule module, const std::vector<uint32_t>& code,
                               bool borrow = false) {
     if (!module) return;
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
-    ModuleCodeDepth source;
-    if (borrow) source.borrowed = &code;
-    else source.owned = code;
-    codes_modules_depth_.insert_or_assign(module, std::move(source));
+    codes_modules_depth_.insert_or_assign(
+        module, borrow ? LibraryCodeLocked(code) : OwnedCodeLocked(std::vector<uint32_t>(code), nullptr, {}));
+  }
+
+  // A module whose code `remake` made from library code (7e3 outputs, no colour writes, early Z).
+  void RegistrarModuleCodeFromLibrary(VkShaderModule module, std::vector<uint32_t>&& code,
+                                      const std::vector<uint32_t>& library, RemakeCode remake) {
+    if (!module) return;
+    std::lock_guard<std::mutex> lock(modules_depth_mutex_);
+    CodePtr parent = LibraryCodeLocked(library);
+    codes_modules_depth_.insert_or_assign(module, OwnedCodeLocked(std::move(code), std::move(parent),
+                                                                  std::move(remake)));
+  }
+
+  static bool RemakeAlphaOnly(const std::vector<uint32_t>& input, std::vector<uint32_t>& output) {
+    uint32_t removed = 0;
+    output = PruneWritesOfColor(input, removed);
+    return !output.empty();
+  }
+  static bool RemakeZEarly(const std::vector<uint32_t>& input, std::vector<uint32_t>& output) {
+    const char* reason = "";
+    output = WithEarlyTests(input, reason);
+    return !output.empty();
+  }
+  static RemakeCode Remake7e3(uint32_t outputs_mask) {
+    return [outputs_mask](const std::vector<uint32_t>& input, std::vector<uint32_t>& output) {
+      output = LimitOutputs7e3(input, outputs_mask);
+      return !output.empty();
+    };
+  }
+
+  // vkCreateShaderModule for the persistent module tables, counting the SPIR-V bytes the driver copies.
+  VkResult CreateModuleCounted(const VkShaderModuleCreateInfo& info, VkShaderModule* module) {
+    const VkResult result = dfn_.vkCreateShaderModule(device_, &info, nullptr, module);
+    if (result == VK_SUCCESS) {
+      module_code_bytes_.fetch_add(info.codeSize, std::memory_order_relaxed);
+      module_code_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return result;
+  }
+
+  // Once per [mem] report (ring): drops the words of owned codes unused for masseffect_native_shader_code_drop_idle_s
+  // seconds and forgets the dead entries of the content index.
+  void DropIdleCodesLocked() {
+    const int32_t idle_s = REXCVAR_GET(masseffect_native_shader_code_drop_idle_s);
+    const int64_t now = CodeClockS();
+    for (auto it = codes_by_hash_.begin(); it != codes_by_hash_.end();) {
+      const CodePtr code = it->second.lock();
+      if (!code) {
+        it = codes_by_hash_.erase(it);
+        continue;
+      }
+      if (idle_s > 0 && !codes_drop_broken_ && code->owned && !code->library && code->parent && code->remake &&
+          now - code->used_s >= idle_s) {
+        ++codes_dropped_;
+        codes_dropped_bytes_ += uint64_t(code->owned->capacity()) * 4;
+        code->owned.reset();
+      }
+      ++it;
+    }
   }
 
   // Mass Effect: bit L set = the fragment module reads input Location L. Vertex shaders (package v30+) drop
@@ -12038,9 +12263,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (!ps || !REXCVAR_GET(masseffect_native_vs_pruned_outputs)) return 0xFFFFFFFFu;
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
     if (const auto it = masks_inputs_ps_.find(ps); it != masks_inputs_ps_.end()) return it->second;
-    const auto source = codes_modules_depth_.find(ps);
-    if (source == codes_modules_depth_.end()) return 0xFFFFFFFFu;
-    const std::vector<uint32_t>& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
+    const CodeWordsPtr words = CodeWordsLocked(TrackedCodeLocked(ps));
+    if (!words) return 0xFFFFFFFFu;
+    const std::vector<uint32_t>& code = *words;
     uint32_t mask = 0;
     bool valid = code.size() > 5 && code[0] == 0x07230203;
     std::unordered_map<uint32_t, uint32_t> locations;  // id -> Location
@@ -12078,7 +12303,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   VkShaderModule ModuleGuestFragCoordXY(VkShaderModule selected, const PipelineKey& key,
                                        const ShaderEntry* vs, const ShaderEntry* ps) {
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
-    const auto source = codes_modules_depth_.find(selected);
+    const CodePtr source = TrackedCodeLocked(selected);
     std::string reason;
     uint64_t code_hash = 0;
     size_t code_words = 0;
@@ -12090,16 +12315,22 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                                me::native::GuestFragCoordXYMode::Phase1;
     if (grid == phase || (phase2 && !phase)) {
       reason = "unsupported combined or absent guest XY raster mode";
-    } else if (source == codes_modules_depth_.end()) {
+    } else if (!source) {
       reason = "final PS has no tracked CPU SPIR-V";
     } else {
-      const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
-      code_words = code.size();
-      code_hash = XXH3_64bits(code.data(), code.size() * sizeof(uint32_t));
+      code_words = source->words;
+      code_hash = source->hash;
       auto& bucket = modules_fragcoord_xy_[code_hash];
       for (const auto& entry : bucket) {
-        if (entry.mode == mode && entry.original == code) return entry.module;
+        if (entry.mode == mode && entry.source == source) return entry.module;
       }
+      const CodeWordsPtr words = CodeWordsLocked(source);
+      if (!words) {
+        REXLOG_ERROR("[native] FragCoord XY: PS n{} final SPIR-V could not be made again; draw rejected",
+                     ps ? int(ps->number) : -1);
+        return VK_NULL_HANDLE;
+      }
+      const auto& code = *words;
       std::vector<uint32_t> mapped;
       VkShaderModule module = VK_NULL_HANDLE;
       if (me::native::TransformGuestFragCoordXY(code, mapped, reason, mode)) {
@@ -12107,16 +12338,19 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         info.codeSize = mapped.size() * sizeof(uint32_t);
         info.pCode = mapped.data();
-        if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) {
+        if (CreateModuleCounted(info, &module) != VK_SUCCESS) {
           reason = "vkCreateShaderModule failure";
           module = VK_NULL_HANDLE;
         }
       }
-      bucket.push_back({code, mode, module}); // Cache failure, never an unchecked base fallback.
+      bucket.push_back({source, mode, module}); // Cache failure, never an unchecked base fallback.
       if (module) {
-        ModuleCodeDepth tracked;
-        tracked.owned = std::move(mapped);
-        codes_modules_depth_.insert_or_assign(module, std::move(tracked));
+        codes_modules_depth_.insert_or_assign(
+            module, OwnedCodeLocked(std::move(mapped), source,
+                                    [mode](const std::vector<uint32_t>& input, std::vector<uint32_t>& output) {
+                                      std::string why;
+                                      return me::native::TransformGuestFragCoordXY(input, output, why, mode);
+                                    }));
         REXLOG_INFO("[native] final material FragCoord XY remapped mode={}: PS n{} container {:016X}, "
                     "source SPIR-V {:016X}/{} words", uint32_t(mode),
                     ps ? int(ps->number) : -1, ps ? ps->fingerprint : 0, code_hash, code_words);
@@ -12160,20 +12394,21 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
     if (!known) return selected;
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
-    const auto source = codes_modules_depth_.find(selected);
-    if (source == codes_modules_depth_.end()) {
+    const CodePtr source = TrackedCodeLocked(selected);
+    if (!source) {
       if (++signs_fold_failures_ <= 8)
         REXLOG_WARN("[native] texture signs: PS n{} final module has no tracked SPIR-V; not folded", ps.number);
       return selected;
     }
-    const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
-    const uint64_t hash = XXH3_64bits_withSeed(signs, sizeof(signs),
-                                               XXH3_64bits(code.data(), code.size() * sizeof(uint32_t)) ^ known);
+    const uint64_t hash = XXH3_64bits_withSeed(signs, sizeof(signs), source->hash ^ known);
     auto& bucket = modules_texture_signs_[hash];
     for (const auto& entry : bucket) {
-      if (entry.known == known && std::memcmp(entry.signs, signs, sizeof(signs)) == 0 && entry.original == code)
+      if (entry.known == known && std::memcmp(entry.signs, signs, sizeof(signs)) == 0 && entry.source == source)
         return entry.module ? entry.module : selected;
     }
+    const CodeWordsPtr words = CodeWordsLocked(source);
+    if (!words) return selected;  // logged; the selected module reads the same signs at run time
+    const auto& code = *words;
     std::vector<uint32_t> folded;
     me::native::TextureSignsFold stats;
     std::string reason;
@@ -12185,10 +12420,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
       info.codeSize = folded.size() * sizeof(uint32_t);
       info.pCode = folded.data();
-      if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
+      if (CreateModuleCounted(info, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
     }
     ModuleTextureSignsEntry entry;
-    entry.original = code;
+    entry.source = source;
     std::memcpy(entry.signs, signs, sizeof(signs));
     entry.known = known;
     entry.module = module;
@@ -12198,9 +12433,17 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       REXLOG_INFO("[native] texture signs folded: PS n{} ({} modules so far), {} shifts folded, {} of other "
                   "registers left, signs {:08X}{:08X} heaps {:05X}", ps.number, signs_folded_modules_,
                   stats.folded, stats.unknown, key.signs_high, key.signs_low, key.signs_heaps);
-    ModuleCodeDepth tracked;
-    tracked.owned = std::move(folded);
-    codes_modules_depth_.insert_or_assign(module, std::move(tracked));
+    std::array<uint8_t, sizeof(signs)> signs_copy;
+    std::memcpy(signs_copy.data(), signs, sizeof(signs));
+    codes_modules_depth_.insert_or_assign(
+        module, OwnedCodeLocked(std::move(folded), source,
+                                [signs_copy, known](const std::vector<uint32_t>& input, std::vector<uint32_t>& output) {
+                                  uint8_t values[48];
+                                  std::memcpy(values, signs_copy.data(), sizeof(values));
+                                  me::native::TextureSignsFold fold;
+                                  std::string why;
+                                  return me::native::FoldTextureSigns(input, values, known, output, fold, why);
+                                }));
     return module;
   }
 
@@ -12312,7 +12555,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       VkShaderModuleCreateInfo create{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
       create.codeSize = folded.size() * sizeof(uint32_t);
       create.pCode = folded.data();
-      if (dfn_.vkCreateShaderModule(device_, &create, nullptr, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
+      if (CreateModuleCounted(create, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
     }
     ModuleVsConstantsEntry entry;
     std::memcpy(entry.values, key.vs_values, sizeof(entry.values));
@@ -12331,17 +12574,19 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   VkShaderModule ModuleDepthHalf(VkShaderModule selected) {
     if (!selected) return VK_NULL_HANDLE;
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
-    const auto source = codes_modules_depth_.find(selected);
-    if (source == codes_modules_depth_.end()) {
+    const CodePtr source = TrackedCodeLocked(selected);
+    if (!source) {
       REXLOG_ERROR("[native] depth half final PS has no tracked CPU code; rejecting, NOT using unhalved PS");
       return VK_NULL_HANDLE;
     }
-    const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
-    const uint64_t hash = XXH3_64bits(code.data(), code.size() * sizeof(uint32_t));
+    const uint64_t hash = source->hash;
     auto& bucket = modules_depth_half_[hash];
     for (const auto& entry : bucket) {
-      if (entry.original == code) return entry.module; // Full collision guard.
+      if (entry.source == source) return entry.module; // Full collision guard (interned code).
     }
+    const CodeWordsPtr words = CodeWordsLocked(source);
+    if (!words) return VK_NULL_HANDLE;  // logged; rejecting, NOT using unhalved PS
+    const auto& code = *words;
     std::vector<uint32_t> half;
     std::string reason;
     VkShaderModule module = VK_NULL_HANDLE;
@@ -12349,7 +12594,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
       info.codeSize = half.size() * sizeof(uint32_t);
       info.pCode = half.data();
-      if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) {
+      if (CreateModuleCounted(info, &module) != VK_SUCCESS) {
         module = VK_NULL_HANDLE;
         reason = "vkCreateShaderModule failure";
       }
@@ -12359,7 +12604,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                    "rejecting, NOT using unhalved PS", hash, reason);
     else
       REXLOG_INFO("[native] final PS depth half composed: hash {:016X}, {} -> {} words", hash, code.size(), half.size());
-    bucket.push_back({code, module}); // Cache failures as failures, never originals.
+    bucket.push_back({source, module}); // Cache failures as failures, never originals.
     return module;
   }
 
@@ -12370,23 +12615,25 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       REXLOG_ERROR("[native] FLOAT24 selected PS creation failed; rejecting, NOT substituting a depth-only PS");
       return VK_NULL_HANDLE;
     }
-    std::vector<uint32_t> synthetic;
-    const std::vector<uint32_t>* code = nullptr;
+    CodePtr source;
     if (selected) {
-      const auto source = codes_modules_depth_.find(selected);
-      if (source == codes_modules_depth_.end()) {
+      source = TrackedCodeLocked(selected);
+      if (!source) {
         REXLOG_ERROR("[native] FLOAT24 final PS has no tracked code; rejecting experiment");
         return VK_NULL_HANDLE;
       }
-      code = source->second.borrowed ? source->second.borrowed : &source->second.owned;
     } else {
-      synthetic = me::native::MakeDepthOnlyFragmentForQuantization();
-      code = &synthetic;
+      if (!synthetic_depth_code_)
+        synthetic_depth_code_ = OwnedCodeLocked(me::native::MakeDepthOnlyFragmentForQuantization(), nullptr, {});
+      source = synthetic_depth_code_;
     }
-    const uint64_t hash = XXH3_64bits(code->data(), code->size() * sizeof(uint32_t));
+    const uint64_t hash = source->hash;
     auto& bucket = modules_depth_quantize_[hash];
     for (const auto& entry : bucket)
-      if (entry.rounded == round_float24 && entry.original == *code) return entry.module;
+      if (entry.rounded == round_float24 && entry.source == source) return entry.module;
+    const CodeWordsPtr words = CodeWordsLocked(source);
+    if (!words) return VK_NULL_HANDLE;  // logged; rejecting, NOT using an unquantized fallback
+    const std::vector<uint32_t>* code = words.get();
     std::vector<uint32_t> half, quantized;
     std::string reason;
     VkShaderModule module = VK_NULL_HANDLE;
@@ -12397,7 +12644,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
       info.codeSize = quantized.size() * sizeof(uint32_t);
       info.pCode = quantized.data();
-      if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) {
+      if (CreateModuleCounted(info, &module) != VK_SUCCESS) {
         module = VK_NULL_HANDLE;
         reason = "vkCreateShaderModule failure";
       }
@@ -12408,7 +12655,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     else if (bucket.empty())
       REXLOG_INFO("[native] FLOAT24 final PS quantized: hash={:016X} round={} synthetic={} {} -> {} words",
                   hash, round_float24, !selected, code->size(), quantized.size());
-    bucket.push_back({*code, round_float24, module});
+    bucket.push_back({source, round_float24, module});
     return module;
   }
 
@@ -12423,7 +12670,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     info.codeSize = code.size() * sizeof(uint32_t);
     info.pCode = code.data();
     VkShaderModule shader_module = VK_NULL_HANDLE;
-    if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &shader_module) != VK_SUCCESS) {
+    if (CreateModuleCounted(info, &shader_module) != VK_SUCCESS) {
       shader_module = VK_NULL_HANDLE;
     }
     modules_.emplace(&entry, shader_module);
@@ -12445,7 +12692,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
       info.codeSize = pruned.size() * sizeof(uint32_t);
       info.pCode = pruned.data();
-      if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &shader_module) != VK_SUCCESS) {
+      if (CreateModuleCounted(info, &shader_module) != VK_SUCCESS) {
         shader_module = VK_NULL_HANDLE;
       }
     }
@@ -12453,7 +12700,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                 entry.number, removed, pruned.size(), entry.shader->Spirv().size(),
                 shader_module != VK_NULL_HANDLE ? "module created" : "the regular one is used");
     modules_alpha_only_.emplace(&entry, shader_module);
-    RegistrarModuleCode(shader_module, pruned);
+    RegistrarModuleCodeFromLibrary(shader_module, std::vector<uint32_t>(pruned), entry.shader->Spirv(),
+                                   RemakeAlphaOnly);
     return shader_module != VK_NULL_HANDLE ? shader_module : ModuleFor(entry);
   }
 
@@ -12482,18 +12730,19 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
     if (const auto it = modules_restore_7e3_.find({selected, slots}); it != modules_restore_7e3_.end())
       return it->second;
-    const auto source = codes_modules_depth_.find(selected);
+    const CodePtr source = TrackedCodeLocked(selected);
+    const CodeWordsPtr words = CodeWordsLocked(source);
     VkShaderModule module = VK_NULL_HANDLE;
     std::vector<uint32_t> transformed;
     std::string reason = "selected module has no tracked SPIR-V";
     me::native::Restore7e3Stats stats;
-    if (source != codes_modules_depth_.end()) {
-      const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
+    if (words) {
+      const auto& code = *words;
       if (me::native::TransformRestore7e3(code, slots, transformed, stats, reason)) {
         VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         info.codeSize = transformed.size() * sizeof(uint32_t);
         info.pCode = transformed.data();
-        if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) {
+        if (CreateModuleCounted(info, &module) != VK_SUCCESS) {
           module = VK_NULL_HANDLE;
           reason = "vkCreateShaderModule failure";
         }
@@ -12508,9 +12757,13 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (++restore_7e3_modules_ <= 16)
       REXLOG_INFO("[native] restore into 7e3: PS n{} slots {:X} module with the UNORM10 -> 7e3 epilogue ({} "
                   "stores, {} words)", ps.number, slots, stats.stores, transformed.size());
-    ModuleCodeDepth tracked;
-    tracked.owned = std::move(transformed);
-    codes_modules_depth_.insert_or_assign(module, std::move(tracked));
+    codes_modules_depth_.insert_or_assign(
+        module, OwnedCodeLocked(std::move(transformed), source,
+                                [slots](const std::vector<uint32_t>& input, std::vector<uint32_t>& output) {
+                                  me::native::Restore7e3Stats epilogue;
+                                  std::string why;
+                                  return me::native::TransformRestore7e3(input, slots, output, epilogue, why);
+                                }));
     return module;
   }
 
@@ -12522,21 +12775,22 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     if (!selected) return VK_NULL_HANDLE;
     std::lock_guard<std::mutex> lock(modules_depth_mutex_);
     if (const auto it = modules_fixed16_.find({selected, slots}); it != modules_fixed16_.end()) return it->second;
-    const auto source = codes_modules_depth_.find(selected);
+    const CodePtr source = TrackedCodeLocked(selected);
+    const CodeWordsPtr words = CodeWordsLocked(source);
     VkShaderModule module = VK_NULL_HANDLE;
     std::vector<uint32_t> transformed;
     std::string reason = "selected module has no tracked SPIR-V";
     me::native::Fixed16Stats stats;
     uint32_t missing = 0;
     bool ok = false;
-    if (source != codes_modules_depth_.end()) {
-      const auto& code = source->second.borrowed ? *source->second.borrowed : source->second.owned;
+    if (words) {
+      const auto& code = *words;
       ok = me::native::TransformFixed16Encode(code, slots, transformed, stats, missing, reason);
       if (ok && stats.stores) {
         VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         info.codeSize = transformed.size() * sizeof(uint32_t);
         info.pCode = transformed.data();
-        if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &module) != VK_SUCCESS) {
+        if (CreateModuleCounted(info, &module) != VK_SUCCESS) {
           module = VK_NULL_HANDLE;
           ok = false;
           reason = "vkCreateShaderModule failure";
@@ -12557,9 +12811,15 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       REXLOG_INFO("[native] k_16_16 encode: PS n{} slots {:X} module with the fixed-point -32...32 epilogue ({} "
                   "stores, {} words{})", ps.number, slots, stats.stores, transformed.size(),
                   missing ? fmt::format(", slots {:X} not stored", missing) : std::string());
-    ModuleCodeDepth tracked;
-    tracked.owned = std::move(transformed);
-    codes_modules_depth_.insert_or_assign(module, std::move(tracked));
+    codes_modules_depth_.insert_or_assign(
+        module, OwnedCodeLocked(std::move(transformed), source,
+                                [slots](const std::vector<uint32_t>& input, std::vector<uint32_t>& output) {
+                                  me::native::Fixed16Stats encode;
+                                  uint32_t not_stored = 0;
+                                  std::string why;
+                                  return me::native::TransformFixed16Encode(input, slots, output, encode, not_stored,
+                                                                            why);
+                                }));
     return module;
   }
 
@@ -12733,14 +12993,15 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
       info.codeSize = limited.size() * sizeof(uint32_t);
       info.pCode = limited.data();
-      if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &shader_module) != VK_SUCCESS) {
+      if (CreateModuleCounted(info, &shader_module) != VK_SUCCESS) {
         shader_module = VK_NULL_HANDLE;
       }
     }
     REXLOG_INFO("[native] C6: PS n{} 7e3 output mask {:X}: {}", entry.number,
                 outputs_mask, shader_module != VK_NULL_HANDLE ? "limited" : "the regular module is used");
     modules_7e3_.emplace(key, shader_module);
-    RegistrarModuleCode(shader_module, limited);
+    RegistrarModuleCodeFromLibrary(shader_module, std::vector<uint32_t>(limited), entry.shader->Spirv(),
+                                   Remake7e3(outputs_mask));
     return shader_module != VK_NULL_HANDLE ? shader_module : ModuleFor(entry);
   }
 
@@ -12761,7 +13022,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
       info.codeSize = patched.size() * sizeof(uint32_t);
       info.pCode = patched.data();
-      if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &shader_module) != VK_SUCCESS) {
+      if (CreateModuleCounted(info, &shader_module) != VK_SUCCESS) {
         shader_module = VK_NULL_HANDLE;
       }
     }
@@ -12771,7 +13032,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                     : fmt::format("stays as it was: {}", reason),
                 entry.kills, entry.shader->Spirv().size());
     modules_z_early_.emplace(&entry, shader_module);
-    RegistrarModuleCode(shader_module, patched);
+    RegistrarModuleCodeFromLibrary(shader_module, std::vector<uint32_t>(patched), entry.shader->Spirv(),
+                                   RemakeZEarly);
     if (shader_module == VK_NULL_HANDLE) {
       ++z_early_no_module_;
     }
@@ -14249,7 +14511,9 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     const ShadersNative& library = *prewarmed_library_;
     std::unordered_map<uint64_t, VkShaderModule> modules;  // (variant << 32) | number
     std::unordered_map<uint64_t, VkRenderPass> passes;       // by formats
-    const auto create = [&](const uint32_t* spirv, size_t bytes, bool track = true) {
+    // `remake` makes the words again from the library code of `e` (docs/memory-growth.md 4.1.1).
+    const auto create = [&](const uint32_t* spirv, size_t bytes, bool track = true, const ShaderEntry* e = nullptr,
+                            RemakeCode remake = {}) {
       VkShaderModuleCreateInfo info{};
       info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
       info.codeSize = bytes;
@@ -14258,7 +14522,11 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       if (dfn_.vkCreateShaderModule(device_, &info, nullptr, &shader_module) != VK_SUCCESS) {
         shader_module = VK_NULL_HANDLE;
       }
-      if (track) RegistrarModuleCode(shader_module, std::vector<uint32_t>(spirv, spirv + bytes / 4));
+      if (track && e && remake)
+        RegistrarModuleCodeFromLibrary(shader_module, std::vector<uint32_t>(spirv, spirv + bytes / 4),
+                                       e->shader->Spirv(), std::move(remake));
+      else if (track)
+        RegistrarModuleCode(shader_module, std::vector<uint32_t>(spirv, spirv + bytes / 4));
       return shader_module;
     };
     // ModuleFor: the library's SPIR-V as is.
@@ -14294,18 +14562,19 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           uint32_t removed = 0;
           const std::vector<uint32_t> pruned = PruneWritesOfColor(e.shader->Spirv(), removed);
           if (!pruned.empty()) {
-            shader_module = create(pruned.data(), pruned.size() * sizeof(uint32_t));
+            shader_module = create(pruned.data(), pruned.size() * sizeof(uint32_t), true, &e, RemakeAlphaOnly);
           }
         } else if (variant == 5) {
           const std::vector<uint32_t> limited = LimitOutputs7e3(e.shader->Spirv(), mask_7e3);
           if (!limited.empty()) {
-            shader_module = create(limited.data(), limited.size() * sizeof(uint32_t));
+            shader_module = create(limited.data(), limited.size() * sizeof(uint32_t), true, &e,
+                                   Remake7e3(mask_7e3));
           }
         } else {
           const char* reason = "";
           const std::vector<uint32_t> patched = WithEarlyTests(e.shader->Spirv(), reason);
           if (!patched.empty()) {
-            shader_module = create(patched.data(), patched.size() * sizeof(uint32_t));
+            shader_module = create(patched.data(), patched.size() * sizeof(uint32_t), true, &e, RemakeZEarly);
           }
         }
         it = modules.emplace(shader_module_key, shader_module).first;
@@ -14923,31 +15192,40 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   bool empty_prepared_ = false;
 
   std::unordered_map<const ShaderEntry*, VkShaderModule> modules_;
-  struct ModuleCodeDepth {
-    const std::vector<uint32_t>* borrowed = nullptr;
-    std::vector<uint32_t> owned;
-  };
+  // The variant entries key on the interned ShaderCode they were made from (docs/memory-growth.md 4.1.1): the
+  // pointer comparison is the full-content collision guard, and no entry copies its source words.
   struct ModuleDepthHalfEntry {
-    std::vector<uint32_t> original;
+    CodePtr source;
     VkShaderModule module = VK_NULL_HANDLE;
   };
   struct ModuleDepthQuantizeEntry {
-    std::vector<uint32_t> original;
+    CodePtr source;
     bool rounded = false;
     VkShaderModule module = VK_NULL_HANDLE;
   };
   struct ModuleFragCoordXYEntry {
-    std::vector<uint32_t> original;
+    CodePtr source;
     me::native::GuestFragCoordXYMode mode;
     VkShaderModule module = VK_NULL_HANDLE;
   };
   std::mutex modules_depth_mutex_;
-  std::unordered_map<VkShaderModule, ModuleCodeDepth> codes_modules_depth_;
+  std::unordered_map<VkShaderModule, CodePtr> codes_modules_depth_;
+  // Under modules_depth_mutex_ (docs/memory-growth.md 4.1.1): the content index of every live ShaderCode, the
+  // library ones by their vector, the synthetic depth-only quantization source, and the drop counters.
+  std::unordered_multimap<uint64_t, std::weak_ptr<ShaderCode>> codes_by_hash_;
+  std::unordered_map<const std::vector<uint32_t>*, CodePtr> codes_library_;
+  CodePtr synthetic_depth_code_;
+  bool codes_drop_broken_ = false;
+  uint64_t codes_dropped_ = 0, codes_dropped_bytes_ = 0;
+  uint64_t codes_remade_ = 0, codes_remade_us_ = 0, codes_remade_max_us_ = 0, codes_remade_mismatches_ = 0;
+  // Bytes of SPIR-V handed to vkCreateShaderModule by the persistent module tables (the driver keeps a copy in
+  // each VkShaderModule: vk_shader_module_create allocates sizeof(module) + codeSize). Any thread.
+  std::atomic<uint64_t> module_code_bytes_{0}, module_code_count_{0};
   std::unordered_map<uint64_t, std::vector<ModuleDepthHalfEntry>> modules_depth_half_;
   std::unordered_map<uint64_t, std::vector<ModuleDepthQuantizeEntry>> modules_depth_quantize_;
   std::unordered_map<uint64_t, std::vector<ModuleFragCoordXYEntry>> modules_fragcoord_xy_;
   struct ModuleTextureSignsEntry {
-    std::vector<uint32_t> original;
+    CodePtr source;
     uint8_t signs[48] = {};
     uint64_t known = 0;
     VkShaderModule module = VK_NULL_HANDLE;  // null: nothing folded, the selected module is used
