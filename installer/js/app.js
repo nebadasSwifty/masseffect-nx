@@ -3,14 +3,14 @@ import { CONFIG } from '../config.js?v=0.3.3';
 import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc, auditPackages, classifyAudit, knownBadFor } from './source.js?v=0.3.3';
 import { planGameFiles, formatBytes } from './plan.js';
 import { openSink, describeSinkSupport, cleanStaleTemporaryFiles } from './sink.js';
-import { run, Cancelled, UserError, stageIds, stagesFor } from './pipeline.js';
+import { run, Cancelled, UserError, stageIds, stagesFor } from './pipeline.js?v=0.3.3';
 import { initLanguage, getLanguage, setLanguage, t } from './i18n.js?v=0.3.3';
 import {
   parseProdKeys, forgetKeys, estimateNspBytes, estimateProgramUpdateBytes, parseBaseMetadata, nextUpdateVersion,
   withLastUpdateVersion, pythonJson, inspectBaseNsp, PartsReader,
-} from './nsp.js';
-import { openNspSink, nspSinkSupport, saveTextFile } from './nsp_sink.js';
-import { findPermittedSwitch, requestSwitch, WebUsbTransport, USB_VENDOR_ID, USB_PRODUCT_ID } from './usb_install.js';
+} from './nsp.js?v=0.3.3';
+import { openNspSink, nspSinkSupport, saveTextFile } from './nsp_sink.js?v=0.3.3';
+import { findPermittedSwitch, requestSwitch, WebUsbTransport, USB_VENDOR_ID, USB_PRODUCT_ID } from './usb_install.js?v=0.3.3';
 import { openStfs, verifyStfs } from './stfs.js';
 
 const $ = (id) => document.getElementById(id);

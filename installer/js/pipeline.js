@@ -20,7 +20,7 @@
 // files go to the content folder of the runtime, and masseffect.toml gets dlc_enable = true. See docs/dlc.md.
 import { ZipWriter } from './zip.js';
 import { planGameFiles, scanCandidates, sha256Hex } from './plan.js';
-import { buildNsp, metadataFromNsp, PartsReader, sourceFromBytes, PackError, checkUpdateTitle } from './nsp.js';
+import { buildNsp, metadataFromNsp, PartsReader, sourceFromBytes, PackError, checkUpdateTitle } from './nsp.js?v=0.3.3';
 
 export class Cancelled extends Error {
   constructor() { super('Cancelled'); this.name = 'Cancelled'; }
