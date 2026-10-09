@@ -142,13 +142,22 @@ std::string ReportPath() {
 struct Slot {
   std::atomic<u32> handle{0};
   char name[32]{};
+  // Guest threads: the guest start routine and its argument (XThread creation parameters), for the report.
+  std::atomic<u32> guest_entry{0};
+  std::atomic<u32> guest_context{0};
+  // Render-thread role marks (one per guest D3D Swap, RexSwitchPerfNoteThreadRole), written by the thread itself.
+  std::atomic<u32> swaps{0};
   // Only the profiler thread touches these:
   u32 seen = 0;
   u64 last_ticks = 0;
   bool busy = true;
   double cpu = 0.0;
+  u32 swaps_last = 0;
+  u32 swaps_interval = 0;
 };
 Slot g_slots[kMaxThreads];
+// The game thread (the one that runs UGameEngine::Tick, RexSwitchPerfNoteThreadRole), 0 = not seen yet.
+std::atomic<u32> g_game_thread{0};
 // Exclusive core for the hottest guest thread (the game's main thread): -1 = off. See ApplyExclusiveCore.
 std::atomic<int> g_exclusive_core{-1};
 std::atomic<bool> g_light_core{false};
@@ -324,6 +333,8 @@ void Register(Handle h) {
     u32 expected = 0;
     if (s.handle.compare_exchange_strong(expected, h)) {
       s.name[0] = 0;
+      s.guest_entry.store(0, std::memory_order_relaxed);
+      s.guest_context.store(0, std::memory_order_relaxed);
       return;
     }
   }
@@ -386,43 +397,92 @@ std::vector<Count> Histogram(std::vector<u64>& addrs) {
 }
 
 /*
- * Exclusive core (RexSwitchPerfExclusiveCore): once the hottest guest thread ("XThread...", the game's main
- * thread in gameplay) uses more than 60 % of a core, it is pinned to core K alone and every other registered
- * thread loses core K from its mask (threads pinned to K alone are left alone). Re-applied at every report
- * so that threads created later move off K too. Same work, different placement: the main thread no longer
- * shares its core with the ring thread and the C20 worker, which run at a higher priority (0x2C < 0x3B).
+ * Exclusive core (RexSwitchPerfExclusiveCore): once the game's main thread uses more than 60 % of a core, it is
+ * pinned to core K alone and every other registered thread loses core K from its mask (threads pinned to K alone are
+ * left alone). Re-applied at every report so that threads created later move off K too. Same work, different
+ * placement: the main thread no longer shares its core with the ring thread and the C20 worker, which run at a higher
+ * priority (0x2C < 0x3B).
+ *
+ * The threads are chosen by what they run, not by their CPU share: the main thread is the one that runs
+ * UGameEngine::Tick and the render thread the one that calls the guest D3D Swap (both reported by the game hooks
+ * through RexSwitchPerfNoteThreadRole). The CPU ranking picked a guest timer thread that spun at 92 % of a core in one
+ * boot and raised it above the ring thread instead of the render thread (docs/kernel-waits.md). Without the role
+ * marks (a build without those hooks) the main thread falls back to the old rule, the hottest "XThread..." thread, and
+ * no thread is raised.
  */
+const Slot* FindSlot(const std::vector<size_t>& order, u32 handle) {
+  if (!handle) return nullptr;
+  for (size_t i : order) {
+    if (g_slots[i].handle.load() == handle) return &g_slots[i];
+  }
+  return nullptr;
+}
+
 void ApplyExclusiveCore(FILE* f, const std::vector<size_t>& order) {
   static u32 pinned = 0;
   const int k = g_exclusive_core.load(std::memory_order_relaxed);
   if (k < 0 || k > 2) return;
   const u64 bit = 1ull << k;
   if (!pinned) {
-    for (size_t i : order) {
-      const Slot& s = g_slots[i];
-      if (std::strncmp(s.name, "XThread", 7) != 0) continue;
-      if (s.cpu < 60.0) break;
-      if (R_SUCCEEDED(svcSetThreadCoreMask(s.handle.load(), k, bit))) {
-        pinned = s.handle.load();
-        std::fprintf(f, "-- exclusive core %d for \"%s\" (CPU %.1f%%)\n", k, s.name, s.cpu);
+    const u32 game = g_game_thread.load(std::memory_order_relaxed);
+    const Slot* main_slot = nullptr;
+    const char* why = "game thread: runs UGameEngine::Tick";
+    if (game) {
+      main_slot = FindSlot(order, game);
+    } else {
+      // Fallback (no role marks): the hottest guest thread.
+      why = "hottest guest thread; game thread not identified";
+      for (size_t i : order) {
+        if (std::strncmp(g_slots[i].name, "XThread", 7) == 0) {
+          main_slot = &g_slots[i];
+          break;
+        }
       }
-      break;
+    }
+    if (main_slot && main_slot->cpu >= 60.0 && R_SUCCEEDED(svcSetThreadCoreMask(main_slot->handle.load(), k, bit))) {
+      pinned = main_slot->handle.load();
+      std::fprintf(f, "-- exclusive core %d for \"%s\" (%s; CPU %.1f%%, guest entry 0x%08X)\n", k, main_slot->name, why,
+                   main_slot->cpu, main_slot->guest_entry.load(std::memory_order_relaxed));
     }
     if (!pinned) return;
   }
-  // 20 + K: also raise the second-hottest guest thread (UE3's render thread, the main thread's critical
-  // path since C45) above the ring thread and the C20 worker (0x2C), which preempted it on cores 0-1.
+  // 20 + K: also raise UE3's render thread (the main thread's critical path since C45) above the ring thread and the
+  // C20 worker (0x2C), which preempted it on cores 0-1. The render thread = the thread with the most guest D3D Swap
+  // calls in the last interval (at least kMinSwaps). If another thread takes that role later, the previous one gets
+  // its old priority back.
   static u32 raised = 0;
-  if (g_core_render.load(std::memory_order_relaxed) && !raised) {
+  static s32 raised_old_priority = -1;
+  static bool reported_unknown = false;
+  if (g_core_render.load(std::memory_order_relaxed)) {
+    constexpr u32 kMinSwaps = 10;
+    const Slot* render = nullptr;
     for (size_t i : order) {
       const Slot& s = g_slots[i];
-      if (s.handle.load() == pinned || std::strncmp(s.name, "XThread", 7) != 0) continue;
-      if (s.cpu < 35.0) break;
-      if (R_SUCCEEDED(svcSetThreadPriority(s.handle.load(), 0x2B))) {
-        raised = s.handle.load();
-        std::fprintf(f, "-- priority 0x2B for \"%s\" (CPU %.1f%%)\n", s.name, s.cpu);
+      if (s.handle.load() == pinned || s.swaps_interval < kMinSwaps) continue;
+      if (!render || s.swaps_interval > render->swaps_interval) render = &s;
+    }
+    if (render && render->handle.load() != raised) {
+      const u32 h = render->handle.load();
+      s32 old_priority = -1;
+      svcGetThreadPriority(&old_priority, h);
+      if (R_SUCCEEDED(svcSetThreadPriority(h, 0x2B))) {
+        if (raised && raised_old_priority >= 0) {
+          // May fail if that thread is gone; nothing else to undo then.
+          svcSetThreadPriority(raised, raised_old_priority);
+          std::fprintf(f, "-- priority 0x%X restored for the previous render thread (handle 0x%X)\n",
+                       static_cast<unsigned>(raised_old_priority), raised);
+        }
+        raised = h;
+        raised_old_priority = old_priority;
+        std::fprintf(f,
+                     "-- priority 0x2B for \"%s\" (render thread: %u guest D3D Swaps in the interval; CPU %.1f%%, "
+                     "guest entry 0x%08X, was priority 0x%X)\n",
+                     render->name, render->swaps_interval, render->cpu,
+                     render->guest_entry.load(std::memory_order_relaxed), static_cast<unsigned>(old_priority));
       }
-      break;
+    } else if (!render && !raised && !reported_unknown) {
+      reported_unknown = true;
+      std::fprintf(f, "-- render thread not identified yet (no guest D3D Swap seen): no thread raised\n");
     }
   }
   const bool light = g_light_core.load(std::memory_order_relaxed);
@@ -468,13 +528,18 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
     if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, h, UINT64_MAX))) {
       continue;
     }
+    const u32 swaps = s.swaps.load(std::memory_order_relaxed);
     if (s.seen != h) {  // new thread: no interval yet
       s.seen = h;
       s.last_ticks = ticks;
       s.busy = true;
       s.cpu = 0.0;
+      s.swaps_last = swaps;
+      s.swaps_interval = 0;
       continue;
     }
+    s.swaps_interval = swaps - s.swaps_last;
+    s.swaps_last = swaps;
     s.cpu = double(ticks - s.last_ticks) * 100.0 / double(elapsed_ticks);
     s.last_ticks = ticks;
     /*
@@ -785,9 +850,17 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
     svcGetThreadCoreMask(&preferred, &mask, s.handle.load());
     std::fprintf(f,
                  "\n-- thread %" PRIu64 " \"%s\": CPU %.1f%% | priority 0x%X, preferred core %d, "
-                 "mask 0x%llX\n",
+                 "mask 0x%llX",
                  tid, s.name[0] ? s.name : "?", s.cpu, static_cast<unsigned>(priority),
                  static_cast<int>(preferred), static_cast<unsigned long long>(mask));
+    // Guest threads: the guest start routine and argument, a name that stays the same between boots.
+    if (const u32 entry = s.guest_entry.load(std::memory_order_relaxed)) {
+      std::fprintf(f, " | guest entry 0x%08X ctx 0x%08X", entry, s.guest_context.load(std::memory_order_relaxed));
+    }
+    if (s.swaps_interval) {
+      std::fprintf(f, " | %u guest Swaps", s.swaps_interval);
+    }
+    std::fputc('\n', f);
 
     auto lo = std::lower_bound(samples.begin(), samples.end(), i,
                                [](const Sample& a, size_t v) { return a.slot < v; });
@@ -1290,6 +1363,42 @@ void RexSwitchPerfMax(unsigned id, u64 value) {
  */
 bool RexSwitchPerfSkip(unsigned bit) {
   return (g_skip_mask.load(std::memory_order_relaxed) & bit) != 0;
+}
+
+// Called by every guest thread when it starts (xthread.cpp): its guest start routine and argument, for the report.
+void RexSwitchPerfSetCurrentGuestEntry(u32 entry, u32 context) {
+  const u32 self = threadGetCurHandle();
+  for (auto& s : g_slots) {
+    if (s.handle.load() == self) {
+      s.guest_context.store(context, std::memory_order_relaxed);
+      s.guest_entry.store(entry, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+// Role marks from the game hooks (ApplyExclusiveCore): 0 = the calling thread ran UGameEngine::Tick (main thread),
+// 1 = it called the guest D3D Swap (render thread). Cheap enough for once per frame: a cached slot and one relaxed add.
+void RexSwitchPerfNoteThreadRole(unsigned role) {
+  const u32 self = threadGetCurHandle();
+  if (role == 0) {
+    if (g_game_thread.load(std::memory_order_relaxed) != self) {
+      g_game_thread.store(self, std::memory_order_relaxed);
+    }
+    return;
+  }
+  static thread_local Slot* slot = nullptr;
+  if (!slot || slot->handle.load(std::memory_order_relaxed) != self) {
+    slot = nullptr;
+    for (auto& s : g_slots) {
+      if (s.handle.load(std::memory_order_relaxed) == self) {
+        slot = &s;
+        break;
+      }
+    }
+    if (!slot) return;
+  }
+  slot->swaps.fetch_add(1, std::memory_order_relaxed);
 }
 
 void RexSwitchPerfSetThreadName(u32 handle, const char* name) {

@@ -203,9 +203,16 @@ void RecordSwapWait(uint64_t ns, uint32_t kicks_behind, bool must_wait, bool rel
 
 #ifndef MASSEFFECT_D3D_TRACE_ALL  // that build wraps sub_8222C558 itself (me_d3d_trace_all.inc)
 REX_EXTERN(__imp__sub_8222C558);
+// Profiler (sdk/src/ui/switch_perf.cpp): a reason-3 wait comes only from the guest D3D Swap, i.e. from UE3's render
+// thread (masseffect_exclusive_core 20 + K raises the thread with the most of these marks, not the busiest one).
+extern "C" void RexSwitchPerfNoteThreadRole(unsigned role);
+
 REX_HOOK_RAW(sub_8222C558) {
   static const bool stats = REXCVAR_GET(masseffect_swap_wait_stats);
   static const bool relax = me::native::Enabled() && REXCVAR_GET(masseffect_swap_frames_in_flight) > 1;
+  if (ctx.r5.u32 == kReasonSwap) {
+    RexSwitchPerfNoteThreadRole(1);
+  }
   if (ctx.r5.u32 != kReasonSwap || (!stats && !relax)) {
     __imp__sub_8222C558(ctx, base);
     return;

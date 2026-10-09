@@ -42,6 +42,8 @@ set(MASSEFFECT_SOURCES
     src/native/me_console_exec.cpp
     src/native/me_tour.cpp
     src/native/me_script_prof.cpp
+    # Diagnostic probe of a spinning guest timer thread (masseffect_diag_timer_spin, docs/kernel-waits.md).
+    src/native/me_timer_spin_diag.cpp
     # Engine settings A/B: config value overrides; skeletal/light environment game-thread cost (docs/engine-settings-ab.md).
     src/native/me_render_ring.cpp
     src/native/masseffect/masseffect_native_draws.cpp

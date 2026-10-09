@@ -61,6 +61,7 @@ This is the path the game follows, from the Xbox 360 disc to the Switch screen:
 | [optimization-paths.md](optimization-paths.md) | Every optimization idea tried or considered, by area, with its result and setting |
 | [known-issues.md](known-issues.md) | What is not working, not finished or not proven, with the evidence |
 | [streaming-io.md](streaming-io.md) | The game's package reads during play, why they are reread, and the RAM block cache for them |
+| [kernel-waits.md](kernel-waits.md) | Cost of the guest's kernel waits and releases in the SDK, the render-thread priority choice, the timer-spin probe |
 
 Outside this folder: [../README.md](../README.md) (how to install and use the port), [../shaders/README.md](../shaders/README.md)
 (the shader pipeline and file formats), [../mesa/README.md](../mesa/README.md) (the driver patch table),

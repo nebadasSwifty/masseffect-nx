@@ -87,6 +87,17 @@ for src in "$HERE"/cpu/test_*.cpp; do
         [[ -d "$THIRD/$third" ]] && extra_inc+=(-I"$THIRD/$third")
       done
       [[ -d "$THIRD/fmt/include" ]] || { report SKIP "$name" "run tools/fetch_thirdparty.py"; continue; } ;;
+    test_kernel_waits)
+      # The SDK's POSIX wait objects (sdk/src/core/threading_posix.cpp, compiled in) with stubs for the logger, the
+      # cvar registry and the timer queue. fmt and spdlog header-only.
+      case "$(uname -s)" in Darwin|Linux) ;; *) report SKIP "$name" "POSIX host only"; continue ;; esac
+      [[ -d "$THIRD/fmt/include" && -d "$THIRD/spdlog/include" ]] || { report SKIP "$name" "run tools/fetch_thirdparty.py"; continue; }
+      std=c++23; strict=(-w -DFMT_HEADER_ONLY -DSPDLOG_FMT_EXTERNAL -fno-char8_t)
+      case "$(uname -s)" in Darwin) strict+=(-DREX_PLATFORM_MAC=1) ;; Linux) strict+=(-DREX_PLATFORM_LINUX=1) ;; esac
+      extra_inc=(-I"$SDK/include" -I"$SDK" -I"$THIRD/fmt/include" -I"$THIRD/spdlog/include")
+      [[ -d "$THIRD/simde" ]] && extra_inc+=(-I"$THIRD/simde")
+      [[ -d "$THIRD/tomlplusplus/include" ]] && extra_inc+=(-isystem "$THIRD/tomlplusplus/include")
+      extra_src=("$SDK/src/core/threading_posix.cpp") ;;
     test_xma_convert)
       # NEON audio conversion against the scalar loop it replaces (copies of the SDK code).
       std=c++23; strict=(-w)

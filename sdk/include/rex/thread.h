@@ -202,8 +202,14 @@ class WaitHandle {
   // This value is platform specific.
   virtual void* native_handle() const = 0;
 
+  // The platform's wait object behind this handle, set once by the platform implementation's constructor (POSIX:
+  // its PosixConditionBase), so a wait reaches it with a static cast instead of a dynamic_cast per call. Null on
+  // platforms that do not use it.
+  void* platform_wait_object() const { return platform_wait_object_; }
+
  protected:
   WaitHandle() = default;
+  void* platform_wait_object_ = nullptr;
 };
 
 // Waits until the wait handle is in the signaled state, an alert triggers and

@@ -41,6 +41,9 @@
 #include <string_view>
 
 #include "../core/threading_switch.h"
+
+// Profiler (ui/switch_perf.cpp): the guest start routine of the calling thread, printed in rex_profile.log.
+extern "C" void RexSwitchPerfSetCurrentGuestEntry(uint32_t entry, uint32_t context);
 #endif
 
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
@@ -470,6 +473,9 @@ X_STATUS XThread::Create() {
     rex::initialize_seh_thread();
 #if REX_PLATFORM_SWITCH
     RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, thread_name_));
+    if (guest_thread_) {
+      RexSwitchPerfSetCurrentGuestEntry(creation_params_.start_address, creation_params_.start_context);
+    }
 #endif
     runtime::ThreadState::Bind(thread_state_.get());
 

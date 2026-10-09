@@ -199,7 +199,12 @@ uint32_t RunConsoleCommand(PPCContext& ctx, uint8_t* base, const std::string& co
 }
 }  // namespace me::exec
 
+// Profiler (sdk/src/ui/switch_perf.cpp): this thread runs UGameEngine::Tick, i.e. it is the game's main thread
+// (masseffect_exclusive_core pins it by this mark instead of by its CPU share).
+extern "C" void RexSwitchPerfNoteThreadRole(unsigned role);
+
 REX_HOOK_RAW(sub_825E6978) {
+  RexSwitchPerfNoteThreadRole(0);
   State& s = Get();
   const int32_t load_ms = REXCVAR_GET(masseffect_exec_load_ms);
   const bool timed = s.configured && s.first.done && !s.arrival.done && load_ms > 0;

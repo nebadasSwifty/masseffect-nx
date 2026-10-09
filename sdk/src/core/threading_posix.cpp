@@ -400,6 +400,9 @@ class PosixConditionBase {
     if (predicate()) {
       executed = true;
     } else {
+      // Counted under mutex_ before the wait releases it: a signaller that changes the state under mutex_ either
+      // runs before this check (the predicate above saw it) or sees cond_waiters_ != 0 and notifies.
+      ++cond_waiters_;
       if (timeout == std::chrono::milliseconds::max()) {
         cond_.wait(lock, predicate);
         executed = true;  // Did not time out;
@@ -411,6 +414,7 @@ class PosixConditionBase {
         executed = cond_.wait_for(lock, timeout, predicate);
 #endif
       }
+      --cond_waiters_;
     }
     if (executed) {
       if (interrupt && !signaled()) {
@@ -426,14 +430,15 @@ class PosixConditionBase {
   // `wake` (optional): wake point registered by the caller (and, for alertable calls, with its thread). With
   // it the call parks instead of sleeping 1 ms between polls: it re-polls when a registered handle is
   // signalled (poke), when `interrupt` is raised, at the end of the timeout, or after the safety interval.
-  static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
+  // `handles` is the caller's array (no copy, no allocation): it must stay valid for the whole call.
+  static std::pair<WaitResult, size_t> WaitMultiple(PosixConditionBase* const* handles, size_t count,
                                                     bool wait_all,
                                                     std::chrono::milliseconds timeout,
                                                     WakePoint* wake = nullptr,
                                                     const std::atomic<bool>* interrupt = nullptr) {
-    assert_true(!handles.empty());
+    assert_true(count != 0);
 
-    if (handles.size() == 1) {
+    if (count == 1) {
       auto result = handles[0]->Wait(timeout, interrupt);
       return std::make_pair(result, 0);
     }
@@ -445,24 +450,34 @@ class PosixConditionBase {
 
     // Registered for the whole call; the guard unregisters on every exit path.
     struct MultiRegistration {
-      std::vector<PosixConditionBase*>& handles;
+      PosixConditionBase* const* handles;
+      size_t count;
       WakePoint* wake;
-      MultiRegistration(std::vector<PosixConditionBase*>& h, WakePoint* w) : handles(h), wake(w) {
+      MultiRegistration(PosixConditionBase* const* h, size_t n, WakePoint* w) : handles(h), count(n), wake(w) {
         if (wake) {
-          for (auto* handle : handles) handle->RegisterMulti(wake);
+          for (size_t i = 0; i < count; ++i) handles[i]->RegisterMulti(wake);
         }
       }
       ~MultiRegistration() {
         if (wake) {
-          for (auto* handle : handles) handle->UnregisterMulti(wake);
+          for (size_t i = 0; i < count; ++i) handles[i]->UnregisterMulti(wake);
         }
       }
-    } registration(handles, wake);
+    } registration(handles, count, wake);
     const auto safety = std::chrono::milliseconds(std::max(1, REXCVAR_GET(thread_multiwait_safety_ms)));
 
-    // Reuse the allocation between polls; clear() releases the locks, not the memory.
-    std::vector<std::unique_lock<std::mutex>> locks;
-    locks.reserve(handles.size());
+    // The internal locks taken by one poll: handles[0..locked) are held. release() (and the destructor, on the
+    // return paths) unlocks them; replaces a std::vector<std::unique_lock> (no allocation per call).
+    struct HeldLocks {
+      PosixConditionBase* const* handles;
+      size_t locked = 0;
+      void release() {
+        while (locked) {
+          handles[--locked]->mutex_.unlock();
+        }
+      }
+      ~HeldLocks() { release(); }
+    } locks{handles};
     while (true) {
       // Sampled BEFORE the poll: a handle signalled after this point bumps the sequence, so the park
       // below returns at once instead of missing it.
@@ -471,7 +486,7 @@ class PosixConditionBase {
       bool condition_met = false;
       bool all_locked = true;
 
-      for (size_t i = 0; i < handles.size(); ++i) {
+      for (size_t i = 0; i < count; ++i) {
 #if REX_PLATFORM_LINUX
         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
         int result = pthread_mutex_trylock(native_mutex);
@@ -479,14 +494,15 @@ class PosixConditionBase {
           if (result == EOWNERDEAD) {
             pthread_mutex_consistent(native_mutex);
           }
-          locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
+          ++locks.locked;
         } else {
           all_locked = false;
           break;
         }
 #else
-        locks.emplace_back(handles[i]->mutex_, std::try_to_lock);
-        if (!locks.back().owns_lock()) {
+        if (handles[i]->mutex_.try_lock()) {
+          ++locks.locked;
+        } else {
           all_locked = false;
           break;
         }
@@ -494,7 +510,7 @@ class PosixConditionBase {
       }
 
       if (!all_locked) {
-        locks.clear();
+        locks.release();
         // The timeout also expires when an object cannot be inspected.
         // The earlier continue skipped the only timeout check.
         const auto now = std::chrono::steady_clock::now();
@@ -519,7 +535,7 @@ class PosixConditionBase {
 
       if (wait_all) {
         bool all_signaled = true;
-        for (size_t i = 0; i < handles.size(); ++i) {
+        for (size_t i = 0; i < count; ++i) {
           if (!handles[i]->signaled()) {
             all_signaled = false;
             break;
@@ -530,7 +546,7 @@ class PosixConditionBase {
         }
         condition_met = all_signaled;
       } else {
-        for (size_t i = 0; i < handles.size(); ++i) {
+        for (size_t i = 0; i < count; ++i) {
           if (handles[i]->signaled()) {
             first_signaled = i;
             condition_met = true;
@@ -541,7 +557,7 @@ class PosixConditionBase {
 
       if (condition_met) {
         if (wait_all) {
-          for (size_t i = 0; i < handles.size(); ++i) {
+          for (size_t i = 0; i < count; ++i) {
             handles[i]->post_execution();
           }
         } else {
@@ -550,7 +566,7 @@ class PosixConditionBase {
         return std::make_pair(WaitResult::kSuccess, first_signaled);
       }
 
-      locks.clear();
+      locks.release();
 
       auto now = std::chrono::steady_clock::now();
       if (now >= end_time) {
@@ -606,8 +622,14 @@ class PosixConditionBase {
  protected:
   inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+  // Must be called with mutex_ held, in the same critical section that changed the state: true when a thread is
+  // blocked (or about to block) in Wait() on cond_. Lets a state change skip cond_.notify_all() when nobody can be
+  // waiting on it; on Horizon a notify is a system call even with no waiter (svcSignalProcessWideKey).
+  bool has_cond_waiters() const { return cond_waiters_ != 0; }
   std::condition_variable cond_;
   std::mutex mutex_;
+  // Threads inside Wait() between their failed predicate check and their return; guarded by mutex_.
+  uint32_t cond_waiters_ = 0;
 
  private:
   std::mutex multi_mutex_;
@@ -630,13 +652,17 @@ class PosixCondition<Event> : public PosixConditionBase {
   virtual ~PosixCondition() = default;
 
   bool Signal() override {
+    bool notify;
     {
       auto lock = std::unique_lock<std::mutex>(mutex_);
       signal_ = true;
+      notify = has_cond_waiters();
     }
     // Notified after the lock is released: a woken waiter (on Horizon the XMA decoder runs above the guest
     // threads) would otherwise run straight into the mutex its signaller still holds and go back to sleep.
-    cond_.notify_all();
+    if (notify) {
+      cond_.notify_all();
+    }
     NotifyMulti();
     return true;
   }
@@ -674,8 +700,11 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
+    const bool notify = has_cond_waiters();
     lock.unlock();
-    cond_.notify_all();
+    if (notify) {
+      cond_.notify_all();
+    }
     NotifyMulti();
     return true;
   }
@@ -684,7 +713,10 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   inline bool signaled() const override { return count_ > 0; }
   inline void post_execution() override {
     count_--;
-    cond_.notify_all();
+    // Runs with mutex_ held (Wait and WaitMultiple).
+    if (has_cond_waiters()) {
+      cond_.notify_all();
+    }
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -705,14 +737,18 @@ class PosixCondition<Mutant> : public PosixConditionBase {
   bool Release() {
     if (owner_ == std::this_thread::get_id() && count_ > 0) {
       bool released = false;
+      bool notify = false;
       {
         auto lock = std::unique_lock<std::mutex>(mutex_);
         --count_;
         // Free to be acquired by another thread
         released = count_ == 0;
+        notify = released && has_cond_waiters();
+      }
+      if (notify) {
+        cond_.notify_all();
       }
       if (released) {
-        cond_.notify_all();
         NotifyMulti();
       }
       return true;
@@ -743,11 +779,15 @@ class PosixCondition<Timer> : public PosixConditionBase {
   virtual ~PosixCondition() { Cancel(); }
 
   bool Signal() override {
+    bool notify;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       signal_ = true;
+      notify = has_cond_waiters();
     }
-    cond_.notify_all();
+    if (notify) {
+      cond_.notify_all();
+    }
     NotifyMulti();
     return true;
   }
@@ -1424,7 +1464,7 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
 template <typename T>
 class PosixConditionHandle : public T, public PosixWaitHandle {
  public:
-  PosixConditionHandle() = default;
+  PosixConditionHandle() { BindWaitObject(); }
   explicit PosixConditionHandle(bool);
   explicit PosixConditionHandle(pthread_t thread);
   PosixConditionHandle(bool manual_reset, bool initial_state);
@@ -1435,6 +1475,10 @@ class PosixConditionHandle : public T, public PosixWaitHandle {
   void* native_handle() const override { return handle_.native_handle(); }
 
  protected:
+  // WaitHandle::platform_wait_object(): the waits below reach handle_ with a static cast (ConditionOf).
+  void BindWaitObject() {
+    this->platform_wait_object_ = static_cast<void*>(static_cast<PosixConditionBase*>(&handle_));
+  }
   PosixCondition<T> handle_;
   friend PosixCondition<T>;
 };
@@ -1442,42 +1486,66 @@ class PosixConditionHandle : public T, public PosixWaitHandle {
 template <>
 PosixConditionHandle<Semaphore>::PosixConditionHandle(uint32_t initial_count,
                                                       uint32_t maximum_count)
-    : handle_(initial_count, maximum_count) {}
+    : handle_(initial_count, maximum_count) {
+  BindWaitObject();
+}
 
 template <>
-PosixConditionHandle<Mutant>::PosixConditionHandle(bool initial_owner) : handle_(initial_owner) {}
+PosixConditionHandle<Mutant>::PosixConditionHandle(bool initial_owner) : handle_(initial_owner) {
+  BindWaitObject();
+}
 
 template <>
-PosixConditionHandle<Timer>::PosixConditionHandle(bool manual_reset) : handle_(manual_reset) {}
+PosixConditionHandle<Timer>::PosixConditionHandle(bool manual_reset) : handle_(manual_reset) {
+  BindWaitObject();
+}
 
 template <>
 PosixConditionHandle<Event>::PosixConditionHandle(bool manual_reset, bool initial_state)
-    : handle_(manual_reset, initial_state) {}
+    : handle_(manual_reset, initial_state) {
+  BindWaitObject();
+}
 
 template <>
-PosixConditionHandle<Thread>::PosixConditionHandle(pthread_t thread) : handle_(thread) {}
+PosixConditionHandle<Thread>::PosixConditionHandle(pthread_t thread) : handle_(thread) {
+  BindWaitObject();
+}
 
-WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::milliseconds timeout) {
-  auto posix_wait_handle = dynamic_cast<PosixWaitHandle*>(wait_handle);
-  if (posix_wait_handle == nullptr) {
-    return WaitResult::kFailed;
+namespace {
+
+// The condition behind a wait handle. Every POSIX wait handle is a PosixConditionHandle, which records its condition
+// in WaitHandle::platform_wait_object() at construction: a static cast instead of the dynamic_cast per wait (a
+// cross-cast that compared type names, ~12 % of a spinning guest wait loop on the console). The dynamic_cast stays
+// as the fallback for a handle that did not record one; null in, null out (the callers then fail the wait).
+inline PosixConditionBase* ConditionOf(WaitHandle* wait_handle) {
+  if (wait_handle == nullptr) {
+    return nullptr;
   }
+  if (void* object = wait_handle->platform_wait_object()) {
+    return static_cast<PosixConditionBase*>(object);
+  }
+  auto posix_wait_handle = dynamic_cast<PosixWaitHandle*>(wait_handle);
+  return posix_wait_handle ? &posix_wait_handle->condition() : nullptr;
+}
+
+// One handle: the body of Wait() and of a one-handle WaitMultiple (which reached the same Wait() calls through
+// PosixConditionBase::WaitMultiple's single-handle branch).
+WaitResult WaitOne(PosixConditionBase& condition, bool is_alertable, std::chrono::milliseconds timeout) {
   if (!is_alertable) {
-    return posix_wait_handle->condition().Wait(timeout);
+    return condition.Wait(timeout);
   }
 
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
   // Event-driven: a queued callback interrupts the parked Wait() (flag + InterruptWaiters).
-  ScopedAlertWake wake(&posix_wait_handle->condition(), nullptr);
+  ScopedAlertWake wake(&condition, nullptr);
   const std::atomic<bool>* interrupt = wake.flag();
 
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
     }
-    auto result =
-        posix_wait_handle->condition().Wait(ComputeAlertableWaitTimeout(deadline), interrupt);
+    auto result = condition.Wait(ComputeAlertableWaitTimeout(deadline), interrupt);
     if (result != WaitResult::kTimeout) {
       return result;
     }
@@ -1491,32 +1559,41 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
   }
 }
 
+}  // namespace
+
+WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::milliseconds timeout) {
+  PosixConditionBase* condition = ConditionOf(wait_handle);
+  if (condition == nullptr) {
+    return WaitResult::kFailed;
+  }
+  return WaitOne(*condition, is_alertable, timeout);
+}
+
 WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_handle_to_wait_on,
                          bool is_alertable, std::chrono::milliseconds timeout) {
   auto result = WaitResult::kFailed;
-  auto posix_wait_handle_to_signal = dynamic_cast<PosixWaitHandle*>(wait_handle_to_signal);
-  auto posix_wait_handle_to_wait_on = dynamic_cast<PosixWaitHandle*>(wait_handle_to_wait_on);
-  if (posix_wait_handle_to_signal == nullptr || posix_wait_handle_to_wait_on == nullptr) {
+  PosixConditionBase* condition_to_signal = ConditionOf(wait_handle_to_signal);
+  PosixConditionBase* condition_to_wait_on = ConditionOf(wait_handle_to_wait_on);
+  if (condition_to_signal == nullptr || condition_to_wait_on == nullptr) {
     return WaitResult::kFailed;
   }
-  if (!posix_wait_handle_to_signal->condition().Signal()) {
+  if (!condition_to_signal->Signal()) {
     return WaitResult::kFailed;
   }
 
   if (!is_alertable) {
-    return posix_wait_handle_to_wait_on->condition().Wait(timeout);
+    return condition_to_wait_on->Wait(timeout);
   }
 
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
-  ScopedAlertWake wake(&posix_wait_handle_to_wait_on->condition(), nullptr);
+  ScopedAlertWake wake(condition_to_wait_on, nullptr);
   const std::atomic<bool>* interrupt = wake.flag();
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
     }
-    result = posix_wait_handle_to_wait_on->condition().Wait(ComputeAlertableWaitTimeout(deadline),
-                                                            interrupt);
+    result = condition_to_wait_on->Wait(ComputeAlertableWaitTimeout(deadline), interrupt);
     if (result != WaitResult::kTimeout) {
       return result;
     }
@@ -1529,35 +1606,45 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
 std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wait_handle_count,
                                            bool wait_all, bool is_alertable,
                                            std::chrono::milliseconds timeout) {
-  std::vector<PosixConditionBase*> conditions;
-  conditions.reserve(wait_handle_count);
+  // The handles' conditions: on the stack up to the kernel's limit of 64 objects per wait (MAXIMUM_WAIT_OBJECTS),
+  // on the heap above it. Was a std::vector built per call and copied again per alertable slice.
+  constexpr size_t kInlineHandles = 64;
+  PosixConditionBase* inline_conditions[kInlineHandles];
+  std::unique_ptr<PosixConditionBase*[]> heap_conditions;
+  PosixConditionBase** conditions = inline_conditions;
+  if (wait_handle_count > kInlineHandles) {
+    heap_conditions.reset(new PosixConditionBase*[wait_handle_count]);
+    conditions = heap_conditions.get();
+  }
   for (size_t i = 0u; i < wait_handle_count; ++i) {
-    auto handle = dynamic_cast<PosixWaitHandle*>(wait_handles[i]);
-    if (handle == nullptr) {
+    conditions[i] = ConditionOf(wait_handles[i]);
+    if (conditions[i] == nullptr) {
       return std::make_pair(WaitResult::kFailed, 0);
     }
-    conditions.push_back(&handle->condition());
+  }
+  // One handle: exactly the calls the general path below makes for it (no wake point, Wait() on the handle).
+  if (wait_handle_count == 1) {
+    return std::make_pair(WaitOne(*conditions[0], is_alertable, timeout), size_t(0));
   }
   // Parked (event-driven) waits need a wake point; legacy mode keeps the 1 ms polling.
   const bool blocking = REXCVAR_GET(thread_wait_blocking);
   WakePoint wake_point;
-  WakePoint* wake = blocking && conditions.size() > 1 ? &wake_point : nullptr;
+  WakePoint* wake = blocking && wait_handle_count > 1 ? &wake_point : nullptr;
   if (!is_alertable) {
-    return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all, timeout, wake, nullptr);
+    return PosixConditionBase::WaitMultiple(conditions, wait_handle_count, wait_all, timeout, wake, nullptr);
   }
 
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
-  // A single handle parks in Wait() itself; several park on the wake point.
-  ScopedAlertWake alert_wake(blocking && conditions.size() == 1 ? conditions[0] : nullptr, wake);
+  // Several handles park on the wake point (a single one was handled above, parked in Wait() itself).
+  ScopedAlertWake alert_wake(nullptr, wake);
   const std::atomic<bool>* interrupt = alert_wake.flag();
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return std::make_pair(WaitResult::kUserCallback, 0);
     }
-    auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
-                                                   wait_all, ComputeAlertableWaitTimeout(deadline),
-                                                   wake, interrupt);
+    auto result = PosixConditionBase::WaitMultiple(conditions, wait_handle_count, wait_all,
+                                                   ComputeAlertableWaitTimeout(deadline), wake, interrupt);
     if (result.first != WaitResult::kTimeout) {
       return result;
     }

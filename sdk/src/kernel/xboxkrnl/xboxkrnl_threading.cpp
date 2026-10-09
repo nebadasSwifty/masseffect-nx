@@ -868,12 +868,48 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
   return result;
 }
 
+namespace {
+
+// The objects of one multiple-object wait, each retained (as the object_ref vector they replace) and released when
+// this goes out of scope: on the stack up to the kernel's limit of 64 objects per wait (MAXIMUM_WAIT_OBJECTS), on the
+// heap above it. Saves the per-call vector allocation of a wait loop that runs thousands of times a second.
+class WaitObjectList {
+ public:
+  explicit WaitObjectList(uint32_t capacity) {
+    if (capacity > kInline) {
+      heap_.reset(new XObject*[capacity]);
+      objects_ = heap_.get();
+    }
+  }
+  ~WaitObjectList() {
+    for (uint32_t i = 0; i < size_; ++i) {
+      objects_[i]->Release();
+    }
+  }
+  WaitObjectList(const WaitObjectList&) = delete;
+  WaitObjectList& operator=(const WaitObjectList&) = delete;
+
+  // Takes over the reference the lookup returned.
+  void push_back(object_ref<XObject>&& object) { objects_[size_++] = object.release(); }
+  XObject** data() { return objects_; }
+  uint32_t size() const { return size_; }
+
+ private:
+  static constexpr uint32_t kInline = 64;
+  XObject* inline_[kInline];
+  std::unique_ptr<XObject*[]> heap_;
+  XObject** objects_ = inline_;
+  uint32_t size_ = 0;
+};
+
+}  // namespace
+
 u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
   assert_true(wait_type <= 1);
 
-  std::vector<object_ref<XObject>> objects;
+  WaitObjectList objects(count);
   for (uint32_t n = 0; n < count; n++) {
     auto object_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(objects_ptr[n]);
     auto object_ref = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
@@ -885,9 +921,8 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
   }
 
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-  X_STATUS result = XObject::WaitMultiple(
-      uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
-      processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  X_STATUS result = XObject::WaitMultiple(objects.size(), objects.data(), wait_type, wait_reason,
+                                          processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }
@@ -899,7 +934,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
                                       uint64_t* timeout_ptr) {
   assert_true(wait_type <= 1);
 
-  std::vector<object_ref<XObject>> objects;
+  WaitObjectList objects(count);
   for (uint32_t n = 0; n < count; n++) {
     uint32_t object_handle = handles[n];
     auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
@@ -909,8 +944,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
     objects.push_back(std::move(object));
   }
 
-  auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()), wait_type,
-                                      6, wait_mode, alertable, timeout_ptr);
+  auto result = XObject::WaitMultiple(count, objects.data(), wait_type, 6, wait_mode, alertable, timeout_ptr);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }
