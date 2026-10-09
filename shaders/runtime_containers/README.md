@@ -14,3 +14,10 @@ These containers wrap the exact microcode emitted by the runtime into 2008 Xenos
 2026-10-07: 8 table-less containers that the v24-v27 packages had but this folder lacked were restored (among them
 `ps_c5840b564b1d37b0.bin`, the Scaleform textured fill `tex * c2 + c3` that draws the combat heat meter). See
 `docs/image-defects-feros.md`, section "Overheat bar missing".
+
+2026-10-09: `ps_ad3fb87d67622d22.bin` (15-word Scaleform solid fill, `oC0 = c0`) and `ps_fc434ce883f593ed.bin` (27-word
+two-texture Scaleform fill with a cxform) added. Both were only in the inherited package lineage (wrapped from the
+2026-09-30 / v22 discovery dumps), never in this folder, so every package built from a disc scan plus this folder
+(the web installer) dropped every settings-menu draw that uses them. Copied byte for byte from `out/ru_stage`
+(entries 2830803E7503514F and C057E38AC6963CA6, complete 16-interpolator headers). Before a release run
+`tools/check_shader_coverage.py <package> --reference <last good package> --logs <console logs>`.
