@@ -327,3 +327,18 @@ windows were in the location tour).
   `[mem]` 3 min after arrival: variant source copies 0 KB (were ~107 MB), 3719 idle transformed codes dropped
   (90.7 MB), 30 remade (3 ms total, max 583 us), 0 mismatches; never-taken heap 876 MB.
   Next memory target: driver module SPIR-V, 4839 modules 117 MB (Mesa keeps a copy per VkShaderModule).
+
+## 2026-10-10: start reliability (launch loops, bot via HOME forwarders)
+| Build | Edition | Launches OK | Failure seen |
+|---|---|---|---|
+| ru_integ7 | RU | 4 / 5 | frozen intro-movie frame (display queue refused, NWindow poisoned) |
+| ru_integ8 (+ Mesa WSI unpoison) | RU | 24 / 25 | 1 abort: shader package read failed in a prewarm thread |
+| ru_integ9 (+ read retry, private-copy hot guard) | RU | 19 / 20 | 1 black screen after a recovered display refusal |
+| ru_integ10 (+ presenter keeps the swapchain) | RU | 20 / 20 | - |
+| en_integ10 | EN | 3 / 6 | Disc Read Error, frozen BioWare logo, console network stalls (cold: no pipeline cache) |
+| en_integ11 (+ 64 MB heap to the kernel), prewarm off | EN | 8 / 8 | - |
+| en_integ12 (+ masseffect_native_pipelines_prewarm_delay_s = 25) | EN | 6 / 6 held 75 s, 3 / 3 fully cold | - |
+| ru_integ12 | RU | 1 / 1 fully cold, 6 / 6 warm | - |
+
+Cause: a cold start compiled the whole prewarm list in the first seconds while the game loaded its startup packages;
+the kernel refused resources (svc::ResultLimitReached 0x10801) to the display queue, the file system and even sysmodules.
