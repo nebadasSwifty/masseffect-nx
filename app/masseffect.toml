@@ -6,7 +6,7 @@
 #  It is read at startup. Every key is optional: a missing key keeps the built-in default
 #  of the code. The values below are the configuration measured best on the Switch; the same file
 #  is shipped with the English and the Russian edition (list and sources: docs/best-config.md,
-#  "Shipped defaults 2026-10-08").
+#  "Shipped defaults 2026-10-08" and "Shipped defaults 2026-10-09").
 # ============================================================================
 
 
@@ -67,7 +67,7 @@ masseffect_audio_dsp_native = 1
 # false (default) = by letter: A accepts, B goes back.
 # input_xbox_layout = false
 
-# Pass the game's rumble to the controllers. Off by default.
+# Pass the game's rumble to the controllers (off in the code; on here: no frame-rate cost, Therum 2026-10-08).
 input_rumble = true
 
 # Touch screen (experimental, handheld only: docked the panel reports no touches). Details and tuning:
@@ -190,6 +190,12 @@ masseffect_native_verify_n = 2048
 masseffect_hot_guest = true
 masseffect_hot_guard_calls = 256
 masseffect_hot_guard_period = 4096
+# Audio thread natives with their own switches (not part of masseffect_hot_guest): the XAudio voice resamplers (mono,
+# stereo) and the CRT memset the mixer clears its buffers with. Guards clean on the console (Citadel spacewalk A/B
+# 2026-10-09 after the guard fix 6aa6847; all five reworks together on ru_integ7); docs/best-config.md, night section.
+masseffect_hot_audio_resampler = true
+masseffect_hot_audio_resampler_stereo = true
+masseffect_hot_crt_memset = true
 
 # --- Ring thread CPU per draw (exact, self-checking; docs/ring-cpu-per-draw.md rounds 1 and 2) ---
 # Heavy walk windows 14.1k -> 17.1k draws per second, no verification mismatch on the console.
@@ -201,6 +207,13 @@ masseffect_native_texture_spread_phase = true
 masseffect_native_edram4_sync_lean = true
 # The periodic VS/PS identity mismatch lines at info instead of warn level (warn flushes the log on the ring thread).
 masseffect_native_mismatch_log_info = true
+# Shader constants tracked per float4 vector: only the changed vectors are compared and copied per draw (CPU copy
+# ~147 B instead of ~3600 B; 4096 decisions verified, 0 differences; docs/batched-constants.md).
+masseffect_native_constants_dirty = true
+# Cross-frame vertex arena: vertex ranges unchanged since their last copy are bound from a persistent buffer instead
+# of being copied again (~6 GB per 10 s not copied on the spacewalk, 50k verified reuses, 0 differences;
+# docs/zero-copy-vertices.md). Both: Citadel spacewalk A/B 2026-10-09, then together with the audio natives on ru_integ7.
+masseffect_native_vertex_arena = true
 
 # --- Guest memory ---
 # BaseHeap::AllocRange searches a free-page bitmap instead of the page table (Feros 2026-10-08, see log_nonblocking).
