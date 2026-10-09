@@ -111,3 +111,10 @@ REXCVAR_DEFINE_INT32(masseffect_native_pipelines_prewarm_priority, -1, "MASSEFFE
                      "accepts from 0x3F to 0x3B, as before")
     .range(-1, 0x3F)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_native_pipelines_prewarm_delay_s, 25, "MASSEFFECT",
+                     "Native renderer: seconds the prewarm threads wait after start before compiling. A cold start "
+                     "(no pipeline cache yet) compiling the whole list during the first seconds, while the game loads "
+                     "its startup packages, exhausted kernel resources (svc::ResultLimitReached): hung or crashed "
+                     "starts, mostly EN (2026-10-10). 0 = start at once, as before")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);

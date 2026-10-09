@@ -14505,6 +14505,11 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       if (PrewarmWorkerEnd()) prewarmed_finished_.store(true, std::memory_order_release);
       return;
     }
+    // masseffect_native_pipelines_prewarm_delay_s: leave the startup to the game first.
+    for (int32_t waited = 0, delay = REXCVAR_GET(masseffect_native_pipelines_prewarm_delay_s) * 10;
+         waited < delay && !prewarmed_stop_.load(std::memory_order_relaxed); ++waited) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     // The extra threads (masseffect_native_pipelines_prewarm_threads) prefer a core other than the ring's.
     if (worker) RexSwitchSetCurrentThreadCore(worker == 1 ? (ring_core == 2 ? 1 : 2) : (ring_core == 0 ? 1 : 0));
     prewarmed_priority_.store(priority, std::memory_order_relaxed);
