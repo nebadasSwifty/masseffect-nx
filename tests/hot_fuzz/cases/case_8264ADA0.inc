@@ -126,6 +126,16 @@ void writes_w(const PPCContext& ctx, const uint8_t* base, me::hot::Writes& w) {
   me::hot::n_8264ADA0::Writes(ctx, base, w);
 }
 
+// What the console guard sees: production settings (a virtual call or an allocator call makes the write set unbounded, so
+// the guard runs only the original for that call; the shadow run never calls guest code).
+void guard_writes(const PPCContext& ctx, const uint8_t* base, me::hot::Writes& w) {
+  me::hot::n_8264ADA0::virt_unbounded = true;
+  me::hot::n_8264ADA0::alloc_unbounded = true;
+  me::hot::n_8264ADA0::Writes(ctx, base, w);
+  me::hot::n_8264ADA0::virt_unbounded = false;
+  me::hot::n_8264ADA0::alloc_unbounded = false;
+}
+
 uint32_t fl(fuzz::Rng& r) {
   switch (r.below(10)) {
     case 0: return r.float_bits();
@@ -265,5 +275,5 @@ extern "C" void sub_822100F8(PPCContext& c, uint8_t*) { c8264ADA0::AStub(c); }
 extern "C" void __imp__sub_822100F8(PPCContext& c, uint8_t*) { c8264ADA0::AStub(c); }
 namespace {
 fuzz::Registrar reg_8264ADA0({"sub_8264ADA0", c8264ADA0::orig_w, c8264ADA0::nat_w, c8264ADA0::writes_w, me::hot::n_8264ADA0::kCmp,
-                              0x40000000, 0x20000, c8264ADA0::gen});
+                              0x40000000, 0x20000, c8264ADA0::gen, c8264ADA0::guard_writes});
 }  // namespace

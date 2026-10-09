@@ -92,6 +92,10 @@ struct Case {
   me::hot::Cmp cmp;
   uint32_t win_addr, win_len;  // guest window the generator may touch (compared as a whole)
   Gen gen;
+  // Optional: the write set the console guard computes (production settings of the native's switches), when the case
+  // widens `writes` for the fuzzer (e.g. stubs for guest calls that the console guard never lets the native make). The
+  // guard replay in main.cpp uses it; nullptr = `writes`.
+  void (*guard_writes)(const PPCContext&, const uint8_t*, me::hot::Writes&) = nullptr;
 };
 
 inline std::vector<Case>& Registry() {

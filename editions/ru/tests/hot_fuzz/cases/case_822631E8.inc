@@ -6,8 +6,8 @@
 // identity block live outside the fuzz window, so the generator writes them into arena A and the native wrapper writes
 // the same bytes into arena B (the harness only copies the window).
 // Special float values (+-inf, quiet/signalling NaNs with random payloads and signs, +-0, denormals, huge values that
-// overflow) are generated on purpose: a NaN determinant or NaN result must make the native version delegate to the
-// original, because the NaN sign/payload depends on the compiled operand order (console guard failure 2026-10-09:
+// overflow) are generated on purpose: a NaN determinant or NaN result must make the native version decline (the
+// original runs), because the NaN sign/payload depends on the compiled operand order (console guard failure 2026-10-09:
 // "memory +0 native=0x7f original=0xff" from a -inf input).
 extern "C" void __imp__sub_82262EC0(PPCContext&, uint8_t*);
 extern "C" void __imp__sub_822631B0(PPCContext&, uint8_t*);
@@ -30,7 +30,7 @@ void put_consts(uint8_t* base) {
 }
 void nat(PPCContext& ctx, uint8_t* base) {
   put_consts(base);
-  me::hot::n_822631E8::Native(ctx, base);
+  if (!me::hot::n_822631E8::Native(ctx, base)) __imp__sub_82262EC0(ctx, base);  // declined (NaN): the original
 }
 float fb(uint32_t b) {
   float f;

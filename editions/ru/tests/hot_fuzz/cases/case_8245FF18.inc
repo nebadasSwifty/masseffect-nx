@@ -141,5 +141,6 @@ struct Stat {
 } stat;
 }  // namespace c8245FF18
 fuzz::Registrar reg_8245FF18({"sub_8245FF18", c8245FF18::orig_w, c8245FF18::nat_w, c8245FF18::writes,
-                              me::hot::n_8245FF18::kCmp, c8245FF18::kWin, c8245FF18::kLen, c8245FF18::gen});
+                              me::hot::n_8245FF18::kCmp, c8245FF18::kWin, c8245FF18::kLen, c8245FF18::gen,
+                              me::hot::n_8245FF18::Writes});  // guard replay: the console guard's write set
 }  // namespace

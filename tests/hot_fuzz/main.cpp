@@ -8,9 +8,17 @@
 
 #include "natives_all.inc"
 
+#include "me_hot_shadow.h"
+
 #include "cases_all.inc"
 
 using namespace fuzz;
+
+namespace fuzz {
+// The shadow build of a case's native (generated shadow_all.cpp), or nullptr.
+using ShadowFn = bool (*)(PPCContext&, uint8_t*);
+ShadowFn ShadowFor(const char* name);
+}  // namespace fuzz
 
 namespace {
 
@@ -193,40 +201,99 @@ int main(int argc, char** argv) {
         }
       }
       // Guard replay: the console guard (me_hot_guest.cpp Check) on arena B from the same inputs, with the same shared
-      // snapshot / rollback helpers: snapshot the declared ranges, native, copy its result, roll back, original, compare.
-      // Catches Writes() ranges that the guard cannot verify (2026-10-09: overlapping ranges gave a false DIFFERENCE).
+      // code (me_hot_shadow.h): the shadow build of the native on a private copy of the declared ranges (it must not
+      // write arena B outside the stack scratch), the original for real, then the guard's comparison and the registers.
+      // Catches Writes() ranges the guard cannot verify (2026-10-09: overlapping ranges gave a false DIFFERENCE) and
+      // natives whose shadow build differs from the normal one.
       if (diff.empty() && !w.overflow) {
         std::memcpy(B.base + c.win_addr, init.data(), c.win_len);
-        const size_t total = me::hot::TotalBytes(w);
-        std::vector<uint8_t> before(total), native_out(total);
-        me::hot::SaveRanges(w, B.base, before.data());
-        PPCContext* g = new PPCContext(*c0);
-        g->fpscr.setcsr(hw0);
-        c.nat(*g, B.base);
-        me::hot::SaveRanges(w, B.base, native_out.data());
-        me::hot::RestoreRanges(w, B.base, before.data());
-        *g = *c0;
-        g->fpscr.setcsr(hw0);
-        c.orig(*g, B.base);
-        g->fpscr.setcsr(hw0);
-        // Same comparison as the guard, within the window and except the callee-owned stack scratch (the scope of the
-        // comparisons above).
-        size_t o = 0;
-        for (int i = 0; i < w.n && diff.empty(); ++i) {
-          for (uint32_t k = 0; k < w.r[i].len; ++k) {
-            const uint32_t a = w.r[i].addr + k;
-            const uint8_t now = *me::hot::Raw(B.base, a);
-            if (now != native_out[o + k] && !scratch(a) && a - c.win_addr < c.win_len) {
-              char buf[200];
-              std::snprintf(buf, sizeof buf, "guard replay: memory %#x (+%u of range %#x+%u) native=%02x original=%02x", a,
-                            k, w.r[i].addr, w.r[i].len, native_out[o + k], now);
+        const ShadowFn sh = ShadowFor(c.name);
+        // Slack pages: the console reads them through the shadow alias of committed pages (all of the arena here);
+        // ME_GUARD_PAGES=declared models a console page that is not committed (slack only inside the declared pages).
+        static const me::hot::ShadowPageFn page_fn =
+            (getenv("ME_GUARD_PAGES") && std::string(getenv("ME_GUARD_PAGES")) == "declared") ? nullptr
+                                                                                          : &me::hot::ShadowPageDirect;
+        me::hot::ShadowView view;
+        std::vector<uint8_t> storage;
+        me::hot::Writes gw;  // the console guard's write set
+        if (c.guard_writes) c.guard_writes(*c0, B.base, gw);
+        else gw = w;
+        if (!sh) {
+          diff = "guard replay: no shadow build of the native (shadow_all.cpp)";
+        } else if (!gw.overflow && me::hot::ShadowBuild(view, gw, B.base, c0->r1.u32, storage, page_fn)) {
+          PPCContext* g = new PPCContext(*c0);
+          g->fpscr.setcsr(hw0);
+          me::hot::t_shadow = &view;
+          const bool handled = sh(*g, B.base);
+          me::hot::t_shadow = nullptr;
+          const uint32_t hw_s = g->fpscr.getcsr();
+          for (uint32_t k = 0; k < c.win_len && diff.empty(); ++k) {
+            const uint32_t a = c.win_addr + k;
+            // Cells only the case's widened write set declares are written by its host stubs for guest callees (guest
+            // code a native calls runs on real memory), not by the native itself: put back for the original's run (on the
+            // console such callees are read-only getters, docs/hot-guard.md).
+            if (Covered(w, a) && !Covered(gw, a)) {
+              B.base[a] = init[k];
+              continue;
+            }
+            if (B.base[a] != init[k] && !scratch(a)) {
+              char buf[160];
+              std::snprintf(buf, sizeof buf, "guard replay: the shadow run wrote guest memory at %#x (%02x -> %02x)", a,
+                            init[k], B.base[a]);
               diff = buf;
-              break;
             }
           }
-          o += w.r[i].len;
+          PPCContext* o = new PPCContext(*c0);
+          o->fpscr.setcsr(hw0);
+          c.orig(*o, B.base);
+          const uint32_t hw_g = o->fpscr.getcsr();
+          o->fpscr.setcsr(hw0);
+          if (handled && diff.empty()) {
+            Stats dummy;
+            diff = CompareRegs(c.cmp, *g, *o, dummy);
+            if (!diff.empty()) diff = "guard replay registers: " + diff;
+            else if (hw_s != hw_g) diff = "guard replay: hardware FPCR differs";
+          }
+          if (handled && diff.empty()) {
+            // The guard's memory comparison, except two tolerances of the main comparison above: the callee-owned stack
+            // scratch / bytes outside the window, and a 4-byte word that is a NaN in both results (the cases' NaN payload
+            // tolerance, see case_826545D0.inc: the payload depends on the compiled operand order).
+            char buf[200];
+            auto is_nan_be = [](const uint8_t* p) {
+              const uint32_t x = uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+              return (x & 0x7F800000u) == 0x7F800000u && (x & 0x007FFFFFu) != 0;
+            };
+            for (int i = 0; i < gw.n && diff.empty(); ++i) {
+              const me::hot::ShadowView::Win* x = me::hot::ShadowDeclared(view, gw.r[i].addr, gw.r[i].len);
+              for (uint32_t k = 0; x && k < gw.r[i].len; ++k) {
+                const uint32_t a = gw.r[i].addr + k;
+                const uint8_t mine = x->buf[a - x->lo], now = *me::hot::Raw(B.base, a);
+                if (mine == now || scratch(a) || a - c.win_addr >= c.win_len) continue;
+                const uint32_t wa = a & ~3u;
+                if (wa >= x->lo && wa + 4 <= x->lo + x->len && is_nan_be(x->buf + (wa - x->lo)) &&
+                    is_nan_be(me::hot::Raw(B.base, wa)))
+                  continue;
+                std::snprintf(buf, sizeof buf, "guard replay: memory %#x (+%u of range %#x+%u) native=%02x original=%02x",
+                              a, k, gw.r[i].addr, gw.r[i].len, mine, now);
+                diff = buf;
+                break;
+              }
+            }
+          }
+          if (handled && diff.empty()) {
+            const me::hot::ShadowDiff d = me::hot::ShadowCompareStores(view);
+            char buf[200];
+            if (d.kind == me::hot::ShadowDiff::kStore) {
+              std::snprintf(buf, sizeof buf, "guard replay: native stored to %#x outside its declared ranges", d.addr);
+              diff = buf;
+            } else if (d.kind == me::hot::ShadowDiff::kSlack) {
+              std::snprintf(buf, sizeof buf, "guard replay: native wrote %#x next to its declared ranges", d.addr);
+              diff = buf;
+            }
+          }
+          delete g;
+          delete o;
         }
-        delete g;
       }
       delete c0;
       st.iters++;
