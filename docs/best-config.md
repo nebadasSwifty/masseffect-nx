@@ -296,3 +296,24 @@ Run 3 (build ru_glob20, glob_prof3.toml = run 2 + indirect_dispatch_hot_cache wi
 heavy windows 266, 226, 229, end 179/191 swaps per 10 s: no measurable change (verify checks every hit, 67 M checks,
 0 differences; clear alias fired 189-287 clears per 10 s). The large area after the cutscene stays at ~18-23 fps,
 GPU busy 34-37 ms there.
+
+## 2026-10-09 night: the three reworks, A/B on Citadel spacewalk (bot walk, build ru_cdirty / ru_integ1 / ru_integ2)
+The route holds ~30 fps already, so fps barely moves; ring savings show as lower ring CPU in heavy scenes (profile
+pending). Swaps per 10 s mean / min, GPU per Swap total / gap (ms), guard/verify result.
+
+| Variant | Swaps | GPU / gap | Verification |
+|---|---|---|---|
+| cA constants old path | 297 / 291 | 33.7 / 14.0 | - |
+| cB masseffect_native_constants_dirty | 300 / 295 | 33.4 / 13.8 | 4096 decisions checked, 0 differences, lost sync 0; 0.68 vectors compared per decision, CPU copy 147 B instead of ~3600 B |
+| vM vertex arena measure only | 299 / 284 | - | 1.0-1.5 GB per 10 s copied, ~95 % clean+same, clean+CHANGED 0 |
+| vB arena + measure | 285 / 244 | - | 0 differences in 46 k verified reuses (the measurement's full hashes cost more than the arena saves) |
+| vC masseffect_native_vertex_arena | 300 / 295 | 33.4 / 13.6 | 6.2 GB per 10 s not copied, 50 k verified reuses, 0 differences, 0 undeclared changes |
+| aA audio old | 300 / 292 | 33.5 / 13.7 | - |
+| aB audio natives (resampler mono/stereo, memset) | 300 / 299 | - | mono and memset guard OK; stereo "DIFFERENCE" was a guard bug (overlapping ranges), fixed in 6aa6847 |
+
+Found on the way: hot native sub_82262EC0 (matrix inverse) differed in the sign of NaN results (15 guard hits in
+older runs); fixed by falling back to the original when NaN appears (fix/hot-82262EC0).
+Rerun on build ru_integ3 (guard fix 6aa6847), spacewalk, profiles fetched: aA3 300/294, aB3 300/296; guards OK for
+sub_82B2D4F0 and sub_82B2D780, no DIFFERENCE. Average CPU per thread (68 profile blocks): ring 60.4 -> 60.5 %,
+game thread 48.1 -> 48.3 %, audio thread (third XThread) 11.8 -> 11.2 % (this route is light on audio; the 32 % audio
+windows were in the location tour).
