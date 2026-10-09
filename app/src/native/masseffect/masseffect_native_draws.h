@@ -455,6 +455,8 @@ class DrawsVulkan {
   virtual void WaitUploads() = 0;
   // Vertex copies queued and not done yet (only to measure the fences).
   virtual size_t PendingCopies() const { return 0; }
+  // docs/memory-growth.md: appends " name count (N KB)" items for the long-lived host caches. Ring thread.
+  virtual void MemoryCaches(std::string& out) { (void)out; }
   // Restore into 7e3: whether the pixel shader's output at Location `slot` can take the UNORM10 -> 7e3
   // epilogue (TransformRestore7e3 succeeds on its SPIR-V). Cached per shader and slot.
   virtual bool SupportsRestore7e3(const ShaderEntry& ps, uint32_t slot) { (void)ps; (void)slot; return false; }

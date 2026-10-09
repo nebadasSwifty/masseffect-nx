@@ -38,6 +38,7 @@
 #include "../me_ring_partition.h"
 #include "../me_frame_coherence.h"  // masseffect_native_coherence_stats (measurement)
 #include "../me_texture_coherency.h"  // masseffect_native_texture_coherency
+#include "../me_heap_report.h"  // docs/memory-growth.md
 #include "me_draw_cache.h"  // masseffect_native_draw_cache_* (docs/frame-coherence.md)
 #include "me_vertex_arena.h"  // masseffect_native_vertex_arena* (docs/zero-copy-vertices.md)
 #include "me_primitives.h"
@@ -2820,7 +2821,45 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     return CreateEmpty();
   }
 
+  /*
+   * docs/memory-growth.md: no allocation failure inside a draw may terminate the game. A std::bad_alloc thrown
+   * anywhere in DrawImpl (its caches, the staging copies, the driver's C++ parts) drops this one draw: it is counted,
+   * logged loudly with the heap state, and the spare staging memory is released so the next draws have a chance.
+   * DrawImpl leaves no half-done state that a later draw relies on (per-draw scratch is reset at its start; the
+   * caches it inserts into give the strong guarantee), and a dropped draw is far better than a dead game.
+   */
   bool Draw(const SubmissionDraw& p) override {
+    bool drawn = false;
+    try {
+      drawn = DrawImpl(p);
+    } catch (const std::bad_alloc&) {
+      DropDrawOutOfMemory(p);
+      drawn = false;
+    }
+    if (rectangle_large_) {  // a rectangle list larger than kRectangleKeepBytes: do not keep its expansion
+      rectangle_large_ = false;
+      for (auto& data : rectangle_data_) {
+        if (data.capacity() > kRectangleKeepBytes) std::vector<uint8_t>().swap(data);
+      }
+    }
+    return drawn;
+  }
+
+  void DropDrawOutOfMemory(const SubmissionDraw& p) {
+    ++draws_dropped_memory_;
+    StagingTrim(true);
+    for (auto& data : rectangle_data_) std::vector<uint8_t>().swap(data);
+    textures_to_upload_.clear();
+    if (draws_dropped_memory_ <= 16 || (draws_dropped_memory_ & 255) == 0) {
+      const me::native::heap::Snapshot heap = me::native::heap::Take(false);
+      REXLOG_ERROR("[native] MEMORY: std::bad_alloc inside a draw (VS n{} PS n{}): the draw is DROPPED ({} so far); "
+                   "heap used {} MB, free {} MB, never taken {} MB",
+                   p.vs ? int(p.vs->number) : -1, p.ps ? int(p.ps->number) : -1, draws_dropped_memory_,
+                   heap.used >> 20, heap.free_in_arena >> 20, heap.untouched >> 20);
+    }
+  }
+
+  bool DrawImpl(const SubmissionDraw& p) {
     // Stage stopwatch on 1 in kStopwatchEach draws: reading the clock 12 times per draw took almost a
     // quarter of the ring thread's busy CPU on PC, and on the Switch each read costs more. The C6 averages
     // come from the sample.
@@ -3466,7 +3505,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
 
     VerticesEntry rectangle_entry;
-    std::array<std::vector<uint8_t>, 16> data_rectangle;
+    std::array<std::vector<uint8_t>, 16>& data_rectangle = rectangle_data_;  // persistent (docs/memory-growth.md)
     static const bool audit_depth_rectangle = [] {
       const char* value = std::getenv("MASSEFFECT_NATIVE_AUDIT_DEPTH_RECTANGLE");
       return value && *value == '1';
@@ -3528,7 +3567,14 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         const uint64_t bytes = uint64_t(rectangles) * 6 * 3 * stride;
         if (bytes > kUploadSize || stride > 2048 / 3)
           return Reject(108, "rectangle expanded stream exceeds limits");
-        auto& data = data_rectangle[b]; data.resize(size_t(bytes));
+        auto& data = data_rectangle[b];
+        if (bytes > kRectangleKeepBytes) rectangle_large_ = true;
+        try {
+          data.resize(size_t(bytes));
+        } catch (const std::bad_alloc&) {
+          std::vector<uint8_t>().swap(data);
+          return Reject(60, "rectangle expansion: out of host memory");
+        }
         for (uint32_t q = 0; q < rectangles; ++q) {
           for (uint32_t c = 0; c < 3; ++c) {
             const uint32_t guest_index = with_indices
@@ -9968,6 +10014,16 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       {
         ++created_textures_;
         masseffect::waits::g_created_textures.fetch_add(1, std::memory_order_relaxed);
+        // docs/memory-growth.md: these diagnostic tables gain an entry per new address or shape and were never
+        // emptied; each zone load brings new addresses. Past kDiagCreatedMax they start over (the counters they
+        // feed only lose the history of addresses seen hours ago).
+        if (created_per_address_.size() >= kDiagCreatedMax || key_per_shape_.size() >= kDiagCreatedMax ||
+            words_per_shape_.size() >= kDiagCreatedMax) {
+          created_per_address_.clear();
+          key_per_shape_.clear();
+          words_per_shape_.clear();
+          ++diag_created_resets_;
+        }
         const uint64_t shape = XXH3_64bits_withSeed(&base, sizeof(base), (uint64_t(format) << 40) ^
                                                                               (uint64_t(width) << 20) ^ height);
         if (created_per_address_[base]++ > 0) {
@@ -10366,6 +10422,22 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       bytes_layer_level[n] = size_t(bx_host) * by_host * tf.bytes;
       bytes_data += bytes_layer_level[n] * layers * (background ? background : 1);
     }
+    // docs/memory-growth.md: the staging buffer comes from the persistent staging pool and never grows through
+    // an allocation that can throw. With the capacity ensured, assign() only fills: it cannot allocate.
+    if (!StagingReserve(bytes_data)) {
+      // Not enough contiguous host memory for this texture's staging copy. The update is skipped: a prepared
+      // image keeps its previous content, a new one stays unbound (slot 0, as for a texture outside memory), and
+      // the hashes are reset so the next check reads it again instead of calling it unchanged.
+      texture.raw_fingerprint = 0;
+      texture.valid_sample = false;
+      texture.coherency_valid = false;
+      texture.interval = 1;
+      texture.next = frame_ + 1;
+      if (!texture.image.prepared) {
+        slot = 0;
+      }
+      return;
+    }
     data.assign(bytes_data, 0);
     const bool tile = (f[0] >> 31) & 0x1;
     if (volume && !ReadVolume(f, tf, blocks_x, blocks_y, background, blocks_x_host,
@@ -10418,9 +10490,14 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       // The first 200, then 1 in 64. Checking every texture, this guard never got to switch itself off (there
       // were only 1,024 textures) and cost 2.1 ms per MB on every new texture.
       ++seen_orders_;
-      const bool check = seen_orders_ <= kLevelsToCheck || seen_orders_ % kCheckAOfEach == 0;
+      bool check = seen_orders_ <= kLevelsToCheck || seen_orders_ % kCheckAOfEach == 0;
       if (check) {
-        check_tile_ = data;
+        try {
+          check_tile_ = data;
+        } catch (const std::bad_alloc&) {  // the self-check is optional: skip it rather than drop the draw
+          std::vector<uint8_t>().swap(check_tile_);
+          check = false;
+        }
       }
       ChangeOrderBytes(data.data(), data.size(), tf.unit_order, uint32_t(order));
       if (check) {
@@ -10996,14 +11073,154 @@ class DrawsVulkanImpl final : public DrawsVulkan {
      * cache take the same space again in CPU RAM (150-680 MB). That once ended in std::bad_alloc in the
      * main menu, with the cache at 682 MB.
      */
-    // The larger buffer is kept as temporal_ (so the next new texture does not ask the system for memory
-    // again or touch fresh pages); the other is released.
-    if (texture.data.capacity() > temporal_.capacity()) {
-      temporal_.swap(texture.data);
-    }
-    std::vector<uint8_t>().swap(texture.data);
+    // The buffer goes back to the staging pool (docs/memory-growth.md), so the next new texture does not ask the
+    // heap for memory again. Freshly allocating and freeing multi-MB staging copies was the allocation that
+    // finally failed after hours of map changes (a fragmented heap: 800 MB free, no block large enough).
+    StagingRelease(texture.data);
     ++uploads_texture_;
     return true;
+  }
+
+  // --- Staging pool for texture uploads (docs/memory-growth.md) -------------------------------------------------
+  //
+  // temporal_ is the buffer PrepareTexture fills. Its content moves into Texture::data until UploadTexture copies
+  // it into the upload buffer; then the vector comes back here instead of being freed. Up to kStagingKeep vectors
+  // of at most kStagingKeepBytes each are kept (a draw can prepare several textures before its upload stage), so in
+  // steady state no texture update allocates. Growth is rounded up to 1 MB and goes through try/catch: a failed
+  // allocation releases every spare buffer and retries once, and if that fails too the texture update is skipped
+  // with a counted warning instead of std::terminate.
+  static constexpr size_t kStagingKeep = 4;
+  static constexpr size_t kStagingKeepBytes = size_t(32) << 20;
+  static constexpr size_t kStagingRound = size_t(1) << 20;
+
+  bool StagingReserve(size_t bytes) {
+    if (temporal_.capacity() >= bytes) return true;
+    // The smallest spare buffer that already fits.
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < staging_spare_.size(); ++i) {
+      if (staging_spare_[i].capacity() >= bytes &&
+          (best == SIZE_MAX || staging_spare_[i].capacity() < staging_spare_[best].capacity()))
+        best = i;
+    }
+    if (best != SIZE_MAX) {
+      temporal_.swap(staging_spare_[best]);
+      if (staging_spare_[best].capacity() == 0) staging_spare_.erase(staging_spare_.begin() + ptrdiff_t(best));
+      ++staging_reused_;
+      return true;
+    }
+    const size_t rounded = bytes <= SIZE_MAX - kStagingRound ? (bytes + kStagingRound - 1) & ~(kStagingRound - 1)
+                                                              : bytes;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      try {
+        // Release the old block first: growing in place would hold both for a moment.
+        std::vector<uint8_t>().swap(temporal_);
+        temporal_.reserve(rounded);
+        ++staging_allocations_;
+        return true;
+      } catch (const std::bad_alloc&) {
+        if (attempt == 0) StagingTrim(true);
+      }
+    }
+    ++staging_failures_;
+    if (staging_failures_ <= 16 || (staging_failures_ & 255) == 0) {
+      REXLOG_ERROR("[native] MEMORY: texture staging of {} KB could not be allocated (failure {}; heap fragmented "
+                   "or exhausted): the texture update is skipped and retried next frame",
+                   bytes >> 10, staging_failures_);
+    }
+    return false;
+  }
+
+  // Takes a finished staging vector (it is left empty).
+  void StagingRelease(std::vector<uint8_t>& data) {
+    if (data.capacity() == 0) return;
+    // A buffer larger than temporal_ replaces it, as before: the largest staging buffer stays at hand.
+    if (data.capacity() > temporal_.capacity() && data.capacity() <= kStagingKeepBytes) temporal_.swap(data);
+    if (data.capacity() && data.capacity() <= kStagingKeepBytes) {
+      data.clear();
+      if (staging_spare_.size() < kStagingKeep) {
+        try {
+          staging_spare_.push_back(std::move(data));
+        } catch (const std::bad_alloc&) {
+        }
+      } else {
+        // Replace the smallest spare one if this one is larger.
+        auto smallest = std::min_element(staging_spare_.begin(), staging_spare_.end(),
+                                         [](const auto& a, const auto& b) { return a.capacity() < b.capacity(); });
+        if (smallest != staging_spare_.end() && smallest->capacity() < data.capacity()) smallest->swap(data);
+      }
+    }
+    std::vector<uint8_t>().swap(data);
+  }
+
+  // Frees the spare buffers (all = also temporal_ and the check copy). Called on an allocation failure. The
+  // rectangle expansion buffers are not touched here: during the textures stage the draw's vertex sources may
+  // still point into them (only the Draw-level bad_alloc handler releases them).
+  void StagingTrim(bool all) {
+    staging_spare_.clear();
+    staging_spare_.shrink_to_fit();
+    if (all) {
+      std::vector<uint8_t>().swap(temporal_);
+      std::vector<uint8_t>().swap(check_tile_);
+    }
+  }
+
+  // docs/memory-growth.md: the draws' part of the 60 s "[mem]" line. Ring thread (the owner of almost all of these);
+  // the module variant tables are shared with the prewarm threads and are read under their locks.
+  void MemoryCaches(std::string& out) override {
+    uint64_t pending_bytes = 0, pending = 0;
+    for (const auto& [key, texture] : textures_) {
+      if (texture.data.capacity()) {
+        ++pending;
+        pending_bytes += texture.data.capacity();
+      }
+    }
+    const auto vector_bytes = [](const std::vector<uint32_t>& v) { return uint64_t(v.capacity()) * 4; };
+    uint64_t variants = 0, variant_bytes = 0, owned_bytes = 0, codes = 0;
+    {
+      std::lock_guard<std::mutex> lock(modules_depth_mutex_);
+      for (const auto& [hash, bucket] : modules_depth_half_)
+        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+      for (const auto& [hash, bucket] : modules_depth_quantize_)
+        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+      for (const auto& [hash, bucket] : modules_fragcoord_xy_)
+        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+      for (const auto& [hash, bucket] : modules_texture_signs_)
+        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+      for (const auto& [hash, bucket] : modules_ps_descriptors_)
+        for (const auto& e : bucket) ++variants, variant_bytes += vector_bytes(e.original);
+      for (const auto& [handle, code] : codes_modules_depth_) owned_bytes += vector_bytes(code.owned);
+      codes = codes_modules_depth_.size();
+    }
+    {
+      std::lock_guard<std::mutex> lock(modules_vs_constants_mutex_);
+      for (const auto& [vs, bucket] : modules_vs_constants_) variants += bucket.size();
+    }
+    uint64_t rectangle_bytes = 0;
+    for (const auto& [vs, shader] : shaders_rectangle_) rectangle_bytes += vector_bytes(shader.words);
+    uint64_t library_shaders = 0, library_bytes = 0;
+    ResidentSpirv(library_shaders, library_bytes);
+    const size_t other_modules = modules_.size() + modules_rectangle_.size() + modules_alpha_only_.size() +
+                                 modules_z_early_.size() + modules_7e3_.size() + modules_restore_7e3_.size() +
+                                 modules_fixed16_.size();
+    out += fmt::format(
+        " | textures {} ({} MB GPU; {} uploads pending, {} KB); views {}, samplers {}, framebuffers {} (+{} retired), "
+        "passes {}; pipelines {} (list {} + {} new); modules {}, variants {} ({} KB source copies), tracked codes {} "
+        "({} KB owned), rectangle VS {} ({} KB); library SPIR-V resident {} shaders ({} MB); vertex inputs {}; "
+        "staging {} KB ({} reused, {} allocated, {} failed); diag tables {}/{}/{} ({} resets); draws dropped (memory) {}",
+        textures_.size(), bytes_textures_ >> 20, pending, pending_bytes >> 10, views_.size(), samplers_.size(),
+        framebuffers_.size(), fb_retired_.size(), passes_.size(), pipelines_.size(), file_list_.size(),
+        session_list_.size(), other_modules, variants, variant_bytes >> 10, codes, owned_bytes >> 10,
+        shaders_rectangle_.size(), rectangle_bytes >> 10, library_shaders, library_bytes >> 20,
+        inputs_cache_.size(), StagingBytes() >> 10, staging_reused_, staging_allocations_, staging_failures_,
+        created_per_address_.size(), key_per_shape_.size(), words_per_shape_.size(), diag_created_resets_,
+        draws_dropped_memory_);
+  }
+
+  size_t StagingBytes() const {
+    size_t bytes = temporal_.capacity() + check_tile_.capacity();
+    for (const auto& data : staging_spare_) bytes += data.capacity();
+    for (const auto& data : rectangle_data_) bytes += data.capacity();
+    return bytes;
   }
 
   // One range per mip level (with all its layers). Factored out for UploadTexture and for the deferred
@@ -14955,6 +15172,16 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   std::vector<Texture*> textures_to_upload_;
   uint64_t me_ordered_updates_ = 0;
   std::vector<uint8_t> temporal_;
+  // Staging pool (StagingReserve / StagingRelease, docs/memory-growth.md) and its counters.
+  std::vector<std::vector<uint8_t>> staging_spare_;
+  uint64_t staging_reused_ = 0, staging_allocations_ = 0, staging_failures_ = 0;
+  // Rectangle-list expansion (type 8), reused from draw to draw instead of 16 fresh vectors per draw. Buffers that
+  // grew beyond kRectangleKeepBytes are released at the end of the draw that needed them.
+  static constexpr size_t kRectangleKeepBytes = size_t(4) << 20;
+  std::array<std::vector<uint8_t>, 16> rectangle_data_;
+  bool rectangle_large_ = false;
+  // Draws dropped because an allocation failed inside them (Draw's std::bad_alloc handler).
+  uint64_t draws_dropped_memory_ = 0;
   std::vector<uint32_t, NoInitialize<uint32_t>> indices_;
   std::vector<uint32_t, NoInitialize<uint32_t>> converted_;
   std::vector<uint16_t, NoInitialize<uint16_t>> indices16_;  // fast path: 16 bits, not converted
@@ -15395,6 +15622,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   uint64_t created_textures_ = 0;
   uint64_t created_in_view_address_ = 0;
   uint64_t created_same_shape_other_key_ = 0;
+  static constexpr size_t kDiagCreatedMax = 16384;  // created_per_address_ / key_per_shape_ / words_per_shape_
+  uint64_t diag_created_resets_ = 0;
   std::unordered_map<uint32_t, uint32_t> created_per_address_;
   std::unordered_map<uint64_t, uint64_t> key_per_shape_;
   std::unordered_map<uint64_t, std::array<uint32_t, 5>> words_per_shape_;

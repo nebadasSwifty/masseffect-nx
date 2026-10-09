@@ -196,13 +196,23 @@ const char* ReadEntry(std::FILE* f, const Shader& s, std::vector<uint8_t>& tempo
   return nullptr;
 }
 
+std::atomic<uint64_t> g_resident_spirv_bytes{0};
+std::atomic<uint64_t> g_resident_spirv_shaders{0};
+
 void Publish(FileShaders& a, const Shader& s, std::vector<uint32_t>&& spirv) {
   std::lock_guard<std::mutex> l(a.publication);
   if (s.ready.v.load(std::memory_order_relaxed)) return;
   s.spirv_lazy = std::move(spirv);
+  g_resident_spirv_bytes.fetch_add(uint64_t(s.spirv_lazy.capacity()) * sizeof(uint32_t), std::memory_order_relaxed);
+  g_resident_spirv_shaders.fetch_add(1, std::memory_order_relaxed);
   s.ready.v.store(true, std::memory_order_release);
 }
 }  // namespace
+
+void ResidentSpirv(uint64_t& shaders, uint64_t& bytes) {
+  shaders = g_resident_spirv_shaders.load(std::memory_order_relaxed);
+  bytes = g_resident_spirv_bytes.load(std::memory_order_relaxed);
+}
 
 const std::vector<uint32_t>& Shader::Spirv() const {
   if (!file || ready.v.load(std::memory_order_acquire)) return file ? spirv_lazy : spirv;

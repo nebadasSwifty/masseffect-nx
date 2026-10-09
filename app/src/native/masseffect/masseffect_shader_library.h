@@ -102,4 +102,8 @@ std::vector<uint8_t> IndexShaders(std::span<const uint8_t> package);
 // OpKill/OpTerminateInvocation/OpDemoteToHelperInvocation count; 2 if the module cannot be walked.
 uint32_t CountKillsSpirv(std::span<const uint32_t> spirv);
 
+// docs/memory-growth.md: shaders whose SPIR-V was read on demand from an indexed package (kept for the session,
+// Shader::Spirv() promises the vector never moves) and their bytes, cumulative over every library loaded.
+void ResidentSpirv(uint64_t& shaders, uint64_t& bytes);
+
 }  // namespace masseffect::native

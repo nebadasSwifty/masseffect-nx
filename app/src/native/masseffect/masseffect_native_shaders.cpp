@@ -599,6 +599,13 @@ const ShaderEntry* ShadersNative::Identify(bool vertices,
       }
     }
   }
+  // docs/memory-growth.md: keyed by the raw microcode hash, so every patched or relocated variant the game ever
+  // loads adds an entry. Capped: past kCacheMax entries it starts over (a miss only redoes the lookup above).
+  constexpr size_t kCacheMax = 65536;
+  if (d.cache.size() >= kCacheMax) {
+    REXLOG_INFO("[native] shaders: microcode lookup cache reached {} entries; cleared (memory cap)", d.cache.size());
+    d.cache.clear();
+  }
   d.cache.emplace(key, Data::Cached{chosen, found_patched});
   return chosen;
 }

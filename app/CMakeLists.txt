@@ -28,6 +28,7 @@ set(MASSEFFECT_SOURCES
     # Developer USB file channel (dev_usb_files, docs/usb-files.md).
     src/me_usb_files.cpp
     src/native/me_native_system.cpp
+    src/native/me_heap_report.cpp
     src/native/me_ring_wait.cpp
     src/native/me_switch_text.cpp
     src/native/me_switch_minigame.cpp

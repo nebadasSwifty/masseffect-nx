@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace rex::memory {
@@ -133,6 +134,9 @@ class TargetsNative {
   virtual void WaitUploads() = 0;
   // Vertex copies queued and not done yet (only to measure the fences).
   virtual size_t PendingCopies() const { return 0; }
+  // docs/memory-growth.md: appends " name count (N KB)" items for the long-lived host caches (render targets and
+  // the draws' caches). Ring thread, every masseffect_mem_report_s.
+  virtual void MemoryCaches(std::string& out) { (void)out; }
   // Copies, clears, presented Swaps and rejected operations, accumulated.
   virtual void Stats(uint64_t& copies, uint64_t& cleared, uint64_t& presented,
                             uint64_t& rejections) const = 0;

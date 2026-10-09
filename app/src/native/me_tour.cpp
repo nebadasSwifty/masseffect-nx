@@ -1151,6 +1151,11 @@ void FinishMap(Tour& t, uint8_t* base, const char* why) {
   t.health_frames = t.health_low_frames = t.health_restores = t.shield_restores = 0;
   t.health_min_pct = 100.0f;
   g_props.clear();  // classes of an unloaded map's packages can go away
+  // docs/memory-growth.md: the same holds for the class and UFunction addresses below (game thread, like the hooks
+  // that fill them); kept for the whole tour they only grew and could go stale when an address is reused.
+  g_classes.clear();
+  g_guard.verdict.clear();
+  g_guard.skipped.clear();
   g_finished += " " + std::to_string(t.map_index + 1);
   Status("map " + t.map + " finished (" + why + "): " + std::to_string(t.visited) + " of " +
          std::to_string(t.stops.size()) + " stops");

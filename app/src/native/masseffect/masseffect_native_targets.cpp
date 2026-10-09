@@ -719,6 +719,8 @@ struct Read {
   uint8_t* data = nullptr;
   VkDeviceSize bytes = 0;
   bool coherent = true;
+  // Last copy recorded into it: WriteReads releases buffers idle for kReadIdle (docs/memory-growth.md).
+  std::chrono::steady_clock::time_point used{};
 };
 struct PendingRead {
   Read* read;
@@ -2746,6 +2748,24 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
 
   StatsDraws StatsOfDraws() const override {
     return draws_ ? draws_->Stats() : StatsDraws{};
+  }
+
+  // docs/memory-growth.md: the render target side of the 60 s "[mem]" line, then the draws' caches.
+  void MemoryCaches(std::string& out) override {
+    uint64_t resolved_bytes = 0;
+    for (const auto& [base, entry] : resolved_)
+      resolved_bytes += uint64_t(entry.image.width) * entry.image.height * 4;
+    uint64_t reads_bytes = 0;
+    for (const auto& [key, read] : reads_) reads_bytes += read.bytes;
+    uint64_t clips_bytes = 0;
+    for (const ResolvedClip& clip : resolved_clips_) clips_bytes += clip.bytes;
+    out += fmt::format(" | targets {} + depths {}; resolved {} (~{} MB GPU), clips {} ({} MB), sleeping {} ({} MB); "
+                       "read-backs {} ({} KB, {} released); restore sites {}",
+                       targets_.size(), depths_.size(), resolved_.size(), resolved_bytes >> 20,
+                       resolved_clips_.size(), clips_bytes >> 20, resolved_sleeping_.size(),
+                       uint64_t(resolved_sleeping_bytes_) >> 20, reads_.size(), reads_bytes >> 10, reads_released_,
+                       edram4_restore_sites_.size());
+    if (draws_) draws_->MemoryCaches(out);
   }
 
   void WaitUploads() override {
@@ -9172,7 +9192,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
           dx += x;
           dy += y;
           const uint64_t key = (uint64_t(base_candidate) << 32) | base_segment;
-          if (partial_recorded_.insert(key).second) {
+          // Log-once set keyed by guest addresses: capped (docs/memory-growth.md).
+          if (partial_recorded_.size() < 4096 && partial_recorded_.insert(key).second) {
             REXLOG_INFO("[native] targets: partial resolve: advanced base {:08X} belongs to {:08X}; "
                         "local destination {},{} inside {}x{} (segment {}x{})",
                         base_segment, base_candidate, dx, dy, candidate.image.width,
@@ -10954,6 +10975,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       }
     }
     Read& read = *pointer;
+    read.used = std::chrono::steady_clock::now();
     if (read.bytes < bytes) {
       uint32_t type = 0;
       if (!rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
@@ -11012,6 +11034,20 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         MASSEFFECT_REPORT_RING("[native] targets: read-backs per target (done/copies):{}", list);
       }
       report_reads_ = before_reads;
+      // docs/memory-growth.md: reads_ gets a buffer per (destination, rectangle, slot) and kept every one of them
+      // for the whole session; each is a dedicated allocation (host heap on the Switch). A buffer with no copy for
+      // kReadIdle and not referenced by any submission still in flight (or by the one being written now) is
+      // released; a later read-back of the same rectangle creates it again.
+      for (auto it = reads_.begin(); it != reads_.end();) {
+        Read& read = it->second;
+        if (before_reads - read.used < kReadIdle || ReadReferenced(&read, reads)) {
+          ++it;
+          continue;
+        }
+        DestroyRead(read);
+        it = reads_.erase(it);
+        ++reads_released_;
+      }
     }
     for (const PendingRead& p : reads) {
       const Read& read = *p.read;
@@ -11090,6 +11126,22 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       }
     }
     reads.clear();
+  }
+
+  static constexpr std::chrono::seconds kReadIdle{60};
+  uint64_t reads_released_ = 0;
+
+  // Whether a read-back buffer is still the target of a recorded copy that WriteReads has not consumed.
+  bool ReadReferenced(const Read* read, const std::vector<PendingRead>& current) const {
+    const auto uses = [read](const std::vector<PendingRead>& list) {
+      for (const PendingRead& p : list)
+        if (p.read == read) return true;
+      return false;
+    };
+    if (uses(current) || uses(pending_reads_)) return true;
+    for (const SlotWork& slot : slots_)
+      if (uses(slot.reads)) return true;
+    return false;
   }
 
   void DestroyRead(Read& read) {

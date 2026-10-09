@@ -22,6 +22,7 @@
 #include "me_frame_coherence.h"
 #include "me_ring_split.h"
 #include "me_texture_coherency.h"  // masseffect_native_texture_coherency
+#include "me_heap_report.h"  // docs/memory-growth.md
 
 #include <algorithm>
 #include <array>
@@ -37,6 +38,8 @@
 #include <map>
 #include <tuple>
 #include <mutex>
+#include <new>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -77,6 +80,20 @@ REXCVAR_DECLARE(bool, masseffect_vblank_sleep_exact);  // me_audio_hooks.cpp
 REXCVAR_DECLARE(int32_t, masseffect_scene_width);   // me_resolution.cpp
 REXCVAR_DECLARE(int32_t, masseffect_scene_height);  // me_resolution.cpp
 REXCVAR_DECLARE(int32_t, masseffect_scene_parts);   // me_resolution.cpp
+
+// Host memory report (docs/memory-growth.md).
+REXCVAR_DEFINE_INT32(masseffect_mem_report_s, 60, "Mass Effect",
+                     "Seconds between the \"[mem]\" log lines (host heap used / free / largest free block and the "
+                     "sizes of the renderer's long-lived caches); 0 = off")
+    .range(0, 3600);
+REXCVAR_DEFINE_INT32(masseffect_mem_emergency_reserve_mb, 32, "Mass Effect",
+                     "A block of this many MB is kept allocated and freed by the C++ new-handler the first time an "
+                     "operator new fails, so the failing allocation (and the ones right after it) can still succeed "
+                     "in a fragmented heap; re-armed by the \"[mem]\" report once the heap has room again. 0 = off")
+    .range(0, 256);
+REXCVAR_DEFINE_BOOL(masseffect_mem_report_probe, true, "Mass Effect",
+                    "The \"[mem]\" line measures the largest block malloc can hand out with a binary search of about "
+                    "12 malloc/free pairs (1 MB steps). false = skip it (the line then shows 'largest free block ?')");
 
 // D3D9 occlusion queries (EVENT_WRITE_ZPD): docs/occlusion-queries.md.
 REXCVAR_DEFINE_INT32(masseffect_native_query_mode, 0, "Mass Effect",
@@ -419,6 +436,21 @@ bool Compare(uint32_t info, uint32_t value, uint32_t ref) {
     case 0x6: return value > ref;
     default: return true;
   }
+}
+
+// docs/memory-growth.md: emergency reserve for operator new. The handler runs on whichever thread failed to
+// allocate; it only frees the block (no logging, no locks of ours) and lets operator new retry. With no block left
+// it throws std::bad_alloc, exactly what operator new does without a handler.
+std::atomic<void*> g_emergency_reserve{nullptr};
+std::atomic<uint64_t> g_emergency_released{0};
+
+void EmergencyNewHandler() {
+  if (void* block = g_emergency_reserve.exchange(nullptr, std::memory_order_acq_rel)) {
+    std::free(block);
+    g_emergency_released.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  throw std::bad_alloc();
 }
 
 // Physical microcode address -> library entry, filled on the game thread by NoteShaderObject and read
@@ -1375,7 +1407,15 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         break;
       }
       case 2: break;
-      default: Type3(data, packet, count, depth); break;
+      default:
+        // The packet's words are already consumed (reader advanced above), so a packet whose processing ran out of
+        // host memory is skipped and the parse stays in step (docs/memory-growth.md).
+        try {
+          Type3(data, packet, count, depth);
+        } catch (const std::bad_alloc&) {
+          NoteOutOfMemory("PM4 type 3 packet");
+        }
+        break;
     }
     return true;
   }
@@ -1701,7 +1741,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
             Draw();
           } else {
             ++draws_unidentified_;
-            ++missing_draw_pairs_[{draw_vs_ ? 0 : current_vs_hash_, draw_ps_ ? 0 : current_ps_hash_}];
+            // Cumulative diagnostic: capped at 4096 distinct pairs (docs/memory-growth.md).
+            const std::pair<uint64_t, uint64_t> missing{draw_vs_ ? 0 : current_vs_hash_, draw_ps_ ? 0 : current_ps_hash_};
+            if (missing_draw_pairs_.size() < 4096 || missing_draw_pairs_.count(missing)) ++missing_draw_pairs_[missing];
             if (REXCVAR_GET(masseffect_diag_missing_shader_draws)) LogMissingShaderDraw();
           }
           if (me::native::coherence::Recording()) CoherenceEndDraw();  // frame coherence
@@ -2544,6 +2586,12 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       ++draws_paired_;
       draw_vs_ = PreferVertexShaderCandidate(draw_vs_, vs, "pair-queue");
       if (ps && AcceptPixelShaderIdentity(ps, "pair-queue")) draw_ps_ = ps;
+      // Only this frame's entries are ever used (frame == swaps_): past 16384 packet addresses the stale ones are
+      // dropped instead of accumulating for the whole session (docs/memory-growth.md).
+      if (paired_packets_.size() >= 16384) {
+        for (auto it = paired_packets_.begin(); it != paired_packets_.end();)
+          it = it->second.frame != swaps_ ? paired_packets_.erase(it) : std::next(it);
+      }
       paired_packets_[packet_address_] = {swaps_, draw_vs_, ps};
       return;
     }
@@ -3160,14 +3208,33 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   }
 
   bool BackDraw(masseffect::native::SubmissionDraw& request) {
-    if (!split_on_) return targets_->Draw(request);
-    const uint32_t* registers = BackRegisters("draw");
     if (split_on_) {
-      request.registers = registers;
-      request.vs_microcode = mirror_.microcode(0);
-      request.ps_microcode = mirror_.microcode(1);
+      const uint32_t* registers = BackRegisters("draw");
+      if (split_on_) {
+        request.registers = registers;
+        request.vs_microcode = mirror_.microcode(0);
+        request.ps_microcode = mirror_.microcode(1);
+      }
     }
-    return targets_->Draw(request);
+    // docs/memory-growth.md: an allocation failure in the render target code around the draw (the draw itself has
+    // its own handler in DrawsVulkanImpl::Draw) drops this draw instead of terminating the game.
+    try {
+      return targets_->Draw(request);
+    } catch (const std::bad_alloc&) {
+      NoteOutOfMemory("draw");
+      return false;
+    }
+  }
+
+  // A std::bad_alloc caught on the ring thread (docs/memory-growth.md): counted, logged loudly with the heap state.
+  void NoteOutOfMemory(const char* what) {
+    ++ring_out_of_memory_;
+    if (ring_out_of_memory_ <= 16 || (ring_out_of_memory_ & 255) == 0) {
+      const me::native::heap::Snapshot heap = me::native::heap::Take(false);
+      REXLOG_ERROR("[native] MEMORY: std::bad_alloc on the ring thread ({}): dropped ({} so far); heap used {} MB, "
+                   "free {} MB, never taken {} MB",
+                   what, ring_out_of_memory_, heap.used >> 20, heap.free_in_arena >> 20, heap.untouched >> 20);
+    }
   }
 
   void SplitVerify(const char* what) {
@@ -3336,12 +3403,64 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     waitregmem_stats_.clear();
   }
 
+  // Every masseffect_mem_report_s (60 s): one line with the host heap and the long-lived cache sizes, so a long run
+  // shows what grows (docs/memory-growth.md). Ring thread; the cache sizes are read by the thread that owns them.
+  void ReportMemory(Clock::time_point now) {
+    const int32_t every = REXCVAR_GET(masseffect_mem_report_s);
+    if (every <= 0) return;
+    if (memory_report_ != Clock::time_point{} && now - memory_report_ < std::chrono::seconds(every)) return;
+    memory_report_ = now;
+    const bool probe = REXCVAR_GET(masseffect_mem_report_probe);
+    const me::native::heap::Snapshot heap = me::native::heap::Take(probe);
+    // Emergency reserve: armed the first time, re-armed once a probe shows room for four times its size.
+    const uint64_t reserve_bytes = uint64_t(std::max(REXCVAR_GET(masseffect_mem_emergency_reserve_mb), 0)) << 20;
+    const uint64_t released = g_emergency_released.load(std::memory_order_relaxed);
+    if (released != emergency_released_seen_) {
+      REXLOG_ERROR("[mem] MEMORY: the {} MB emergency reserve was released by a failed operator new ({} times so "
+                   "far): the heap ran out of a large enough block",
+                   reserve_bytes >> 20, released);
+      emergency_released_seen_ = released;
+    }
+    if (reserve_bytes && !g_emergency_reserve.load(std::memory_order_acquire) &&
+        (!emergency_armed_once_ || (probe && heap.largest >= 4 * reserve_bytes))) {
+      if (void* block = std::malloc(size_t(reserve_bytes))) {
+        void* expected = nullptr;
+        if (!g_emergency_reserve.compare_exchange_strong(expected, block, std::memory_order_acq_rel)) std::free(block);
+        if (!emergency_armed_once_) std::set_new_handler(EmergencyNewHandler);
+        emergency_armed_once_ = true;
+      }
+    }
+    std::string caches;
+    {
+      std::lock_guard<std::mutex> lock(g_by_address_mutex);
+      caches += fmt::format(" | shader objects seen {}, by address {}, by code {}, entry of object {}",
+                            g_objects_seen.size(), g_by_address.size(), g_by_code.size(), g_entry_of_object.size());
+    }
+    caches += fmt::format("; paired packets {}, missing pairs {}", paired_packets_.size(), missing_draw_pairs_.size());
+    if (targets_) targets_->MemoryCaches(caches);
+    const bool reserve_armed = g_emergency_reserve.load(std::memory_order_acquire) != nullptr;
+    if (!heap.valid) {
+      REXLOG_INFO("[mem] heap not measured on this platform; out-of-memory drops on the ring {}; top caches:{}",
+                  ring_out_of_memory_, caches);
+      return;
+    }
+    REXLOG_INFO("[mem] heap used {} MB, free {} MB, largest free block {} MB, never taken {} MB; process {}/{} MB; "
+                "emergency reserve {} ({} releases); out-of-memory drops on the ring {}; top caches:{}",
+                heap.used >> 20, heap.free_in_arena >> 20,
+                probe ? fmt::format("{}{}", heap.largest_capped ? ">=" : "", heap.largest >> 20) : std::string("?"),
+                heap.untouched >> 20,
+                heap.process_used >> 20, heap.process_total >> 20,
+                reserve_armed ? fmt::format("{} MB armed", reserve_bytes >> 20) : std::string("not armed"), released,
+                ring_out_of_memory_, caches);
+  }
+
   void Report(bool force) {
     const auto now = Clock::now();
     if (!force && now - last_report_ < std::chrono::seconds(10)) return;
     ReportWaitRegMem();
     const double secs = std::chrono::duration<double>(now - last_report_).count();
     last_report_ = now;
+    ReportMemory(now);
     // GPU time per category, real milliseconds per Swap of this interval: raw NVK timestamps x 1.627 on the Switch.
     if (targets_) {
       std::array<uint64_t, masseffect::native::kGpuCategories> gpu{}, frag{}, vert{}, prim{};
@@ -3660,6 +3779,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t bin_mask_ = ~0ull, bin_select_ = ~0ull;
   // Ring-thread counters.
   uint64_t packets_ = 0, draws_ = 0, copies_ = 0, swaps_ = 0, waits_timed_out_ = 0;
+  // docs/memory-growth.md: std::bad_alloc caught on the ring thread, and the 60 s "[mem]" report.
+  uint64_t ring_out_of_memory_ = 0;
+  Clock::time_point memory_report_{};
+  uint64_t emergency_released_seen_ = 0;
+  bool emergency_armed_once_ = false;
   // masseffect_vblank_adaptive
   std::atomic<bool> adaptive_vblank_{false};
   std::atomic<uint64_t> last_swap_ns_{0}, vblank_interval_ns_{0};
