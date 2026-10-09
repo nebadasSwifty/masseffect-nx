@@ -5,8 +5,11 @@
 //   2. a FAT32 split folder from showDirectoryPicker (Chromium): <name>.nsp/00, 01, ... of 0xFFFF0000 bytes each, the
 //      layout DBI, Tinfoil and Goldleaf install from a FAT32 card.
 //   3. memory (any browser), then a download: only for small outputs (an update NSP is ~75 MB).
-// Firefox and Safari have neither picker: a full NSP (8-9 GB) cannot be written there; the page says so.
+//   4. the connected Switch over USB (Chromium, WebUSB): UsbNspSink. Nothing is written anywhere: js/nsp.js sees
+//      serve() and hands over an NspImage that the console reads by range (Sphaira's USB install, js/usb_install.js).
+// Firefox and Safari have neither picker nor WebUSB: a full NSP (8-9 GB) cannot be written there; the page says so.
 import { FAT32_PART } from './nsp.js';
+import { serveFiles, webUsbSupport } from './usb_install.js';
 
 function triggerDownload(blob, name) {
   const url = URL.createObjectURL(blob);
@@ -115,21 +118,72 @@ export class MemoryNspSink {
   async abort() { this.chunks = []; }
 }
 
-/** What this browser can write an NSP to: { file, split, memory } (memory is always possible, for small outputs). */
+/**
+ * The connected console as the target. connect({ signal, log }) -> a transport ({ read, write, close }, see
+ * js/usb_install.js WebUsbTransport); the page supplies it (it finds an allowed device or asks the user for one, which
+ * needs a click). serve(image) is called by js/nsp.js once the NSP header is final; it returns when the console quits.
+ */
+export class UsbNspSink {
+  constructor(connect, name, { onWaiting = null } = {}) {
+    this.connect = connect;
+    this.name = name;
+    this.kind = 'usb';
+    this.onWaiting = onWaiting;
+    this.transport = null;
+    this.installed = false;
+    this.stats = null;
+  }
+
+  write() { throw new Error('UsbNspSink takes no writes: the NSP is served to the console by range (serve)'); }
+  writeAt() { throw new Error('UsbNspSink takes no writes: the NSP is served to the console by range (serve)'); }
+
+  async serve(image, { signal = null, log = () => {}, progress = () => {} } = {}) {
+    this.transport = await this.connect({ signal, log });
+    try {
+      const r = await serveFiles(this.transport, [{ name: this.name, size: image.size, read: (o, n) => image.read(o, n) }], {
+        signal, log, onWaiting: this.onWaiting ?? undefined,
+        onProgress: (sent, total, info) => progress(Math.min(sent, total), total, info),
+      });
+      this.stats = { ...r.files[0], reopens: image.stats.reopens, verified: image.stats.verified };
+      if (!image.complete()) {
+        throw new Error('the console stopped before it had read the whole package: the install was cancelled or failed on the console (see its message; not enough free space?), or Sphaira skipped it because this version is already installed');
+      }
+      this.installed = true;
+    } finally {
+      await this.transport.close?.();
+    }
+  }
+
+  async close() { return this.installed ? 'installed' : 'not-installed'; }
+  async abort() { try { await this.transport?.close?.(); } catch { /* ignore */ } }
+}
+
+/**
+ * What this browser can write an NSP to: { file, split, memory, usb } (memory is always possible, for small outputs;
+ * usb: WebUSB in a secure context, usbReason says why not).
+ */
 export function nspSinkSupport() {
+  const usb = webUsbSupport();
   return {
     file: typeof globalThis.showSaveFilePicker === 'function',
     split: typeof globalThis.showDirectoryPicker === 'function',
     memory: true,
+    usb: usb.ok,
+    usbReason: usb.reason,
   };
 }
 
 /**
  * Asks for the target (call it from the click handler: the pickers need the user gesture).
- * how: 'file' | 'split' | 'memory'. Returns the sink, or null when the user cancelled.
+ * how: 'file' | 'split' | 'memory' | 'usb' (with connect, see UsbNspSink). Returns the sink, or null when the user
+ * cancelled.
  * For 'split', sink.dir is the picked folder (the base metadata can be written next to the NSP folder).
  */
-export async function openNspSink(how, name) {
+export async function openNspSink(how, name, { connect = null, onWaiting = null } = {}) {
+  if (how === 'usb') {
+    if (!connect) throw new Error('openNspSink: usb needs connect()');
+    return new UsbNspSink(connect, name, { onWaiting });
+  }
   if (how === 'file') {
     try {
       const handle = await globalThis.showSaveFilePicker({

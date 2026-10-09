@@ -9,7 +9,8 @@ import { run, stagesFor, UserError } from '../js/pipeline.js';
 import {
   buildNsp, sourceFromBytes, pythonJson, parseBaseMetadata, metadataFromNsp, PartsReader, PackError, checkUpdateTitle, validDataDir,
 } from '../js/nsp.js';
-import { MemoryNspSink } from '../js/nsp_sink.js';
+import { MemoryNspSink, UsbNspSink } from '../js/nsp_sink.js';
+import { usbLink, fakeSphairaInstall } from './usb_fake_console.js';
 import { deterministicPssSigner } from '../js/nsp_crypto.js';
 import { prng, makeNro, makeKeys, makeRsa } from './nsp_fixtures.js';
 import { pattern } from './stfs_builder.js';
@@ -143,6 +144,35 @@ test('run(output nsp): full NSP, then updates against it (metadata file, base NS
   const wantUpd3 = await direct({ nro: nro2, entries: expectedEntries(site.toml, 1), update: { baseMeta: meta }, version: 2, dataDir: meta.data_dir });
   assert.deepEqual(upd3.bytes, wantUpd3.bytes);
   assert.ok(upd3.result.nsp.stats.baseBytes > 0);
+});
+
+test('run(output nsp, target usb): the console gets the same NSP; the pack worker serves the shaders again by offset', async () => {
+  const rand = prng(44);
+  const nro = makeNro(rand);
+  const site = fakeSite(nro);
+  const want = await runNsp(site, { kind: 'full' });
+  const det = deterministic();
+  const { host, console: con } = usbLink();
+  const sink = new UsbNspSink(async () => host, CONFIG.nsp.fullName);
+  const serve = sink.serve.bind(sink);
+  let image;
+  sink.serve = (img, o) => { image = img; return serve(Object.assign(img, { windowBytes: 0x4000, skipAheadBytes: 0x4000 }), o); };
+  const seen = [];
+  const labels = [];
+  const consoleRun = fakeSphairaInstall(con, { readSize: 0x5000, midReads: [{ after: 0.3, offset: -0x9000, length: 0x3000 }, { after: 0.7, offset: -0x9000, length: 0x3000 }] });
+  const [result, got] = await Promise.all([run({
+    config: CONFIG, edition: CONFIG.editions[0], files: discFiles(), dlc: [], mode: 'full', sink, output: 'nsp',
+    nsp: { keys: det.keys, signer: det.signer, aesKeyFor: det.aesKeyFor, createdUtc: det.createdUtc, kind: 'full', target: 'usb', chunkBytes: 0x4000 },
+    createWorker: site.createWorker, baseUrl: 'https://example.test/', fetchImpl: site.fetchImpl,
+    onProgress: (id, p) => { if (seen.at(-1) !== id) seen.push(id); if (id === 'nsp_usb') labels.push(p.label); },
+  }), consoleRun]);
+  assert.deepEqual(seen, stagesFor('nsp', { kind: 'full', target: 'usb' }));
+  assert.ok(Buffer.from(got.bytes).equals(Buffer.from(want.bytes)));
+  assert.equal(result.sinkResult, 'installed');
+  assert.equal(pythonJson(result.nsp.baseMeta), pythonJson(want.result.nsp.baseMeta));
+  assert.match(labels.at(-1), /^Sending to the Switch: /);
+  assert.ok(image.stats.reopens >= 2, 'sources were re-read from inside (disc file slices, pack worker reads at an offset)');
+  assert.equal(image.stats.verified, true);
 });
 
 test('run(output nsp): the edition\'s prewarm list is in the RomFS of the full NSP and of an update with data', async () => {

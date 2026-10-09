@@ -13,6 +13,8 @@
 //   full                       download, scan, translate, pack, nsp_hash (pass 1), nsp_write (pass 2)
 //   update with game data      download, nsp_base (base metadata), scan, translate, pack, nsp_hash, nsp_write
 //   program-only update        download, nsp_base, nsp_write (no shaders, no disc reads)
+// With nsp.target 'usb' (sink: js/nsp_sink.js UsbNspSink) every NSP run ends with nsp_usb: nsp_write then only hashes
+// (the NSP header must be final before the console reads it) and nsp_usb serves the NSP to Sphaira's USB install.
 //
 // Optional DLC (js/stfs.js packages): their *.xxx files are scanned together with the disc's, their trees and .header
 // files go to the content folder of the runtime, and masseffect.toml gets dlc_enable = true. See docs/dlc.md.
@@ -34,9 +36,18 @@ export { stageIds };
 /** The stages of a run: the zip, or an NSP (options.nsp: { kind: 'full' | 'update', programOnly }). */
 export function stagesFor(output = 'zip', nsp = null) {
   if (output !== 'nsp') return stageIds;
-  if (nsp?.kind === 'update' && nsp.programOnly) return ['download', 'nsp_base', 'nsp_write'];
-  if (nsp?.kind === 'update') return ['download', 'nsp_base', 'scan', 'translate', 'pack', 'nsp_hash', 'nsp_write'];
-  return ['download', 'scan', 'translate', 'pack', 'nsp_hash', 'nsp_write'];
+  const usb = nsp?.target === 'usb' ? ['nsp_usb'] : [];
+  if (nsp?.kind === 'update' && nsp.programOnly) return ['download', 'nsp_base', 'nsp_write', ...usb];
+  if (nsp?.kind === 'update') return ['download', 'nsp_base', 'scan', 'translate', 'pack', 'nsp_hash', 'nsp_write', ...usb];
+  return ['download', 'scan', 'translate', 'pack', 'nsp_hash', 'nsp_write', ...usb];
+}
+
+function formatRate(bytesPerSecond) {
+  return `${(bytesPerSecond / 1e6).toFixed(1)} MB/s`;
+}
+
+function formatGb(bytes) {
+  return `${(bytes / 1e9).toFixed(2)} GB`;
 }
 
 /** The base of an update: the parsed .basemeta.json, or computed from the base NSP's parts (needs the keys). */
@@ -83,7 +94,14 @@ export function nspIdentity(nspOptions, edition) {
 /** Runs js/nsp.js buildNsp with the page's progress stages; returns its result. */
 async function writeNspStage({ nspOptions, identity, build, entries, baseMeta, sink, signal, stage, log }) {
   const o = nspOptions;
-  const labels = { hash: 'Pass 1 of 2: hashing the package', write: o.programOnly ? 'Encrypting and writing the update' : 'Pass 2 of 2: encrypting and writing the NSP' };
+  const usb = typeof sink.serve === 'function';
+  const labels = usb
+    ? { hash: 'Pass 1 of 3: hashing the package', write: o.programOnly ? 'Encrypting and hashing the update' : 'Pass 2 of 3: encrypting and hashing (the NSP header needs the hashes)' }
+    : { hash: 'Pass 1 of 2: hashing the package', write: o.programOnly ? 'Encrypting and writing the update' : 'Pass 2 of 2: encrypting and writing the NSP' };
+  const stageOf = { hash: 'nsp_hash', write: 'nsp_write', usb: 'nsp_usb' };
+  const label = (phase, done, total, info) => (phase === 'usb'
+    ? `Sending to the Switch: ${formatGb(done)} of ${formatGb(total)}${info?.rate ? `, ${formatRate(info.rate)}` : ''}`
+    : labels[phase]);
   try {
     return await buildNsp({
       keys: o.keys,
@@ -99,7 +117,7 @@ async function writeNspStage({ nspOptions, identity, build, entries, baseMeta, s
       signer: o.signer, aesKeyFor: o.aesKeyFor, createdUtc: o.createdUtc, chunkBytes: o.chunkBytes,
       sink, signal,
       log: (t, level) => log(t, level ?? 'info'),
-      onProgress: (phase, done, total) => stage(phase === 'hash' ? 'nsp_hash' : 'nsp_write')({ done, total, label: labels[phase] }),
+      onProgress: (phase, done, total, info) => stage(stageOf[phase])({ done, total, label: label(phase, done, total, info), rate: info?.rate }),
     });
   } catch (e) {
     throw nspError(e);
@@ -383,12 +401,12 @@ function workerBudget() {
   return Math.max(1, hc - 1);
 }
 
-async function* readChunks(blob, chunkBytes, signal) {
+async function* readChunks(blob, chunkBytes, signal, from = 0) {
   let next = null;
   const read = (pos) => blob.slice(pos, Math.min(pos + chunkBytes, blob.size)).arrayBuffer().then((b) => new Uint8Array(b));
-  if (blob.size === 0) return;
-  next = read(0);
-  for (let pos = 0; pos < blob.size; pos += chunkBytes) {
+  if (blob.size <= from) return;
+  next = read(from);
+  for (let pos = from; pos < blob.size; pos += chunkBytes) {
     throwIfCancelled(signal);
     const chunk = await next;
     const after = pos + chunkBytes;
@@ -397,7 +415,7 @@ async function* readChunks(blob, chunkBytes, signal) {
   }
 }
 
-async function* bytesOnce(bytes) { if (bytes.length) yield bytes; }
+async function* bytesOnce(bytes, from = 0) { if (bytes.length > from) yield from ? bytes.subarray(from) : bytes; }
 
 /**
  * Sets `key = true` in a masseffect.toml (bytes in, bytes out). An existing top-level assignment of the key (commented
@@ -457,8 +475,8 @@ export function dlcScanFiles(packages) {
   return out;
 }
 
-async function* packageChunks(packRemote, file, size, chunkBytes, signal) {
-  for (let offset = 0; offset < size; offset += chunkBytes) {
+async function* packageChunks(packRemote, file, size, chunkBytes, signal, from = 0) {
+  for (let offset = from; offset < size; offset += chunkBytes) {
     throwIfCancelled(signal);
     const length = Math.min(chunkBytes, size - offset);
     const r = await packRemote.call({ type: 'read', id: offset, file, offset, length }, [], 'chunk');
@@ -470,7 +488,8 @@ async function* packageChunks(packRemote, file, size, chunkBytes, signal) {
  * Runs the whole thing.
  * options: { config, edition, files (disc files, re-rooted), mode: 'full'|'update', sink, createWorker(kind),
  *            dlc (optional: packages from js/stfs.js openStfs()),
- *            output: 'zip' (default) | 'nsp', nsp (with output 'nsp'): { keys, kind: 'full'|'update', programOnly,
+ *            output: 'zip' (default) | 'nsp', nsp (with output 'nsp'): { keys, kind: 'full'|'update', programOnly, target
+ *              ('usb' with a UsbNspSink: adds the nsp_usb stage),
  *              base: { meta } | { parts: [File] } (updates), version, titleId, dataDir (default: the edition's nsp),
  *              displayVersion } and a sink from
  *              js/nsp_sink.js,
@@ -600,14 +619,15 @@ export async function run(options) {
       const entries = [
         { path: names.toml, ...sourceFromBytes(build.toml) },
         ...(build.prewarmList ? [{ path: names.prewarmList, ...sourceFromBytes(build.prewarmList) }] : []),
-        { path: names.shaders, size: packed.sizes.package, chunks: () => packageChunks(packRemote, names.shaders, packed.sizes.package, 8 * 1024 * 1024, signal) },
-        { path: names.shadersIndex, size: packed.sizes.index, chunks: () => packageChunks(packRemote, names.shadersIndex, packed.sizes.index, 8 * 1024 * 1024, signal) },
+        // Every entry can start at an offset (chunks(from)): the USB install re-reads the region the console asks for.
+        { path: names.shaders, size: packed.sizes.package, seekable: true, chunks: (from = 0) => packageChunks(packRemote, names.shaders, packed.sizes.package, 8 * 1024 * 1024, signal, from) },
+        { path: names.shadersIndex, size: packed.sizes.index, seekable: true, chunks: (from = 0) => packageChunks(packRemote, names.shadersIndex, packed.sizes.index, 8 * 1024 * 1024, signal, from) },
       ];
       for (const f of gamePlan.copy) {
-        entries.push({ path: `${config.zip.gameRootDir}/${f.path}`, size: f.size, chunks: () => readChunks(f.blob, config.limits.copyChunkBytes, signal) });
+        entries.push({ path: `${config.zip.gameRootDir}/${f.path}`, size: f.size, seekable: true, chunks: (from = 0) => readChunks(f.blob, config.limits.copyChunkBytes, signal, from) });
       }
       for (const e of dlcZipEntries(config, dlc)) {
-        entries.push({ path: e.name.slice(root.length + 1), size: e.size, chunks: () => (e.bytes ? bytesOnce(e.bytes) : readChunks(e.blob, config.limits.copyChunkBytes, signal)) });
+        entries.push({ path: e.name.slice(root.length + 1), size: e.size, seekable: true, chunks: (from = 0) => (e.bytes ? bytesOnce(e.bytes, from) : readChunks(e.blob, config.limits.copyChunkBytes, signal, from)) });
       }
       const nsp = await writeNspStage({ nspOptions, identity, build, entries, baseMeta, sink, signal, stage, log });
       const sinkResult = await sink.close();
