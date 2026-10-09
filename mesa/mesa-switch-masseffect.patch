@@ -2562,3 +2562,160 @@ index 3c7cafd74de..cac10592b4d 100644
  void *vk_pipeline_zalloc(struct vk_device *device,
                           const struct vk_pipeline_ops *ops,
                           VkPipelineBindPoint bind_point,
+diff --git a/src/vulkan/wsi/wsi_common_switch.c b/src/vulkan/wsi/wsi_common_switch.c
+index a1dcc11..f527a00 100644
+--- a/src/vulkan/wsi/wsi_common_switch.c
++++ b/src/vulkan/wsi/wsi_common_switch.c
+@@ -22,6 +22,7 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ 
++#include "util/log.h"
+ #include "util/macros.h"
+ #include "util/os_time.h"
+ #include "util/simple_mtx.h"
+@@ -89,6 +90,28 @@ out:
+    simple_mtx_unlock(&wsi_switch_poisoned_nwindows_lock);
+ }
+ 
++/* Only after the ownership has been proven released (see
++ * wsi_switch_nwindow_recover). An overflowed registry cannot forget one
++ * window, so it stays poisoned.
++ */
++static bool
++wsi_switch_nwindow_unpoison(NWindow *nw)
++{
++   simple_mtx_lock(&wsi_switch_poisoned_nwindows_lock);
++
++   bool ok = !wsi_switch_poisoned_nwindow_overflow;
++   for (uint32_t i = 0; ok && i < wsi_switch_poisoned_nwindow_count; i++) {
++      if (wsi_switch_poisoned_nwindows[i] == nw) {
++         wsi_switch_poisoned_nwindows[i] =
++            wsi_switch_poisoned_nwindows[--wsi_switch_poisoned_nwindow_count];
++         break;
++      }
++   }
++
++   simple_mtx_unlock(&wsi_switch_poisoned_nwindows_lock);
++   return ok;
++}
++
+ static VkResult
+ wsi_switch_surface_get_support(VkIcdSurfaceBase *surface,
+                                struct wsi_device *wsi_device,
+@@ -338,6 +361,9 @@ struct wsi_switch_swapchain {
+    /* A failed Binder transaction cannot prove whether registrations remain.
+     * Once unknown, backing storage is quarantined instead of destroyed. */
+    bool nwindow_ownership_unknown;
++   /* Set by wsi_switch_nwindow_recover on the chain it replaced: its slots
++    * are gone from the NWindow, but its scanout memory is never freed. */
++   bool keep_storage;
+    bool retired;
+    uint32_t pixel_format;
+    NvColorFormat color_format;
+@@ -1017,7 +1043,7 @@ wsi_switch_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+    if (released)
+       released = wsi_switch_swapchain_close_nwindow_buffers(chain);
+ 
+-   if (released) {
++   if (released && !chain->keep_storage) {
+       for (uint32_t i = 0; i < chain->base.image_count; i++)
+          wsi_switch_destroy_scanout_image(chain, &chain->images[i]);
+    }
+@@ -1029,6 +1055,59 @@ wsi_switch_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+    return released ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
+ }
+ 
++/* Recovery from unknown NWindow ownership.
++ *
++ * A single failed Binder call (queue, cancel, request, release) poisons the
++ * NWindow, and before this every later swapchain on it was refused for the
++ * rest of the process: the buffers of the failed chain stay registered
++ * (nwindowSetDimensions then fails with LibnxError_AlreadyInitialized), the
++ * application can never present again, and the compositor keeps showing the
++ * last queued image.
++ *
++ * nwindowReleaseBuffers cancels the dequeued slot, if any, and disconnects
++ * the producer from the BufferQueue. When it succeeds and libnx reports no
++ * configured slot, the compositor holds no registration of this process
++ * anymore, so the ownership is known again (nothing) and new slots may be
++ * configured. The replaced chain forgets its slots and keeps its memory
++ * (keep_storage), as the quarantine did.
++ */
++static bool
++wsi_switch_nwindow_recover(NWindow *nw, struct wsi_switch_swapchain *old_chain)
++{
++   if (!nw || !nwindowIsValid(nw))
++      return false;
++
++   Result rc = nwindowReleaseBuffers(nw);
++   if (R_FAILED(rc) || nw->slots_configured != 0 || nw->cur_slot >= 0) {
++      mesa_loge("wsi/switch: NWindow ownership unknown and nwindowReleaseBuffers "
++                "did not clear it (rc 0x%08x, slots 0x%016llx, dequeued %d); "
++                "the window stays unusable",
++                rc, (unsigned long long)nw->slots_configured, nw->cur_slot);
++      return false;
++   }
++
++   if (old_chain && old_chain->nw == nw) {
++      old_chain->owns_nwindow_buffers = false;
++      old_chain->nwindow_ownership_unknown = false;
++      old_chain->keep_storage = true;
++      for (uint32_t i = 0; i < old_chain->base.image_count; i++) {
++         struct wsi_switch_image *img = &old_chain->images[i];
++         img->slot = -1;
++         img->busy_on_host = false;
++         img->busy_on_device = false;
++         img->have_acquire_fence = false;
++         memset(&img->acquire_fence, 0, sizeof(img->acquire_fence));
++      }
++   }
++
++   if (!wsi_switch_nwindow_unpoison(nw))
++      return false;
++
++   mesa_logw("wsi/switch: NWindow ownership was unknown; all buffers released "
++             "(producer disconnected), the window is usable again");
++   return true;
++}
++
+ static VkResult
+ wsi_switch_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+                                     VkDevice device,
+@@ -1049,22 +1128,27 @@ wsi_switch_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+     * VkImages until destruction. The old chain must never release
+     * replacement registrations.
+     */
++   struct wsi_switch_swapchain *old_chain = NULL;
+    if (pCreateInfo->oldSwapchain != VK_NULL_HANDLE) {
+-      VK_FROM_HANDLE(wsi_switch_swapchain, old_chain,
+-                     pCreateInfo->oldSwapchain);
++      old_chain = wsi_switch_swapchain_from_handle(pCreateInfo->oldSwapchain);
+       old_chain->retired = true;
+-      if (wsi_switch_nwindow_is_poisoned(old_chain->nw) ||
+-          wsi_switch_nwindow_is_poisoned(nw))
+-         return VK_ERROR_SURFACE_LOST_KHR;
+-      if (!wsi_switch_swapchain_cancel_outstanding_images(old_chain) ||
+-          !wsi_switch_swapchain_close_nwindow_buffers(old_chain))
++      if (old_chain->nw != nw &&
++          wsi_switch_nwindow_is_poisoned(old_chain->nw))
+          return VK_ERROR_SURFACE_LOST_KHR;
++      /* A failure here poisons the window; the recovery below handles it. */
++      if (!wsi_switch_nwindow_is_poisoned(nw) &&
++          wsi_switch_swapchain_cancel_outstanding_images(old_chain))
++         (void)wsi_switch_swapchain_close_nwindow_buffers(old_chain);
+    }
+ 
+    /* Poison is sticky across DestroySwapchainKHR because that API is void.
+     * Never configure new slots on an NWindow whose ownership could not be
+-    * proven released by an earlier swapchain. */
+-   if (wsi_switch_nwindow_is_poisoned(nw))
++    * proven released by an earlier swapchain: prove it here by releasing
++    * everything, or give up. */
++   if ((wsi_switch_nwindow_is_poisoned(nw) ||
++        (old_chain && old_chain->nw == nw &&
++         old_chain->nwindow_ownership_unknown)) &&
++       !wsi_switch_nwindow_recover(nw, old_chain))
+       return VK_ERROR_SURFACE_LOST_KHR;
+ 
+    const VkPresentModeKHR present_mode =

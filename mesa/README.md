@@ -12,7 +12,7 @@ links into the NRO.
 | Upstream | [danfromtico/mesa-switch](https://github.com/danfromtico/mesa-switch), `main` |
 | Pinned commit | `d4a00ea0ab3f59afb967cc5d779e4263d237bd77` ("Merge NaGaa95/mesa-switch main: Mesa 26.2.3, NVK and NAK fixes, shared shader cache") |
 | Mesa version | 26.2.3 |
-| Patch | `mesa-switch-masseffect.patch`, one `git apply`-able diff: 17 files, +1861 / -31, about 105 KB |
+| Patch | `mesa-switch-masseffect.patch`, one `git apply`-able diff: 18 files, +1955 / -41, about 110 KB |
 
 The patch is the sum of two things, applied on that commit:
 
@@ -28,6 +28,7 @@ The text of the source comments was cleaned of project-specific names; no code w
 
 | Change | Why | Effect | Files |
 |---|---|---|---|
+| WSI recovery from unknown NWindow ownership (ours) | One failed Binder call of the swapchain (queue, cancel, request, release) "poisoned" the NWindow for the rest of the process: every new swapchain was refused, the old buffers stayed registered (`nwindowSetDimensions` then fails with 0xF59, `LibnxError_AlreadyInitialized`) and the screen froze on the last queued image while the game kept running (the intro-movie frame at start, about 1 launch in 5-10, 2026-10-08/09). | `vkCreateSwapchainKHR` on a poisoned window calls `nwindowReleaseBuffers` (cancel the dequeued slot, disconnect the producer); if libnx then reports no configured slot, the poison is lifted and the swapchain is created normally. The replaced chain keeps its memory (about 11 MB at 1280x720, once). Logs `wsi/switch: NWindow ownership was unknown; all buffers released`. | `src/vulkan/wsi/wsi_common_switch.c` |
 | Submit tail reservation (ours) | The GPFIFO holds 0x800 entries. `exec_locked` reserved only the final skid, then `submit_locked` needed up to 3 more entries (fence, report, cross-channel wait). A batch filling the queue to the skid made the next submit fail with `no queue space`, and NVK treats that as a lost device. | No more "Graphics device lost" after minutes of play. The queue now keeps 3 entries free. | `src/nouveau/horizon/nouveau_horizon_channel.c` |
 | Per-stage shader cache keys, `NVK_SWITCH_STAGE_CACHE=1` (ours) | The Vulkan runtime hashes the vertex and fragment shader of a linked pipeline into one cache key, so every new VS/FS pair recompiled both. | Setting `disable_lto` gives one key per stage. Cold pipeline compile went from 137 to 81 ms. Off unless the variable is set (the app sets it). | `nvk_device.c` |
 | Fragment barrier, `NVK_SWITCH_FRAG_BARRIER=0/1/2` (ours) | A barrier between fragment work and later fragment work does not need a full pipeline wait (what deko3d does). 1 = colour attachment sources, 2 = colour and depth/stencil. | Experimental, off (0) by default. | `nvk_cmd_buffer.c` |

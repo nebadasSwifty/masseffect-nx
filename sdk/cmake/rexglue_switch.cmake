@@ -67,6 +67,9 @@ if(NOT TARGET rexglue_switch_startup)
         "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
         "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx"
         "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
+        # Failures of the window calls the Mesa WSI makes, for the presenter's log (RexSwitchWindowFailures).
+        "LINKER:--wrap=nwindowCancelBuffer,--wrap=nwindowReleaseBuffers,--wrap=nwindowConfigureBuffer"
+        "LINKER:--wrap=bqRequestBuffer,--wrap=bqCancelBuffer"
         "LINKER:--wrap=svcSleepThread")
 endif()
 

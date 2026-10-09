@@ -85,6 +85,11 @@ void __real_armDCacheClean(void* addr, size_t size);
 Result __real_nwindowQueueBuffer(NWindow* nw, s32 slot, const NvMultiFence* fence);
 Result __real_bqDequeueBuffer(Binder* b, bool async, u32 width, u32 height, s32 format, u32 usage, s32* buf,
                               NvMultiFence* fence);
+Result __real_nwindowCancelBuffer(NWindow* nw, s32 slot, const NvMultiFence* fence);
+Result __real_nwindowReleaseBuffers(NWindow* nw);
+Result __real_nwindowConfigureBuffer(NWindow* nw, s32 slot, NvGraphicBuffer* buf);
+Result __real_bqRequestBuffer(Binder* b, s32 bufferIdx, BqGraphicBuffer* buf);
+Result __real_bqCancelBuffer(Binder* b, s32 buf, const NvMultiFence* fence);
 void __real_svcSleepThread(s64 nano);
 }
 
@@ -1234,6 +1239,72 @@ void __wrap_armDCacheClean(void* addr, size_t size) {
 }
 
 /*
+ * Failed window calls (NWindow and its BufferQueue), kept for the presenter's log.
+ *
+ * The Mesa WSI (wsi_common_switch.c) turns any failed Binder call of the swapchain into
+ * VK_ERROR_SURFACE_LOST_KHR or VK_ERROR_OUT_OF_DATE_KHR and drops the libnx result. Worse, a failure it
+ * cannot prove harmless "poisons" the NWindow for the rest of the process: every later swapchain on it is
+ * refused, its buffers stay registered, and the screen keeps the last queued image forever (the frozen
+ * intro-movie frame at start, 2026-10-09 launch loop: "nwindowSetDimensions(1280x720) failed: 0x00000F59",
+ * that is LibnxError_AlreadyInitialized, slots still configured). The wrappers below only record which call
+ * failed, its result, the slot and NWindow::cur_slot, so the presenter can print them when presentation is
+ * lost. No lock, no I/O: a fixed ring, read by RexSwitchWindowFailures.
+ */
+enum : u32 {
+  kWinQueueBuffer = 1,
+  kWinDequeueBuffer,
+  kWinCancelBuffer,
+  kWinReleaseBuffers,
+  kWinConfigureBuffer,
+  kWinRequestBuffer,
+  kWinBqCancelBuffer,
+};
+struct WindowFailure {
+  std::atomic<u32> seq{0};  // written last (release); 0 = empty
+  std::atomic<u32> call{0};
+  std::atomic<u32> rc{0};
+  std::atomic<s32> slot{0};
+  std::atomic<s32> cur_slot{0};
+  std::atomic<u64> tick{0};
+};
+constexpr u32 kWindowFailures = 16;
+static WindowFailure g_window_failures[kWindowFailures];
+static std::atomic<u32> g_window_failure_count{0};
+static std::atomic<u32> g_window_failure_reported{0};
+
+static void NoteWindowFailure(u32 call, Result rc, s32 slot, const NWindow* nw) {
+  const u32 n = g_window_failure_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  WindowFailure& f = g_window_failures[(n - 1) % kWindowFailures];
+  f.call.store(call, std::memory_order_relaxed);
+  f.rc.store(u32(rc), std::memory_order_relaxed);
+  f.slot.store(slot, std::memory_order_relaxed);
+  f.cur_slot.store(nw ? nw->cur_slot : -2, std::memory_order_relaxed);
+  f.tick.store(armGetSystemTick(), std::memory_order_relaxed);
+  f.seq.store(n, std::memory_order_release);
+}
+
+static const char* WindowCallName(u32 call) {
+  switch (call) {
+    case kWinQueueBuffer:
+      return "nwindowQueueBuffer";
+    case kWinDequeueBuffer:
+      return "bqDequeueBuffer";
+    case kWinCancelBuffer:
+      return "nwindowCancelBuffer";
+    case kWinReleaseBuffers:
+      return "nwindowReleaseBuffers";
+    case kWinConfigureBuffer:
+      return "nwindowConfigureBuffer";
+    case kWinRequestBuffer:
+      return "bqRequestBuffer";
+    case kWinBqCancelBuffer:
+      return "bqCancelBuffer";
+    default:
+      return "?";
+  }
+}
+
+/*
  * The presentation interval (masseffect_interval_swap).
  *
  * It is reapplied on every present, not when the chain is created, on purpose: the WSI sets it to 1
@@ -1254,8 +1325,15 @@ Result __wrap_nwindowQueueBuffer(NWindow* nw, s32 slot, const NvMultiFence* fenc
   if (request != 0 && nw != nullptr && nw->swap_interval != request) {
     nwindowSetSwapInterval(nw, request);
   }
+  const s32 cur = nw ? nw->cur_slot : -2;
   const Result rc = __real_nwindowQueueBuffer(nw, slot, fence);
   Note(kQueueBuffer, from);
+  if (R_FAILED(rc)) {
+    // cur_slot from before the call: a mismatch with slot means the WSI queued an image it had not dequeued.
+    NoteWindowFailure(kWinQueueBuffer, rc, slot, nullptr);
+    g_window_failures[(g_window_failure_count.load(std::memory_order_relaxed) - 1) % kWindowFailures]
+        .cur_slot.store(cur, std::memory_order_relaxed);
+  }
   return rc;
 }
 
@@ -1264,6 +1342,88 @@ Result __wrap_bqDequeueBuffer(Binder* b, bool async, u32 width, u32 height, s32 
   const u64 from = armGetSystemTick();
   const Result rc = __real_bqDequeueBuffer(b, async, width, height, format, usage, buf, fence);
   Note(kDequeueBuffer, from);
+  // WouldBlock is the normal answer of an asynchronous dequeue with no free buffer.
+  if (R_FAILED(rc) && R_VALUE(rc) != MAKERESULT(Module_LibnxBinder, LibnxBinderError_WouldBlock)) {
+    NoteWindowFailure(kWinDequeueBuffer, rc, -1, nullptr);
+  }
+  return rc;
+}
+
+/*
+ * Formats the window failures recorded since the previous call (oldest first, at most the ring size) into
+ * buf and returns how many there were in total since the start (0 = never). Any thread; meant for the
+ * presenter when it loses the swapchain.
+ */
+u32 RexSwitchWindowFailures(char* buf, size_t cap) {
+  if (buf && cap) {
+    buf[0] = 0;
+  }
+  const u32 total = g_window_failure_count.load(std::memory_order_acquire);
+  u32 from = g_window_failure_reported.exchange(total, std::memory_order_relaxed);
+  if (total > from + kWindowFailures) {
+    from = total - kWindowFailures;
+  }
+  size_t used = 0;
+  for (u32 n = from + 1; n <= total && buf && used + 1 < cap; ++n) {
+    const WindowFailure& f = g_window_failures[(n - 1) % kWindowFailures];
+    if (f.seq.load(std::memory_order_acquire) != n) {
+      continue;  // overwritten or still being written
+    }
+    const u32 rc = f.rc.load(std::memory_order_relaxed);
+    const int w = std::snprintf(buf + used, cap - used,
+                                "%s[#%u %s rc 0x%08X (module %u, description %u) slot %d cur_slot %d at %.3f s]",
+                                used ? " " : "", n, WindowCallName(f.call.load(std::memory_order_relaxed)), rc,
+                                rc & 0x1FF, (rc >> 9) & 0x1FFF, f.slot.load(std::memory_order_relaxed),
+                                f.cur_slot.load(std::memory_order_relaxed),
+                                double(armTicksToNs(f.tick.load(std::memory_order_relaxed))) / 1e9);
+    if (w <= 0) {
+      break;
+    }
+    used = std::min(cap - 1, used + size_t(w));
+  }
+  return total;
+}
+
+Result __wrap_nwindowCancelBuffer(NWindow* nw, s32 slot, const NvMultiFence* fence) {
+  const s32 cur = nw ? nw->cur_slot : -2;
+  const Result rc = __real_nwindowCancelBuffer(nw, slot, fence);
+  if (R_FAILED(rc)) {
+    NoteWindowFailure(kWinCancelBuffer, rc, slot, nullptr);
+    g_window_failures[(g_window_failure_count.load(std::memory_order_relaxed) - 1) % kWindowFailures]
+        .cur_slot.store(cur, std::memory_order_relaxed);
+  }
+  return rc;
+}
+
+Result __wrap_nwindowReleaseBuffers(NWindow* nw) {
+  const Result rc = __real_nwindowReleaseBuffers(nw);
+  if (R_FAILED(rc)) {
+    NoteWindowFailure(kWinReleaseBuffers, rc, -1, nw);
+  }
+  return rc;
+}
+
+Result __wrap_nwindowConfigureBuffer(NWindow* nw, s32 slot, NvGraphicBuffer* buf) {
+  const Result rc = __real_nwindowConfigureBuffer(nw, slot, buf);
+  if (R_FAILED(rc)) {
+    NoteWindowFailure(kWinConfigureBuffer, rc, slot, nw);
+  }
+  return rc;
+}
+
+Result __wrap_bqRequestBuffer(Binder* b, s32 bufferIdx, BqGraphicBuffer* buf) {
+  const Result rc = __real_bqRequestBuffer(b, bufferIdx, buf);
+  if (R_FAILED(rc)) {
+    NoteWindowFailure(kWinRequestBuffer, rc, bufferIdx, nullptr);
+  }
+  return rc;
+}
+
+Result __wrap_bqCancelBuffer(Binder* b, s32 buf, const NvMultiFence* fence) {
+  const Result rc = __real_bqCancelBuffer(b, buf, fence);
+  if (R_FAILED(rc)) {
+    NoteWindowFailure(kWinBqCancelBuffer, rc, buf, nullptr);
+  }
   return rc;
 }
 

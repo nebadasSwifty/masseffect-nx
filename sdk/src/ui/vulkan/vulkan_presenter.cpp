@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -56,6 +57,8 @@ extern "C" {
 #include <switch/result.h>
 #include <switch/display/native_window.h>
 }
+// switch_perf.cpp: the window calls (NWindow / BufferQueue) that failed since the previous call.
+extern "C" uint32_t RexSwitchWindowFailures(char* buf, size_t cap);
 #endif
 
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
@@ -400,6 +403,27 @@ void PaintedDumpIfTouches(uint32_t sends_in_flight) {
     g_painted_ns_worst[i] = 0;
   }
   g_painted_redone_pipelines = 0;
+}
+
+/*
+ * For the log lines of a lost presentation: the libnx results the WSI swallowed. On the Switch the Mesa
+ * WSI reports any failed Binder call as SURFACE_LOST / OUT_OF_DATE without the cause, and one such failure
+ * can make every later swapchain on the NWindow fail (the frozen start frame, 2026-10-09).
+ */
+std::string WindowFailuresForLog() {
+#if REX_PLATFORM_SWITCH
+  char text[1024];
+  const uint32_t total = RexSwitchWindowFailures(text, sizeof(text));
+  if (!total) {
+    return "no failed NWindow call recorded";
+  }
+  if (!text[0]) {
+    return "no new failed NWindow call (" + std::to_string(total) + " in total)";
+  }
+  return std::string(text);
+#else
+  return "";
+#endif
 }
 
 }  // namespace
@@ -1184,8 +1208,13 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         Result dimensions_result =
             nwindowSetDimensions(vi_surface.window(), new_surface_width, new_surface_height);
         if (R_FAILED(dimensions_result)) {
-          REXLOG_WARN("VulkanPresenter: nwindowSetDimensions({}x{}) failed: 0x{:08X}",
-                      new_surface_width, new_surface_height, dimensions_result);
+          // 0x00000F59 = LibnxError_AlreadyInitialized: buffers of an earlier swapchain are still
+          // registered with the NWindow (slots_configured != 0), i.e. the WSI could not release them.
+          REXLOG_WARN("VulkanPresenter: nwindowSetDimensions({}x{}) failed: 0x{:08X} (slots configured "
+                      "{:016X}, connected {}, dequeued slot {}); window: {}",
+                      new_surface_width, new_surface_height, dimensions_result,
+                      vi_surface.window()->slots_configured, vi_surface.window()->is_connected ? "yes" : "no",
+                      vi_surface.window()->cur_slot, WindowFailuresForLog());
         }
         VkViSurfaceCreateInfoNN surface_create_info;
         surface_create_info.sType = VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN;
@@ -1849,8 +1878,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.clipped = VK_TRUE;
   swapchain_create_info.oldSwapchain = old_swapchain;
   VkSwapchainKHR swapchain;
-  if (dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain) != VK_SUCCESS) {
-    REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
+  const VkResult create_result =
+      dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain);
+  if (create_result != VK_SUCCESS) {
+    // On the Switch, SURFACE_LOST (-1000000000) here means the WSI considers the NWindow's buffer ownership
+    // unknown ("poisoned") and refuses every new swapchain on it for the rest of the process.
+    REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain (VkResult {}, {}x{}, old swapchain {}); window: {}",
+                 int(create_result), swapchain_create_info.imageExtent.width,
+                 swapchain_create_info.imageExtent.height, old_swapchain != VK_NULL_HANDLE ? "yes" : "no",
+                 WindowFailuresForLog());
     return VK_NULL_HANDLE;
   }
   // The mode with its name. The whole frame pacing depends on it, and a bare number in the log
@@ -2087,10 +2123,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       // on some platforms).
       REXLOG_INFO(
           "VulkanPresenter: Presentation to the swapchain image has been "
-          "dropped as the swapchain or the surface has become outdated");
+          "dropped as the swapchain or the surface has become outdated (acquire, VkResult {}); "
+          "window: {}",
+          int(acquire_result), WindowFailuresForLog());
       return PaintResult::kNotPresentedConnectionOutdated;
     default:
-      REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
+      REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image (VkResult {}); window: {}",
+                   int(acquire_result), WindowFailuresForLog());
       return PaintResult::kNotPresented;
   }
   if (acquisition_in_cpu) {
@@ -2847,12 +2886,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       // on some platforms).
       REXLOG_INFO(
           "VulkanPresenter: Presentation to the swapchain image has been "
-          "dropped as the swapchain or the surface has become outdated");
+          "dropped as the swapchain or the surface has become outdated (present, VkResult {}, "
+          "image {}); window: {}",
+          int(present_result), swapchain_image_index, WindowFailuresForLog());
       // Note that the semaphore wait (followed by reset) has been enqueued,
       // however, this should have no effect on anything here likely.
       return PaintResult::kNotPresentedConnectionOutdated;
     default:
-      REXLOG_ERROR("VulkanPresenter: Failed to present the swapchain image");
+      REXLOG_ERROR("VulkanPresenter: Failed to present the swapchain image (VkResult {}); window: {}",
+                   int(present_result), WindowFailuresForLog());
       // The image is in an acquired state - but now, it will be in it forever.
       // To avoid that, recreate the swapchain - don't return just
       // kNotPresented.
