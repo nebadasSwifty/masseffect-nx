@@ -20,13 +20,13 @@ struct StencilCopyRegion {
   uint32_t x = 0, y = 0, width = 0, height = 0;  // destination texels
 };
 
-inline std::vector<StencilCopyRegion> PlanStencilCopyRegions(uint32_t pitch, uint32_t target_width,
-                                                             uint32_t target_height, uint32_t rect_x,
-                                                             uint32_t rect_y, uint32_t rect_width,
-                                                             uint32_t target_start, uint32_t count,
-                                                             bool merge_rows, uint64_t* merged = nullptr) {
-  std::vector<StencilCopyRegion> regions;
-  if (!pitch) return regions;
+// Fills `regions` (cleared first, capacity kept: the ring thread passes a reused vector).
+inline void PlanStencilCopyRegions(std::vector<StencilCopyRegion>& regions, uint32_t pitch, uint32_t target_width,
+                                   uint32_t target_height, uint32_t rect_x, uint32_t rect_y, uint32_t rect_width,
+                                   uint32_t target_start, uint32_t count, bool merge_rows,
+                                   uint64_t* merged = nullptr) {
+  regions.clear();
+  if (!pitch) return;
   for (uint32_t t = 0; t < count;) {
     const uint32_t tile = target_start + t, row = tile / pitch, col = tile % pitch;
     const uint32_t n = std::min(count - t, pitch - col);
@@ -50,6 +50,16 @@ inline std::vector<StencilCopyRegion> PlanStencilCopyRegions(uint32_t pitch, uin
     }
     regions.push_back(r);
   }
+}
+
+inline std::vector<StencilCopyRegion> PlanStencilCopyRegions(uint32_t pitch, uint32_t target_width,
+                                                             uint32_t target_height, uint32_t rect_x,
+                                                             uint32_t rect_y, uint32_t rect_width,
+                                                             uint32_t target_start, uint32_t count,
+                                                             bool merge_rows, uint64_t* merged = nullptr) {
+  std::vector<StencilCopyRegion> regions;
+  PlanStencilCopyRegions(regions, pitch, target_width, target_height, rect_x, rect_y, rect_width, target_start,
+                         count, merge_rows, merged);
   return regions;
 }
 

@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <string_view>
 
 using namespace rex::graphics;
 
@@ -61,7 +62,7 @@ int main() {
   me::native::NativeDrawExtentEstimator estimator(memory);
   me::native::NativeDrawExtentEstimator::Diagnostics d;
   auto estimate = estimator.Estimate(regs, original, &d);
-  if (!estimate) std::fprintf(stderr, "positive fixture rejected: %s\n", d.reason.c_str());
+  if (!estimate) std::fprintf(stderr, "positive fixture rejected: %s\n", d.reason);
   assert(estimate && *estimate == 440);
   for (uint32_t v = 0; v < 3; ++v) {
     assert(d.position[v][0] == axis[v][0] && d.position[v][1] == axis[v][1]);
@@ -82,23 +83,23 @@ int main() {
   padded[9] = 0x1FFFu;
   padded[10] = 0x1000u;
   assert(!estimator.Estimate(regs, padded, &d));
-  assert(d.reason == "non-inert-cf-padding");
+  assert(std::string_view(d.reason) == "non-inert-cf-padding");
 
   // Full float3 position fetch now reads unavailable W instead of setting W=1.
   // That component is not native-equivalent despite CPU zero initialization.
   auto mutated = original;
   mutated[10] = (mutated[10] & ~0xFFFu) | 0x688u;  // XYZ1 -> XYZW.
   assert(!estimator.Estimate(regs, mutated, &d));
-  if (d.reason != "position-undefined-fetch-components")
-    std::fprintf(stderr, "missing-W fixture reason: %s\n", d.reason.c_str());
-  assert(d.reason == "position-undefined-fetch-components");
+  if (std::string_view(d.reason) != "position-undefined-fetch-components")
+    std::fprintf(stderr, "missing-W fixture reason: %s\n", d.reason);
+  assert(std::string_view(d.reason) == "position-undefined-fetch-components");
 
   set_vertices({{{0, 0}, {100, 200}, {200, 0}}});
   assert(!estimator.Estimate(regs, original, &d));
-  assert(d.reason == "not-axis-aligned-corners");
+  assert(std::string_view(d.reason) == "not-axis-aligned-corners");
   set_vertices(axis);
   regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0] &= ~3u;
   assert(!estimator.Estimate(regs, original, &d));
-  assert(d.reason == "fetch-constant-type");
+  assert(std::string_view(d.reason) == "fetch-constant-type");
   std::puts("native SDK draw extent estimator: PASS");
 }
