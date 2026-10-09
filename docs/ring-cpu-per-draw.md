@@ -707,6 +707,25 @@ exact: same commands, same image, same log text (the keys and lines of the 10 s 
 | `edram4_depth_no_reasons_`, `edram4_stencil_no_reasons_`, `edram4_restore_no_`, `edram4_operations_`, `edram4_fetch_pairs_`, `edram4_import9_pairs_` (masseffect_native_targets.cpp) | `fmt::format` into a temporary `std::string` key (or a `std::string` built from a literal) for `map::operator[]` on every increment | `std::map<..., std::less<>>` + `DiagnosticAt` / `DiagnosticAtFormat`: the key is formatted into a 256-byte stack buffer and found as a `string_view`; a `std::string` is made only when a new key is inserted. `NoteFetchEDRAM4` takes the kind and its detail separately instead of a pre-formatted `"{kind}, {detail}"` string (same key text) | every declined redirected clear, every `RestoreTargetEDRAM4` decline, every EDRAM conversion (`EnsureCapacityConversionEDRAM4`), every late stencil fetch, every 9-pass import |
 | `extent_diagnostics_` (me_native_system.cpp) | `fmt::format` key + `unordered_set<std::string>::insert` on every extent-eligible draw until 32 distinct keys were seen (a location with fewer keys never saturates) | stack-buffer key and a transparent-hash `find` first; a `std::string` only for a new key (logged exactly as before) | every extent-eligible draw while the set has fewer than 32 keys |
 
+Second pass (audit of the Draw / PrepareDrawEDRAM4 / SynchronizeEDRAM4 paths), also unconditional and exact:
+
+| Where | What allocated | Now |
+|---|---|---|
+| `PrepareDrawEDRAM4`: `edram4_draw_desc_` (targets) | a new ~200-char `fmt::format` string per mode-4 draw while `edram4_traces_ < 60`; that counter only rises on 64+ tile transfers, so in practice on every draw | formatted into the member string's own buffer (`clear()` + `format_to`), capacity kept; same text |
+| `DrawImpl`: `rectangle_entry` (draws) | a local `VerticesEntry` copied from the entry (two vectors) on every rectangle-list (type 8) draw | reused member `rectangle_entry_`; copy-assignment keeps the capacity |
+| `EntryFor`: `entry_ = VerticesEntry{}` (draws) | dropped the vectors' capacity on every input-cache miss (every VS change once the cache holds 4096) | fields reset in place (same state) |
+| `SynchronizeEDRAM4`: `spans` | local vector per sync that records a transfer | member `edram4_sync_spans_` through `ScratchVectorEDRAM4` |
+| `CopyTilesEDRAM4`: `regions` | local `VkImageCopy` vector per copy | member scratch |
+| `CopyStencilEDRAM4`: `PlanStencilCopyRegions` + `regions` | a returned vector plus a local `VkBufferImageCopy` vector per stencil copy | out-parameter overload of `PlanStencilCopyRegions` (the returning one now wraps it; the CPU test passes unchanged) and member scratch |
+| `ImportColorDepthEDRAM4`: `rects` | local `VkClearRect` vector per stencil-only import | member scratch |
+| `CloseImportBatchEDRAM4`: `copies.swap(...)` | the swap with a fresh local freed the batch list's buffer each batch | swapped with a spare member that keeps its capacity |
+| `FailureEDRAM4`: key | `std::string` + 2 `std::to_string` + concatenations per failure | same `reason/target/source` text on the stack, transparent-hash lookup, `std::string` only for a new key |
+| `ForgetSynchronizedEDRAM4` (restore / create) | erased the view's 2048-entry version table (8 KB) and stencil-source table (32 KB); the next use allocated them again | zeroed in place; only `Destroy` erases. A zero version never matches (`SynchronizedEDRAM4` requires version != 0) and an empty source record is skipped by every reader, so a zeroed table answers exactly as a missing one |
+
+`ScratchVectorEDRAM4` moves the member out, clears it and moves it back on every exit, so a reentrant call gets an
+empty vector of its own instead of aliasing. The deferred-recording queue deep-copies the region arrays of the
+`vkCmd*` calls (the locals were already freed right after each call), so reusing the buffers is safe there too.
+
 ### H.2 `masseffect_native_edram_reuse_descriptor_sets` (new, default false, exact)
 
 The EDRAM conversions allocate one descriptor set per dispatch/pass from the work slot's pools
@@ -741,6 +760,8 @@ its sets once at start-up.
 
 - `edram4_transfer_pairs_` (2-4 strings per transfer span): `masseffect_native_edram4_pair_keys = true` in
   docs/best-config.md already removes it.
+- Gated by non-default cvars: the query maps (`masseffect_native_query_mode` 2/3), GPU labels
+  (`masseffect_native_gpu_labels`), the `WrittenStencilEDRAM4` erase (`masseffect_native_edram4_stencil_known`).
 - Bounded diagnostics (`LogVertexWordDiff`, the VS identity detail, missing-shader dumps, unpaired-draw lines): they
   run a fixed number of times per session.
 
@@ -752,6 +773,10 @@ its sets once at start-up.
 | `ProveRectangleList` | ~80 KB malloc + memcpy + free per multi-rectangle draw: ~10-20 us each on the A57 (the memcpy dominates), and the largest single source of heap fragmentation on this thread |
 | Region vectors | one malloc/free per redirected clear candidate |
 | Diagnostic maps | one malloc/free per counted decline / conversion / fetch / import whose key is longer than 15 chars |
+| `edram4_draw_desc_` | one ~200-byte malloc/free per mode-4 draw (the most frequent string allocation left on the thread) |
+| Rectangle entry, `entry_` reset | 2-4 allocations per rectangle-list draw / per input-cache miss |
+| Sync spans, copy/clear region lists, stencil copy plan, batch list | 1-3 malloc/free per EDRAM transfer span / copy / import |
+| `ForgetSynchronizedEDRAM4` | 8 KB + 32 KB free and re-allocation per restored target (about once per frame per swapped target) |
 | Descriptor reuse (cvar) | 2-3 malloc/free per EDRAM conversion |
 
 Together the profile's ~1.25-2.4 ms per frame of `_malloc_r` / `_free_r` / `_M_create` on the ring thread should

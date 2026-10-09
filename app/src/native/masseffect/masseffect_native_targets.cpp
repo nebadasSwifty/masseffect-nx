@@ -96,6 +96,22 @@ V& DiagnosticAtFormat(std::map<std::string, V, std::less<>>& m, fmt::format_stri
   fmt::vformat_to(fmt::appender(key), f.get(), fmt::make_format_args(args...));
   return DiagnosticAt(m, std::string_view(key.data(), key.size()));
 }
+
+// A per-call scratch vector kept in a member so its capacity survives between calls (a fresh local std::vector
+// per call was a malloc/free pair on the ring thread). The member is moved out, cleared, and moved back on every
+// exit, so a nested call of the same function just gets an empty vector of its own (no aliasing).
+template <typename T>
+struct ScratchVectorEDRAM4 {
+  std::vector<T>& slot;
+  std::vector<T> v;
+  explicit ScratchVectorEDRAM4(std::vector<T>& s) : slot(s), v(std::move(s)) { v.clear(); }
+  ~ScratchVectorEDRAM4() {
+    v.clear();
+    slot = std::move(v);
+  }
+  ScratchVectorEDRAM4(const ScratchVectorEDRAM4&) = delete;
+  ScratchVectorEDRAM4& operator=(const ScratchVectorEDRAM4&) = delete;
+};
 }  // namespace
 
 namespace masseffect::native {
@@ -4063,12 +4079,23 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     if (versions.empty()) versions.assign(2048, 0);
     versions[physical & 2047u] = version;
   }
-  void ForgetSynchronizedEDRAM4(const Image& view) {
-    edram4_views_.erase(&view);
+  // destroyed = false (content replaced, the view lives on): the view's 2048-entry version and stencil-source
+  // tables are zeroed in place instead of erased, so the next use does not allocate them again (8 KB + 32 KB
+  // per restore). A zero version never matches (SynchronizedEDRAM4 needs version != 0) and an empty source
+  // record is skipped everywhere, so a zeroed table answers exactly like a missing one. Destroy erases them.
+  void ForgetSynchronizedEDRAM4(const Image& view, bool destroyed = false) {
+    if (destroyed) {
+      edram4_views_.erase(&view);
+      edram4_stencil_source_.erase(&view);
+    } else {
+      if (const auto it = edram4_views_.find(&view); it != edram4_views_.end())
+        std::fill(it->second.begin(), it->second.end(), 0u);
+      if (const auto it = edram4_stencil_source_.find(&view); it != edram4_stencil_source_.end())
+        std::fill(it->second.begin(), it->second.end(), SourceStencil{});
+    }
     edram4_alias_1x_.erase(&view);
     for (auto it = edram4_consumer_.begin(); it != edram4_consumer_.end();)
       it = it->second.view == &view ? edram4_consumer_.erase(it) : std::next(it);
-    edram4_stencil_source_.erase(&view);
     WrittenStencilEDRAM4(view);  // masseffect_native_edram4_stencil_known: its content is replaced
     for (auto& [v, sources] : edram4_stencil_source_)
       for (auto& f : sources) if (f.image == &view) f = {};
@@ -4085,6 +4112,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     uint32_t tile_source, tile, count;
     bool native_msaa_import;
   };
+  std::vector<SpanEDRAM4> edram4_sync_spans_;  // SynchronizeEDRAM4 phase 1 (ScratchVectorEDRAM4)
   struct CopyStencilPending {
     Image* source;
     Image* target;
@@ -4317,8 +4345,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
              (uint32_t(image.edram_64bpp) << 9) | (uint32_t(image.edram_msaa_x) << 10) |
              (uint32_t(image.edram_msaa_y) << 11);
     };
-    const std::string key = std::string(reason) + "/" + std::to_string(class_value(target)) + "/" +
-                            std::to_string(source ? class_value(*source) : UINT32_MAX);
+    // Same key text as before ("reason/target/source"), built on the stack; a std::string only for a new key.
+    fmt::basic_memory_buffer<char, 256> key_buffer;
+    fmt::format_to(fmt::appender(key_buffer), "{}/{}/{}", reason, class_value(target),
+                   source ? class_value(*source) : UINT32_MAX);
+    const std::string_view key(key_buffer.data(), key_buffer.size());
     auto found = edram4_rejections_per_class_.find(key);
     if (found == edram4_rejections_per_class_.end()) {
       if (edram4_rejections_per_class_.size() >= 128) {
@@ -4328,7 +4359,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         }
         return false;
       }
-      found = edram4_rejections_per_class_.emplace(key, 0).first;
+      found = edram4_rejections_per_class_.emplace(std::string(key), 0).first;
     }
     if (++found->second <= 3) {
       REXLOG_WARN("[native] EDRAM mode4 REJECT {}: dest {:03X}/{} depth {} source {:03X}/{} depth {} "
@@ -4819,7 +4850,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       return (*versions_target)[physical & 2047u] == version;
     };
     // Phase 1 collects the runs (tile-row pieces) to transfer; phase 2 records them.
-    std::vector<SpanEDRAM4> spans;
+    ScratchVectorEDRAM4<SpanEDRAM4> spans_scratch(edram4_sync_spans_);
+    std::vector<SpanEDRAM4>& spans = spans_scratch.v;
     const bool lean = SyncLeanEDRAM4(clear_overwrite, clear_cutout);  // masseffect_native_edram4_sync_lean
     // Full-width areas are one contiguous span (a transfer run may cross rows, as before).
     const bool complete_width = has_range && range.tx0 == 0 && range.tx1 == range.pitch;
@@ -5138,7 +5170,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       if (draws_) draws_->NotifyGraphicsExternalState();
     }
     bool ok = true;
-    std::vector<CopyStencilPending> copies;
+    // The batch's list is swapped with an empty spare that keeps its capacity (a plain swap with a fresh local
+    // freed the list's buffer every batch, and the next batch allocated it again).
+    ScratchVectorEDRAM4<CopyStencilPending> copies_scratch(edram4_copies_stencil_spare_);
+    std::vector<CopyStencilPending>& copies = copies_scratch.v;
     copies.swap(edram4_batch_.copies_stencil);
     for (const auto& c : copies)
       if (!CopyStencilEDRAM4(*c.source, *c.target, c.source_start, c.target_start, c.count, c.scissor))
@@ -5161,7 +5196,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     if (!copy_image_) return false;
     const uint32_t tile_width = 80u >> (uint32_t(target.edram_64bpp) + target.edram_msaa_x);
     const uint32_t tile_height = 16u >> target.edram_msaa_y;
-    std::vector<VkImageCopy> regions;
+    ScratchVectorEDRAM4<VkImageCopy> regions_scratch(edram4_copy_tiles_regions_);
+    std::vector<VkImageCopy>& regions = regions_scratch.v;
     for (uint32_t i = 0; i < count; ++i) {
       const uint32_t so = source_start + i, sd = target_start + i;
       const uint32_t sx = (so % PitchTilesEDRAM(source)) * tile_width;
@@ -5299,20 +5335,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     return !w.edram_depth && w.edram_64bpp;
   }
   // Per-call region lists of the redirected clears, kept as members so their capacity survives between
-  // draws (a fresh std::vector per call was a malloc/free pair on the ring thread). A call moves the member
-  // out and back (ScratchVectorEDRAM4), so a nested call would just get an empty vector of its own.
-  template <typename T>
-  struct ScratchVectorEDRAM4 {
-    std::vector<T>& slot;
-    std::vector<T> v;
-    explicit ScratchVectorEDRAM4(std::vector<T>& s) : slot(s), v(std::move(s)) { v.clear(); }
-    ~ScratchVectorEDRAM4() {
-      v.clear();
-      slot = std::move(v);
-    }
-    ScratchVectorEDRAM4(const ScratchVectorEDRAM4&) = delete;
-    ScratchVectorEDRAM4& operator=(const ScratchVectorEDRAM4&) = delete;
-  };
+  // draws (a fresh std::vector per call was a malloc/free pair on the ring thread). See ScratchVectorEDRAM4.
   struct ClearDepthRegionEDRAM4 {
     Image* owner;
     uint32_t first_local, owner_local, count;
@@ -5324,6 +5347,12 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   struct ClearStencilRegionEDRAM4 { Image* owner; uint32_t first_local, owner_local, count; VkRect2D area; };
   std::vector<ClearDepthRegionEDRAM4> clear_depth_regions_edram4_;
   std::vector<ClearStencilRegionEDRAM4> clear_stencil_regions_edram4_;
+  // Scratch lists of CopyTilesEDRAM4, CopyStencilEDRAM4, ImportColorDepthEDRAM4 and CloseImportBatchEDRAM4.
+  std::vector<VkImageCopy> edram4_copy_tiles_regions_;
+  std::vector<me::native::StencilCopyRegion> edram4_stencil_copy_plan_;
+  std::vector<VkBufferImageCopy> edram4_stencil_copy_regions_;
+  std::vector<VkClearRect> edram4_import_clear_rects_;
+  std::vector<CopyStencilPending> edram4_copies_stencil_spare_;
 
   bool RedirectClearDepthEDRAM4(const SubmissionDraw& p) {
     if (!REXCVAR_GET(masseffect_native_edram4_redirected_clear) || !p.registers || !p.edram_overwrite_rect ||
@@ -6121,8 +6150,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         image->edram4_usa_stencil = true;  // from now on its imports carry stencil
         if (StencilDeferredEDRAM4(*image, 0, 2048)) ++edram4_stencil_late_;
       }
-      if (edram4_traces_ < 60)
-        edram4_draw_desc_ = fmt::format(
+      if (edram4_traces_ < 60) {
+        // Formatted into the member's own buffer (capacity kept): a new ~200-char std::string per mode-4 draw
+        // was a malloc/free pair on the ring thread (the trace count only rises on 64+ tile transfers).
+        edram4_draw_desc_.clear();
+        fmt::format_to(std::back_inserter(edram4_draw_desc_),
             "slot{} VS n{} PS n{} prim {} count {} dc {:08X} clip {:08X} vte {:08X} mask {:08X} blend0 {:08X} "
             "scissor {},{}+{}x{} overwrite {:X} est {}",
             slot, p.vs ? int(p.vs->number) : -1, p.ps ? int(p.ps->number) : -1,
@@ -6131,6 +6163,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
             r[gr::XE_GPU_REG_RB_BLENDCONTROL0], edram4_draw_area_.offset.x, edram4_draw_area_.offset.y,
             edram4_draw_area_.extent.width, edram4_draw_area_.extent.height, p.edram_overwrite_slots,
             p.edram_used_height_estimate ? int(*p.edram_used_height_estimate) : -1);
+      }
       edram4_stencil_replacement_.reset();
       if (slot == 0 && p.edram_stencil_replace_rect && REXCVAR_GET(masseffect_native_edram4_stencil_lazy)) {
         const auto& sr = *p.edram_stencil_replace_rect;
@@ -7997,11 +8030,14 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mid, 0, nullptr, 0, nullptr);
     // One region per tile-row run; with masseffect_native_edram4_stencil_copy_rows consecutive whole rows are
     // one region (me_stencil_copy_regions.h, tests/cpu/test_native_stencil_copy_regions.cpp).
-    std::vector<VkBufferImageCopy> regions;
-    for (const auto& p : me::native::PlanStencilCopyRegions(
+    ScratchVectorEDRAM4<me::native::StencilCopyRegion> plan_scratch(edram4_stencil_copy_plan_);
+    ScratchVectorEDRAM4<VkBufferImageCopy> regions_scratch(edram4_stencil_copy_regions_);
+    std::vector<VkBufferImageCopy>& regions = regions_scratch.v;
+    me::native::PlanStencilCopyRegions(plan_scratch.v,
              PitchTilesEDRAM(target), target.width, target.height, uint32_t(rect.offset.x),
              uint32_t(rect.offset.y), rect.extent.width, target_start, count,
-             REXCVAR_GET(masseffect_native_edram4_stencil_copy_rows), &edram4_stencil_rows_merged_)) {
+             REXCVAR_GET(masseffect_native_edram4_stencil_copy_rows), &edram4_stencil_rows_merged_);
+    for (const auto& p : plan_scratch.v) {
       VkBufferImageCopy r{};
       r.bufferOffset = VkDeviceSize(p.buffer_offset);
       r.bufferRowLength = rect.extent.width;
@@ -8257,7 +8293,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       clear.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
       // One rect per tile-row run: a multi-row range has a full-width scissor that also covers tiles
       // before/after the run, whose stencil must survive.
-      std::vector<VkClearRect> rects;
+      ScratchVectorEDRAM4<VkClearRect> rects_scratch(edram4_import_clear_rects_);
+      std::vector<VkClearRect>& rects = rects_scratch.v;
       const uint32_t dp = PitchTilesEDRAM(target);
       const uint32_t tw = 80u >> target.edram_msaa_x, th = 16u >> target.edram_msaa_y;
       for (uint32_t t = 0; t < count && dp;) {
@@ -10064,7 +10101,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   }
 
   void Destroy(Image& image) {
-    ForgetSynchronizedEDRAM4(image);
+    ForgetSynchronizedEDRAM4(image, true);
     // masseffect_native_lazy_front. A deferred copy cannot keep a destroyed image. If the texture is
     // what gets destroyed (GetResolved recreates it with another size or format), its content is lost
     // just as before: the copy is simply dropped. If it is the source (only at shutdown: render targets
@@ -11749,7 +11786,11 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   uint64_t edram4_imports_ = 0;
   uint64_t edram4_stencil_preserves_ = 0;
   uint64_t edram4_capacity_rollovers_ = 0, edram4_capacity_rollover_failures_ = 0;
-  std::unordered_map<std::string, uint32_t> edram4_rejections_per_class_;
+  struct StringHashEDRAM4 {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
+  };
+  std::unordered_map<std::string, uint32_t, StringHashEDRAM4, std::equal_to<>> edram4_rejections_per_class_;
   bool edram4_log_cap_ = false;
   bool edram4_operation_failed_ = false;
   bool import_depth_edram_failed_ = false, edram4_float_import_warned_ = false;

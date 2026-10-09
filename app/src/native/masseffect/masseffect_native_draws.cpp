@@ -3504,7 +3504,8 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       bytes_vertices += (required + 3) & ~VkDeviceSize(3);
     }
 
-    VerticesEntry rectangle_entry;
+    // Reused member (capacity kept): a local copy of the entry allocated its two vectors on every rectangle draw.
+    VerticesEntry& rectangle_entry = rectangle_entry_;
     std::array<std::vector<uint8_t>, 16>& data_rectangle = rectangle_data_;  // persistent (docs/memory-growth.md)
     static const bool audit_depth_rectangle = [] {
       const char* value = std::getenv("MASSEFFECT_NATIVE_AUDIT_DEPTH_RECTANGLE");
@@ -9299,7 +9300,12 @@ class DrawsVulkanImpl final : public DrawsVulkan {
         return entry_current_;
       }
     }
-    entry_ = VerticesEntry{};
+    // Reset in place (same state as VerticesEntry{}), keeping the vectors' capacity.
+    entry_.attributes.clear();
+    entry_.bindings.clear();
+    entry_.remaps = {};
+    entry_.specialization = 0;
+    entry_.fingerprint = 0;
     const uint64_t rejected_before = rejected_;
     const auto before_entry = std::chrono::steady_clock::now();
     const VerticesEntry* entry = ComputeEntry(p);
@@ -15179,6 +15185,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
   // grew beyond kRectangleKeepBytes are released at the end of the draw that needed them.
   static constexpr size_t kRectangleKeepBytes = size_t(4) << 20;
   std::array<std::vector<uint8_t>, 16> rectangle_data_;
+  VerticesEntry rectangle_entry_;  // DrawImpl: the expanded entry of a rectangle-list draw (capacity reused)
   bool rectangle_large_ = false;
   // Draws dropped because an allocation failed inside them (Draw's std::bad_alloc handler).
   uint64_t draws_dropped_memory_ = 0;
