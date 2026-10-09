@@ -24,6 +24,7 @@ struct Hook {
   const char* name;
   PPCFunc* orig;
   bool (*native)(PPCContext&, uint8_t*);  // false = declined: nothing was modified, the original must run
+  bool (*shadow)(PPCContext&, uint8_t*);  // the same native built with the shadow accessors (me_hot_shadow.cpp), guard only
   void (*writes)(const PPCContext&, const uint8_t*, Writes&);
   Cmp cmp;
   // Runtime state. Until the first call initialises it the zeros are harmless: kUninit goes to the slow path, and a
@@ -39,8 +40,10 @@ struct Hook {
 // switched on by masseffect_hot_guest, only by its own cvar (hooks added after the production toml enabled the umbrella).
 void InitHook(Hook& h, bool own, bool umbrella = true);
 
-// One guarded call: native on a copy of the registers with the written ranges snapshotted, rollback, original,
-// compare. Leaves the state exactly as the original would. Defined in me_hot_guest.cpp.
+// One guarded call: the shadow build of the native on a copy of the registers and a private copy of the declared write
+// ranges (no guest memory is written), then the original for real, then compare (me_hot_shadow.h). Leaves the state
+// exactly as the original would, and other guest threads never see anything the original would not write.
+// Defined in me_hot_guest.cpp.
 void Check(Hook& h, PPCContext& ctx, uint8_t* base);
 
 // Natives return void (always handle the call) or bool (false = decline this call, e.g. a rare input the native version
@@ -79,12 +82,16 @@ inline void Dispatch(Hook& h, uint32_t& n, PPCContext& ctx, uint8_t* base) {
 // Same, but masseffect_hot_guest does not switch it on: only its own cvar does.
 #define ME_HOT_HOOK_OWN(ADDR, CVAR, NS) ME_HOT_HOOK_IMPL(ADDR, CVAR, NS, false)
 
+// NS::ShadowNative is defined in me_hot_shadow.cpp (ME_HOT_SHADOW_NATIVE): every hooked NS must be listed there.
 #define ME_HOT_HOOK_IMPL(ADDR, CVAR, NS, UMBRELLA)                                                          \
+  namespace NS {                                                                                            \
+  bool ShadowNative(PPCContext&, uint8_t*);                                                                 \
+  }                                                                                                         \
   REX_EXTERN(__imp__sub_##ADDR);                                                                            \
   REX_HOOK_RAW(sub_##ADDR) {                                                                                \
     static thread_local uint32_t n_calls;                                                                   \
-    static me::hot::Hook h{"sub_" #ADDR, &__imp__sub_##ADDR, &me::hot::NativeB<&NS::Native>, &NS::Writes,  \
-                           NS::kCmp};                                                                       \
+    static me::hot::Hook h{"sub_" #ADDR, &__imp__sub_##ADDR, &me::hot::NativeB<&NS::Native>,               \
+                           &NS::ShadowNative, &NS::Writes, NS::kCmp};                                       \
     const uint8_t st = h.state.load(std::memory_order_relaxed);                                             \
     if (st == me::hot::kOn) [[likely]] {                                                                    \
       me::hot::Dispatch<&NS::Native>(h, n_calls, ctx, base);                                                \
