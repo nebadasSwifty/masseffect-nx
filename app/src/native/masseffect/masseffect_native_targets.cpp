@@ -48,6 +48,7 @@
 #include <rex/graphics/pipeline/texture/info.h>  // FormatInfo: masseffect_native_resolved_cpu_overwrite
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
+#include <fmt/format.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/vulkan/device.h>
@@ -67,6 +68,7 @@ extern "C" void RexSwitchPerfHitch(uint64_t start, uint64_t end);
 #include <cstring>
 #include <map>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -78,9 +80,33 @@ extern "C" bool MeResolutionOutputSize(uint32_t* w, uint32_t* h);  // me_resolut
 
 namespace gr = rex::graphics;
 
+namespace {
+// Diagnostics counters keyed by text (the 10 s report prints the keys in map order). The maps use std::less<> so a
+// key already present is found from a string_view: no std::string is built per increment on the ring thread, only
+// when a new key is inserted. Formatted keys are built in a 256-byte stack buffer (heap only past that).
+template <typename V>
+V& DiagnosticAt(std::map<std::string, V, std::less<>>& m, std::string_view key) {
+  auto it = m.find(key);
+  if (it == m.end()) it = m.emplace(std::string(key), V{}).first;
+  return it->second;
+}
+template <typename V, typename... Args>
+V& DiagnosticAtFormat(std::map<std::string, V, std::less<>>& m, fmt::format_string<Args...> f, Args&&... args) {
+  fmt::basic_memory_buffer<char, 256> key;
+  fmt::vformat_to(fmt::appender(key), f.get(), fmt::make_format_args(args...));
+  return DiagnosticAt(m, std::string_view(key.data(), key.size()));
+}
+}  // namespace
+
 namespace masseffect::native {
 bool CompareActiveFast();  // masseffect_native_draws.cpp: masseffect_native_compare_fast
 }
+REXCVAR_DEFINE_BOOL(masseffect_native_edram_reuse_descriptor_sets, false, "Mass Effect",
+                    "EDRAM conversions: keep the descriptor sets of each work slot's pools allocated and hand them out "
+                    "again after the slot's fence (each use rewrites them, as before), instead of resetting the pools "
+                    "per recording and allocating a set per conversion (NVK: a heap allocation per set and per reset "
+                    "on the ring thread). Same descriptors, same image. false = reset + allocate, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(masseffect_native_reuse_alloc_resolved, true, "Mass Effect",
                    "Reuse fence-safe resolved image allocations in experimental EDRAM mode 4; "
                    "discard all old contents before reuse. false = original fenced recreation");
@@ -769,6 +795,15 @@ struct SlotWork {
   VkDescriptorPool pool_conv_color_frag = VK_NULL_HANDLE;  // masseffect_native_conversion_frag
   // Copy-engine stencil import (Mass Effect mode 4): bytes computed into this buffer, then copied.
   VkDescriptorPool pool_stencil_copy = VK_NULL_HANDLE;
+  // masseffect_native_edram_reuse_descriptor_sets: the sets allocated from each pool above stay allocated and are
+  // handed out again (rewritten by the caller) after this slot's fence, instead of a pool reset per recording and
+  // a vkAllocateDescriptorSets (NVK: vk_object_zalloc + pool heap allocation) per conversion.
+  struct ReusedSetsEDRAM {
+    std::vector<VkDescriptorSet> sets;  // every set allocated from the pool since its last reset
+    size_t used = 0;                    // handed out in the current recording
+  };
+  ReusedSetsEDRAM sets_conversion_edram, sets_conversion_depth_edram, sets_import_depth_edram, sets_conv_color_frag,
+      sets_stencil_copy;
   VkBuffer buffer_stencil_copy = VK_NULL_HANDLE;
   VkDeviceMemory memory_stencil_copy = VK_NULL_HANDLE;
   uint32_t conversions_edram = 0;
@@ -3883,9 +3918,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   static constexpr uint32_t kRestoreConfidence = 2;
   uint64_t edram4_restore_draws_ = 0, edram4_restore_tiles_ = 0, edram4_restore_logged_ = 0;
   uint64_t edram4_restore_good_ = 0, edram4_restore_disabled_ = 0;
-  std::map<std::string, uint64_t> edram4_restore_no_;
+  std::map<std::string, uint64_t, std::less<>> edram4_restore_no_;
   uint64_t edram4_redirected_ = 0, edram4_redirected_tiles_ = 0, edram4_redirected_no_ = 0;
-  std::map<std::string, uint64_t> edram4_stencil_no_reasons_, edram4_depth_no_reasons_;
+  std::map<std::string, uint64_t, std::less<>> edram4_stencil_no_reasons_, edram4_depth_no_reasons_;
   uint64_t edram4_redirected_color_tiles_ = 0;
   // masseffect_native_edram4_clear_alias_raw64 (10 s report): whole tiles taken from a 64bpp color owner, and the
   // redirected clears that took at least one of them.
@@ -4080,7 +4115,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   uint64_t edram4_bits_skipped_ = 0;
   std::optional<VkRect2D> edram4_stencil_replacement_;  // raster rect whose stencil the current draw replaces
   uint64_t edram4_stencil_replaced_ = 0;
-  std::map<std::string, std::pair<uint64_t, uint64_t>> edram4_import9_pairs_;  // 9-pass imports: ops, tiles
+  std::map<std::string, std::pair<uint64_t, uint64_t>, std::less<>> edram4_import9_pairs_;  // 9-pass imports: ops, tiles
   bool edram4_draw_writes_depth_ = false;  // the draw being prepared writes depth (slot 0)
   // masseffect_native_resolve_repeat: the publish in progress changes only the stencil plane of a depth image.
   bool edram4_publish_stencil_only_ = false;
@@ -4117,7 +4152,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   uint64_t edram4_fetch_area_draws_ = 0, edram4_fetch_area_tiles_skipped_ = 0;
   uint64_t edram4_stencil_rows_merged_ = 0;
   // Late fetch report (any of the three section-10 cvars on): "source -> view kind" -> ops, tiles.
-  std::map<std::string, std::pair<uint64_t, uint64_t>> edram4_fetch_pairs_;
+  std::map<std::string, std::pair<uint64_t, uint64_t>, std::less<>> edram4_fetch_pairs_;
   void WrittenStencilEDRAM4(const Image& image) {
     if (!edram4_stencil_known_.empty()) edram4_stencil_known_.erase(&image);
   }
@@ -4141,11 +4176,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
            REXCVAR_GET(masseffect_native_edram4_stencil_fetch_area) ||
            REXCVAR_GET(masseffect_native_edram4_stencil_copy_rows);
   }
-  void NoteFetchEDRAM4(const Image& source, const Image& view, uint32_t count, const char* kind) {
-    auto& n = edram4_fetch_pairs_[fmt::format("{}{:03X}:{}x{}:mx{}my{}s{}->{:03X}:{}x{}:mx{}my{} {}",
+  // `detail`, when given, is appended to `kind` after ", " (the same key text as formatting both first).
+  void NoteFetchEDRAM4(const Image& source, const Image& view, uint32_t count, const char* kind,
+                       const char* detail = nullptr) {
+    auto& n = DiagnosticAtFormat(edram4_fetch_pairs_, "{}{:03X}:{}x{}:mx{}my{}s{}->{:03X}:{}x{}:mx{}my{} {}{}{}",
         source.edram_depth ? "D" : "C", source.edram_base, source.width, source.height, source.edram_msaa_x,
         source.edram_msaa_y, uint32_t(source.sample_count), view.edram_base, view.width, view.height,
-        view.edram_msaa_x, view.edram_msaa_y, kind)];
+        view.edram_msaa_x, view.edram_msaa_y, kind, detail ? ", " : "", detail ? detail : "");
     ++n.first;
     n.second += count;
   }
@@ -4227,7 +4264,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
         n >= uint32_t(REXCVAR_GET(masseffect_native_edram4_stencil_copy_min_tiles)) &&
         me::native::IsSingleSample(uint32_t(view.sample_count)) && view.accepts_target_of_copy &&
         !view.edram_msaa_x && !view.edram_msaa_y;
-    NoteFetchEDRAM4(source, view, n, fmt::format("{}, {}", kind, copy ? "copy engine" : "bit passes").c_str());
+    NoteFetchEDRAM4(source, view, n, kind, copy ? "copy engine" : "bit passes");
     return false;
   }
   // PrepareDrawEDRAM4's late fetch for a stencil-using draw on `image` (bound range [0, length)).
@@ -5261,12 +5298,39 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
   static bool Raw64ClearOwnerEDRAM4(const Image& w) {
     return !w.edram_depth && w.edram_64bpp;
   }
+  // Per-call region lists of the redirected clears, kept as members so their capacity survives between
+  // draws (a fresh std::vector per call was a malloc/free pair on the ring thread). A call moves the member
+  // out and back (ScratchVectorEDRAM4), so a nested call would just get an empty vector of its own.
+  template <typename T>
+  struct ScratchVectorEDRAM4 {
+    std::vector<T>& slot;
+    std::vector<T> v;
+    explicit ScratchVectorEDRAM4(std::vector<T>& s) : slot(s), v(std::move(s)) { v.clear(); }
+    ~ScratchVectorEDRAM4() {
+      v.clear();
+      slot = std::move(v);
+    }
+    ScratchVectorEDRAM4(const ScratchVectorEDRAM4&) = delete;
+    ScratchVectorEDRAM4& operator=(const ScratchVectorEDRAM4&) = delete;
+  };
+  struct ClearDepthRegionEDRAM4 {
+    Image* owner;
+    uint32_t first_local, owner_local, count;
+    VkRect2D area;
+    bool reassign;
+    VkRect2D area2{};  // a partial tile of a color owner can map to two rects (depth/color half-tile swap)
+    bool partial = false;
+  };
+  struct ClearStencilRegionEDRAM4 { Image* owner; uint32_t first_local, owner_local, count; VkRect2D area; };
+  std::vector<ClearDepthRegionEDRAM4> clear_depth_regions_edram4_;
+  std::vector<ClearStencilRegionEDRAM4> clear_stencil_regions_edram4_;
+
   bool RedirectClearDepthEDRAM4(const SubmissionDraw& p) {
     if (!REXCVAR_GET(masseffect_native_edram4_redirected_clear) || !p.registers || !p.edram_overwrite_rect ||
         !(p.edram_overwrite_slots & 1) || !draws_) return false;
     const auto no = [&](const char* reason) {
-      ++edram4_depth_no_reasons_[fmt::format("{} (depth info {:08X})", reason,
-                                             p.registers[gr::XE_GPU_REG_RB_DEPTH_INFO])];
+      ++DiagnosticAtFormat(edram4_depth_no_reasons_, "{} (depth info {:08X})", reason,
+                           p.registers[gr::XE_GPU_REG_RB_DEPTH_INFO]);
       return false;
     };
     if (!p.edram_overwrite_depth) return no("depth not proven constant");
@@ -5359,24 +5423,18 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     if (o[0] < 0 || o[1] < 0 || (!aligned && !partial_ok) ||
         uint32_t(o[2]) > drawn->width || uint32_t(o[3]) > drawn->height) {
       ++edram4_redirected_no_;
-      ++edram4_depth_no_reasons_[fmt::format("rect {},{}-{},{} not tile-aligned in {:03X}:{}x{}:mx{}my{}", o[0], o[1],
-                                             o[2], o[3], drawn->edram_base, drawn->width, drawn->height,
-                                             drawn->edram_msaa_x, drawn->edram_msaa_y)];
+      ++DiagnosticAtFormat(edram4_depth_no_reasons_, "rect {},{}-{},{} not tile-aligned in {:03X}:{}x{}:mx{}my{}",
+                           o[0], o[1], o[2], o[3], drawn->edram_base, drawn->width, drawn->height,
+                           drawn->edram_msaa_x, drawn->edram_msaa_y);
       return false;
     }
     const uint32_t pitch_tiles = PitchTilesEDRAM(*drawn);
     // Depth 0 is the all-zero 24-bit field in both D24S8 and D24FS8 (and 0 in every host encoding): another
     // depth encoding's owner can take the clear as is.
     const bool zero_depth = *p.edram_overwrite_depth == 0.0f && REXCVAR_GET(masseffect_native_edram4_clear_zero);
-    struct Region {
-      Image* owner;
-      uint32_t first_local, owner_local, count;
-      VkRect2D area;
-      bool reassign;
-      VkRect2D area2{};  // a partial tile of a color owner can map to two rects (depth/color half-tile swap)
-      bool partial = false;
-    };
-    std::vector<Region> regions;
+    using Region = ClearDepthRegionEDRAM4;
+    ScratchVectorEDRAM4<Region> regions_scratch(clear_depth_regions_edram4_);
+    std::vector<Region>& regions = regions_scratch.v;
     // Target of a tile: its current owner if that is another depth view; if the drawn view itself owns it
     // (or nobody does), the drawn view's known 1x alias, which then becomes the owner.
     const auto alias_it = edram4_alias_1x_.find(drawn);
@@ -5468,7 +5526,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
           Region region{};
           if (!PartialEDRAM4(*drawn, local, px0, px1, py0, py1, color_for, region)) {
             ++edram4_redirected_no_;
-            ++edram4_depth_no_reasons_["partial tile: owner unsupported"];
+            ++DiagnosticAt(edram4_depth_no_reasons_, "partial tile: owner unsupported");
             return false;
           }
           regions.push_back(region);
@@ -5486,13 +5544,15 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
              !zero_depth) ||
             !me::native::IsSingleSample(uint32_t(w->sample_count)))) {
           ++edram4_redirected_no_;
-          ++edram4_depth_no_reasons_[!w ? std::string("no target (no 1x alias)") : w == drawn
-              ? std::string("drawn view") : fmt::format("target {}{:03X}/f{}:{}x{}:mx{}my{} samples{} (clear of "
+          if (!w) ++DiagnosticAt(edram4_depth_no_reasons_, "no target (no 1x alias)");
+          else if (w == drawn) ++DiagnosticAt(edram4_depth_no_reasons_, "drawn view");
+          else
+            ++DiagnosticAtFormat(edram4_depth_no_reasons_, "target {}{:03X}/f{}:{}x{}:mx{}my{} samples{} (clear of "
                   "{:03X}/f{} mx{}my{} depth {} stencil {})",
                   w->edram_depth ? "D" : "C", w->edram_base, w->edram_format, w->width, w->height,
                   w->edram_msaa_x, w->edram_msaa_y, uint32_t(w->sample_count), drawn->edram_base,
                   drawn->edram_format, drawn->edram_msaa_x, drawn->edram_msaa_y, *p.edram_overwrite_depth,
-                  stencil_value)];
+                  stencil_value);
           return false;
         }
         const uint32_t wp = PitchTilesEDRAM(*w);
@@ -5631,8 +5691,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
       return false;
     }
     const uint32_t pitch_tiles = PitchTilesEDRAM(*drawn);
-    struct Region { Image* owner; uint32_t first_local, owner_local, count; VkRect2D area; };
-    std::vector<Region> regions;
+    using Region = ClearStencilRegionEDRAM4;
+    ScratchVectorEDRAM4<Region> regions_scratch(clear_stencil_regions_edram4_);
+    std::vector<Region>& regions = regions_scratch.v;
     for (uint32_t ty = uint32_t(o[1]) / th; ty < uint32_t(o[3]) / th; ++ty) {
       for (uint32_t tx = uint32_t(o[0]) / tw; tx < uint32_t(o[2]) / tw;) {
         const uint32_t local = ty * pitch_tiles + tx;
@@ -5644,10 +5705,12 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
             w->image == drawn->image || !w->prepared || w->invalid_content ||
             !me::native::IsSingleSample(uint32_t(w->sample_count))) {
           ++edram4_stencil_redirected_no_;
-          ++edram4_stencil_no_reasons_[!w ? std::string("no owner") : w == drawn ? std::string("drawn view owns")
-              : fmt::format("owner {}{:03X}/f{}:{}x{}:mx{}my{} samples{}", w->edram_depth ? "D" : "C",
-                            w->edram_base, w->edram_format, w->width, w->height, w->edram_msaa_x, w->edram_msaa_y,
-                            uint32_t(w->sample_count))];
+          if (!w) ++DiagnosticAt(edram4_stencil_no_reasons_, "no owner");
+          else if (w == drawn) ++DiagnosticAt(edram4_stencil_no_reasons_, "drawn view owns");
+          else
+            ++DiagnosticAtFormat(edram4_stencil_no_reasons_, "owner {}{:03X}/f{}:{}x{}:mx{}my{} samples{}",
+                                 w->edram_depth ? "D" : "C", w->edram_base, w->edram_format, w->width, w->height,
+                                 w->edram_msaa_x, w->edram_msaa_y, uint32_t(w->sample_count));
           return false;
         }
         const uint32_t wp = PitchTilesEDRAM(*w);
@@ -5754,7 +5817,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
    * the last two conditions), so the published tiles are stamped and the next consumer is learned.
    */
   Image* RestoreTargetEDRAM4(const SubmissionDraw& p, Image& image, uint32_t slot, uint32_t info, uint32_t pitch) {
-    const auto no = [&](const char* why) -> Image* { ++edram4_restore_no_[why]; return nullptr; };
+    const auto no = [&](const char* why) -> Image* { ++DiagnosticAt(edram4_restore_no_, why); return nullptr; };
     if (image.edram_depth || image.edram_64bpp || image.edram_format != 2 || !p.ps || !p.registers) return nullptr;
     const uint32_t* r = p.registers;
     const uint32_t i = slot - 1;
@@ -6564,7 +6627,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     reserve.descriptorPool = slot.pool_conversion_edram;
     reserve.descriptorSetCount = 1;
     reserve.pSetLayouts = &layout_conversion_edram_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_conversion_edram, reserve, set)) return false;
     ++slot.conversions_edram;
     const VkDescriptorImageInfo images[2] = {{VK_NULL_HANDLE, owner.view, VK_IMAGE_LAYOUT_GENERAL},
                                              {VK_NULL_HANDLE, target.view, VK_IMAGE_LAYOUT_GENERAL}};
@@ -7200,7 +7263,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     reserve.descriptorPool = slot.pool_conv_color_frag;
     reserve.descriptorSetCount = 1;
     reserve.pSetLayouts = &layout_conv_color_frag_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_conv_color_frag, reserve, set)) return false;
     ++slot.conversions_edram;
     VkDescriptorImageInfo sampled{sampler_depth_edram_, owner.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -7276,7 +7339,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     reserve.descriptorPool = slot.pool_conv_color_frag;
     reserve.descriptorSetCount = 1;
     reserve.pSetLayouts = &layout_conv_color_frag_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_conv_color_frag, reserve, set)) return false;
     ++slot.conversions_edram;
     VkDescriptorImageInfo sampled{sampler_depth_edram_, source.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -7357,7 +7420,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     reserve.descriptorPool = slot.pool_conv_color_frag;
     reserve.descriptorSetCount = 1;
     reserve.pSetLayouts = &layout_conv_color_frag_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_conv_color_frag, reserve, set)) return false;
     ++slot.conversions_edram;
     VkDescriptorImageInfo sampled{sampler_depth_edram_, source.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -7422,7 +7485,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     reserve.descriptorPool = slot.pool_conversion_edram;
     reserve.descriptorSetCount = 1;
     reserve.pSetLayouts = &layout_conversion_edram_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_conversion_edram, reserve, set)) return false;
     ++slot.conversions_edram;
     const VkDescriptorImageInfo images[2] = {
         {VK_NULL_HANDLE, source.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -7896,7 +7959,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     alloc.descriptorPool = slot.pool_stencil_copy;
     alloc.descriptorSetCount = 1;
     alloc.pSetLayouts = &layout_stencil_copy_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &alloc, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_stencil_copy, alloc, set)) return false;
     const VkDescriptorImageInfo img{sampler_depth_edram_, view_source, VK_IMAGE_LAYOUT_GENERAL};
     const VkDescriptorBufferInfo buf{slot.buffer_stencil_copy, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet w[2]{};
@@ -8039,7 +8102,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     allocate.descriptorPool = slot.pool_import_depth_edram;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &layout_import_depth_edram_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &allocate, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_import_depth_edram, allocate, set)) return false;
     ++slot.conversions_edram;
     ViewsDepthEDRAM* depth_views = source_depth ? GetViewsDepthEDRAM4(source) : nullptr;
     if (source_depth && !depth_views) return false;
@@ -8210,10 +8273,10 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     }
     if (steps > 1) {
       MarkGpu(kGpuEdramImport9);
-      auto& n = edram4_import9_pairs_[fmt::format("{}{:03X}:{}x{}:mx{}my{}->{:03X}:{}x{}:mx{}my{}{}",
+      auto& n = DiagnosticAtFormat(edram4_import9_pairs_, "{}{:03X}:{}x{}:mx{}my{}->{:03X}:{}x{}:mx{}my{}{}",
           source.edram_depth ? "D" : "C", source.edram_base, source.width, source.height, source.edram_msaa_x,
           source.edram_msaa_y, target.edram_base, target.width, target.height, target.edram_msaa_x,
-          target.edram_msaa_y, StencilDeferredEDRAM4(source, source_start, count) ? " deferred" : "")];
+          target.edram_msaa_y, StencilDeferredEDRAM4(source, source_start, count) ? " deferred" : "");
       ++n.first;
       n.second += count;
     }
@@ -8309,7 +8372,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     allocate.descriptorPool = slot.pool_conversion_depth_edram;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &layout_conversion_depth_edram_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &allocate, &set) != VK_SUCCESS)
+    if (!AllocateSetEDRAM(slot.sets_conversion_depth_edram, allocate, set))
       return FailureEDRAM4("guestspace resolve descriptor allocation failed", target, &source);
     ++slot.conversions_edram;
     VkDescriptorImageInfo images[2] = {
@@ -8375,7 +8438,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     allocate.descriptorPool = slot.pool_conversion_depth_edram;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &layout_conversion_depth_edram_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &allocate, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_conversion_depth_edram, allocate, set)) return false;
     ++slot.conversions_edram;
     VkDescriptorImageInfo images[3] = {
         {sampler_depth_edram_, views->depth, VK_IMAGE_LAYOUT_GENERAL},
@@ -8733,7 +8796,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     reserve.descriptorPool = slot.pool_conv_color_frag;
     reserve.descriptorSetCount = 1;
     reserve.pSetLayouts = &layout_conv_color_frag_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) return false;
+    if (!AllocateSetEDRAM(slot.sets_conv_color_frag, reserve, set)) return false;
     ++slot.conversions_edram;
     VkDescriptorImageInfo sampled{sampler_depth_edram_, view_source, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -8941,7 +9004,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     reserve.descriptorPool = slot.pool_conversion_edram;
     reserve.descriptorSetCount = 1;
     reserve.pSetLayouts = &layout_conversion_edram_;
-    if (dfn_.vkAllocateDescriptorSets(device_, &reserve, &set) != VK_SUCCESS) {
+    if (!AllocateSetEDRAM(slot.sets_conversion_edram, reserve, set)) {
       return false;
     }
     ++slot.conversions_edram;
@@ -10131,7 +10194,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
 
   // All three descriptor pools share this budget. Never reset a live pool or
   // retain a slot reference / descriptor allocation across submission rotation.
-  std::map<std::string, uint64_t> edram4_operations_;  // ME: mode-4 operations per kind since the last report
+  std::map<std::string, uint64_t, std::less<>> edram4_operations_;  // ME: mode-4 operations per kind since the last report
   bool EnsureCapacityConversionEDRAM4(const char* operation) {
     if (REXCVAR_GET(masseffect_native_edram_alias_mode) != 4)
       return slots_[slot_].conversions_edram < kConversionsEDRAMPerSlot;
@@ -10139,7 +10202,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     // submit and rotate the slot. Also avoids recursive submit in BeforeSend.
     if (draws_) draws_->FinishPass();
     if (!Record()) return false;
-    ++edram4_operations_[operation];
+    ++DiagnosticAt(edram4_operations_, operation);
     // ME: the conversion's GPU time, by kind (until the next pass marks its own category).
     MarkGpu(std::strcmp(operation, "depth import") == 0   ? kGpuEdramImport
               : std::strcmp(operation, "depth export") == 0 ? kGpuEdramExport
@@ -10174,6 +10237,23 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     return recording;
   }
 
+  bool reuse_sets_edram_ = false;  // masseffect_native_edram_reuse_descriptor_sets, read at each BeginRecording
+  // A descriptor set of `info.pSetLayouts[0]` from `info.descriptorPool` (one pool per layout; `reused` is that
+  // pool's list). The caller rewrites every binding it uses, as after a fresh allocation.
+  bool AllocateSetEDRAM(SlotWork::ReusedSetsEDRAM& reused, const VkDescriptorSetAllocateInfo& info,
+                        VkDescriptorSet& set) {
+    if (reused.used < reused.sets.size()) {
+      set = reused.sets[reused.used++];
+      return true;
+    }
+    if (dfn_.vkAllocateDescriptorSets(device_, &info, &set) != VK_SUCCESS) return false;
+    if (reuse_sets_edram_) {
+      reused.sets.push_back(set);
+      reused.used = reused.sets.size();
+    }
+    return true;
+  }
+
   bool BeginRecording() {
     // Slots rotate: while one frame is recorded, the previous ones can still be on the GPU. It only waits
     // if this slot's last submission has not finished yet, so the more slots there are, the further ahead
@@ -10184,12 +10264,24 @@ const std::array<std::pair<const uint32_t*, size_t>, 14> codes_conversion{{
     if (resolved_pool_device_error_) return false;
     dfn_.vkResetCommandPool(device_, slot.pool_work, 0);
     dfn_.vkResetCommandPool(device_, slot.pool_upload, 0);
-    dfn_.vkResetDescriptorPool(device_, slot.pool_conversion_edram, 0);
-    dfn_.vkResetDescriptorPool(device_, slot.pool_conversion_depth_edram, 0);
-    if (slot.pool_import_depth_edram)
-      dfn_.vkResetDescriptorPool(device_, slot.pool_import_depth_edram, 0);
-    if (slot.pool_conv_color_frag) dfn_.vkResetDescriptorPool(device_, slot.pool_conv_color_frag, 0);
-    if (slot.pool_stencil_copy) dfn_.vkResetDescriptorPool(device_, slot.pool_stencil_copy, 0);
+    // The slot's fence has passed (Complete): none of its descriptor sets is in use any more. Either reset the
+    // pools (default) or keep their sets for reuse (masseffect_native_edram_reuse_descriptor_sets). A pool whose
+    // sets are not all tracked (first use, or the switch was off) is reset once, so in reuse mode every set
+    // allocated from a pool is in its list and the pool fills up at exactly the same allocation as with resets.
+    reuse_sets_edram_ = REXCVAR_GET(masseffect_native_edram_reuse_descriptor_sets);
+    const auto renew = [&](VkDescriptorPool pool, SlotWork::ReusedSetsEDRAM& reused) {
+      if (!pool) return;
+      if (!reuse_sets_edram_ || reused.sets.empty()) {
+        dfn_.vkResetDescriptorPool(device_, pool, 0);
+        reused.sets.clear();
+      }
+      reused.used = 0;
+    };
+    renew(slot.pool_conversion_edram, slot.sets_conversion_edram);
+    renew(slot.pool_conversion_depth_edram, slot.sets_conversion_depth_edram);
+    renew(slot.pool_import_depth_edram, slot.sets_import_depth_edram);
+    renew(slot.pool_conv_color_frag, slot.sets_conv_color_frag);
+    renew(slot.pool_stencil_copy, slot.sets_stencil_copy);
     slot.conversions_edram = 0;
     commands_work_ = slot.work;
     commands_upload_ = slot.upload;

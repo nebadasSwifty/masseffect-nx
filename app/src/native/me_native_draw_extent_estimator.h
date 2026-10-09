@@ -21,7 +21,9 @@ namespace me::native {
 class NativeDrawExtentEstimator {
  public:
   struct Diagnostics {
-    std::string reason;
+    // Always a string literal (static storage): assigning a std::string here cost a heap allocation per
+    // estimate on the ring thread ("axis-aligned-sdk-estimate" is past the SSO limit).
+    const char* reason = "";
     std::array<std::array<float, 4>, 3> position{};
     // x/y of `position` are already raster space (the viewport transform was applied here); z/w are raw.
     bool xy_raster = false;

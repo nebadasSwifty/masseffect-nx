@@ -40,6 +40,8 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <string_view>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -47,6 +49,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <fmt/format.h>
 #include <rex/memory/utils.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/kernel_state.h>
@@ -2613,9 +2616,21 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // (xenia's "spurious ownership transfer round trips"; here the shadow maps and the scene share EDRAM).
   void ProveRectangleList(masseffect::native::SubmissionDraw& request, uint32_t rects) {
     if (!request.ps) return;
-    std::vector<uint32_t> regs(registers_);
+    // The two per-rectangle registers are patched in the live register file and restored on every exit
+    // (as the predicated-draw path does with VGT_DRAW_INITIATOR): copying the whole file (~80 KB malloc +
+    // memcpy + free) per call showed up as _malloc_r/_free_r on the ring thread. Only Estimate reads them
+    // here; Register() below reads other registers, and nothing else runs on this thread meanwhile.
+    std::vector<uint32_t>& regs = registers_;
     const uint32_t initiator = regs[kRegVgtDrawInitiator];
     const uint32_t offset = regs[rex::graphics::XE_GPU_REG_VGT_INDX_OFFSET];
+    struct Restore {
+      std::vector<uint32_t>& r;
+      uint32_t initiator, offset;
+      ~Restore() {
+        r[kRegVgtDrawInitiator] = initiator;
+        r[rex::graphics::XE_GPU_REG_VGT_INDX_OFFSET] = offset;
+      }
+    } restore{regs, initiator, offset};
     regs[kRegVgtDrawInitiator] = (initiator & 0xFFFFu) | (3u << 16);
     std::optional<std::array<int32_t, 4>> best, bounds;
     int64_t best_area = -1;
@@ -3072,11 +3087,16 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                         request.edram_stencil_clear.length_tiles, request.edram_stencil_clear.stencil_reference);
         }
         if (extent_diagnostics_.size() < 32) {
-          const std::string key = fmt::format("{:X}/{:X}/{}/{}/{}", current_vs_hash_,
+          // Key built on the stack and looked up as a string_view: a std::string is made only for a new key (the
+          // set may never reach 32 keys, and then this ran on every extent-eligible draw).
+          fmt::basic_memory_buffer<char, 128> key_buffer;
+          fmt::format_to(fmt::appender(key_buffer), "{:X}/{:X}/{}/{}/{}", current_vs_hash_,
               Register(rex::graphics::XE_GPU_REG_RB_DEPTH_INFO),
               Register(rex::graphics::XE_GPU_REG_RB_SURFACE_INFO),
               request.edram_used_height_estimate.value_or(UINT32_MAX), diagnostic.reason);
-          if (extent_diagnostics_.insert(key).second)
+          const std::string_view key(key_buffer.data(), key_buffer.size());
+          if (extent_diagnostics_.find(key) == extent_diagnostics_.end() &&
+              extent_diagnostics_.emplace(key).second)
             REXLOG_INFO("[native] bounded draw extent: code={:016X} VS={} depth={:08X} surface={:08X} "
                         "accepted={} maxY={} reason={} format={} postVS=[{},{},{},{}; {},{},{},{}; {},{},{},{}]",
                         current_vs_hash_, request.vs->number,
@@ -3666,7 +3686,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t shaders_by_code_ = 0, draws_paired_ = 0, draws_unpaired_ = 0;
   uint64_t native_draw_attempts_ = 0, native_draw_failures_ = 0;
   std::unique_ptr<NativeDrawExtentEstimator> draw_extent_estimator_;
-  std::unordered_set<std::string> extent_diagnostics_;
+  struct StringHashTransparent {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
+  };
+  std::unordered_set<std::string, StringHashTransparent, std::equal_to<>> extent_diagnostics_;
   uint32_t stencil_clear_diagnostics_ = 0;
   uint64_t native_copy_attempts_ = 0, native_copy_failures_ = 0;
   uint32_t logged_unpaired_ = 0;

@@ -689,3 +689,75 @@ Change (same cvar, still default 0):
 - Report: `clean+CHANGED X (of stable eligible textures Y; textures exempted Z)`. Y is what could have been shown
   late and must stay 0. On g1_a's data Y would have been 0: all 2,514 cases were on linear planes that are never
   confirmed.
+
+## Heap allocations on the ring thread (2026-10-09)
+
+Profile finding: the GPU ring thread spent ~1.3-3.3 % in `_free_r`, 1-1.9 % in `_malloc_r` and ~1 % in
+`std::string::_M_create`, about 1.25-2.4 ms per frame. The churn also fragments the newlib heap, which is what ended
+earlier runs in out-of-memory crashes (docs/memory-growth.md). Branch `perf/ring-no-alloc`. Everything below is
+exact: same commands, same image, same log text (the keys and lines of the 10 s reports are byte-identical).
+
+### H.1 Changed unconditionally (pure refactors, no cvar)
+
+| Where | What allocated | Now | How often it ran |
+|---|---|---|---|
+| `NativeDrawExtentEstimator::Diagnostics::reason` (me_native_draw_extent_estimator.h) | a `std::string`; `"axis-aligned-sdk-estimate"` (25 chars) is past the 15-char SSO, so every accepted estimate allocated and the `Diagnostics` destructor freed it (me_native_system.cpp, end of the extent block) | `const char*` to the string literal (every assignment was a literal) | every extent-eligible draw and every rectangle of `ProveRectangleList` |
+| `ProveRectangleList` (me_native_system.cpp) | `std::vector<uint32_t> regs(registers_)`: the whole register file, ~0x5003 words = ~80 KB malloc + memcpy + free per call | the two per-rectangle registers (`VGT_DRAW_INITIATOR`, `VGT_INDX_OFFSET`) are patched in `registers_` and restored by a scope guard on every return, as the predicated-draw path already does for `VGT_DRAW_INITIATOR`. Nothing else in the loop reads those two registers (`Register()` calls and `ProveFullOverwrite` read others), and the ring thread is the only writer of draw registers | every multi-rectangle (RectangleList, >3 vertices) draw with a PS |
+| `RedirectClearDepthEDRAM4` / `RedirectClearStencilEDRAM4` (masseffect_native_targets.cpp) | a local `std::vector<Region>` per call | member vectors (`clear_depth_regions_edram4_`, `clear_stencil_regions_edram4_`) borrowed through `ScratchVectorEDRAM4` (moved out, cleared, moved back on every exit; a nested call would just get an empty vector of its own) | every proven clear candidate in mode 4 |
+| `edram4_depth_no_reasons_`, `edram4_stencil_no_reasons_`, `edram4_restore_no_`, `edram4_operations_`, `edram4_fetch_pairs_`, `edram4_import9_pairs_` (masseffect_native_targets.cpp) | `fmt::format` into a temporary `std::string` key (or a `std::string` built from a literal) for `map::operator[]` on every increment | `std::map<..., std::less<>>` + `DiagnosticAt` / `DiagnosticAtFormat`: the key is formatted into a 256-byte stack buffer and found as a `string_view`; a `std::string` is made only when a new key is inserted. `NoteFetchEDRAM4` takes the kind and its detail separately instead of a pre-formatted `"{kind}, {detail}"` string (same key text) | every declined redirected clear, every `RestoreTargetEDRAM4` decline, every EDRAM conversion (`EnsureCapacityConversionEDRAM4`), every late stencil fetch, every 9-pass import |
+| `extent_diagnostics_` (me_native_system.cpp) | `fmt::format` key + `unordered_set<std::string>::insert` on every extent-eligible draw until 32 distinct keys were seen (a location with fewer keys never saturates) | stack-buffer key and a transparent-hash `find` first; a `std::string` only for a new key (logged exactly as before) | every extent-eligible draw while the set has fewer than 32 keys |
+
+### H.2 `masseffect_native_edram_reuse_descriptor_sets` (new, default false, exact)
+
+The EDRAM conversions allocate one descriptor set per dispatch/pass from the work slot's pools
+(`pool_conversion_edram`, `pool_conversion_depth_edram`, `pool_import_depth_edram`, `pool_conv_color_frag`,
+`pool_stencil_copy`; 11 call sites), and `TargetsVulkan::BeginRecording` resets all five pools each time the slot is
+reused. In NVK every `vkAllocateDescriptorSets` is a `vk_object_zalloc` plus a pool heap allocation, and the reset
+frees them all: two to three malloc/free pairs per conversion (~65 transfer spans per Normandy frame, more with
+imports).
+
+With the switch, each pool keeps the list of the sets allocated from it. `BeginRecording` (after `Complete(slot)`,
+i.e. after the slot's fence, which is when the reset was legal too) only rewinds the list, and `AllocateSetEDRAM`
+hands out the next listed set before allocating a new one. Why it is exact:
+- Each pool serves exactly one set layout, so a reused set always has the requested layout.
+- Every call site rewrites the bindings it uses with `vkUpdateDescriptorSets` right after the allocation, as before.
+  Two sites write fewer bindings than the layout has (stencil import with a color source: 1 of 2; the guestspace
+  depth resolve: 2 of 3); after a fresh allocation those bindings were undefined, now they hold an older valid
+  descriptor. The shaders of those paths never declare them: `me_edram_color_to_depth.frag` and
+  `me_edram_raw64_to_depth.frag` use binding 0 only, `me_depth_resolve_guestspace(_msaa2).comp` bindings 0-1.
+- In reuse mode every set allocated from a pool is in its list (a pool whose list is empty, i.e. its first use, is
+  still reset), so the k-th allocation of a recording fails exactly when it failed with resets (k > maxSets = 256),
+  and `EnsureCapacityConversionEDRAM4` caps the conversions per slot below that anyway.
+- With `masseffect_native_deferred_recording`, `vkResetDescriptorPool` was a drain point; `vkResetCommandPool` in the
+  same `BeginRecording` drains anyway, so the queue behaves the same. `vkUpdateDescriptorSets` (queued or not) runs
+  after the slot's fence in both modes.
+- The switch is read at every `BeginRecording`; off resets the pools and empties the lists (as before).
+
+Expected: the per-conversion `vk_object_zalloc`/pool allocation and the per-recording reset frees go away, about
+2-4 us per conversion on the A57, ~0.15-0.3 ms per heavy frame. The draws side (`DrawsVulkanImpl`) already allocates
+its sets once at start-up.
+
+### H.3 Not changed
+
+- `edram4_transfer_pairs_` (2-4 strings per transfer span): `masseffect_native_edram4_pair_keys = true` in
+  docs/best-config.md already removes it.
+- Bounded diagnostics (`LogVertexWordDiff`, the VS identity detail, missing-shader dumps, unpaired-draw lines): they
+  run a fixed number of times per session.
+
+### H.4 Expected savings and console check
+
+| Change | Saves |
+|---|---|
+| `Diagnostics::reason` | one malloc/free pair per extent estimate (each extent-eligible draw, each proven rectangle) |
+| `ProveRectangleList` | ~80 KB malloc + memcpy + free per multi-rectangle draw: ~10-20 us each on the A57 (the memcpy dominates), and the largest single source of heap fragmentation on this thread |
+| Region vectors | one malloc/free per redirected clear candidate |
+| Diagnostic maps | one malloc/free per counted decline / conversion / fetch / import whose key is longer than 15 chars |
+| Descriptor reuse (cvar) | 2-3 malloc/free per EDRAM conversion |
+
+Together the profile's ~1.25-2.4 ms per frame of `_malloc_r` / `_free_r` / `_M_create` on the ring thread should
+mostly go (the rest is in NVK command recording and texture creation). Console check: the same tour with and
+without the branch (and then with `masseffect_native_edram_reuse_descriptor_sets = true`): the ring thread's
+`_malloc_r` / `_free_r` / `_M_create` share in profile.log, ring CPU % and fps in the heavy Normandy and Feros
+windows, `heap` largest-free-block lines (fragmentation), and captures, which must be identical. The 10 s report
+lines (`declined by`, `late stencil fetches`, `9-pass`, `operations`, `bounded draw extent`) must have the same
+text.
