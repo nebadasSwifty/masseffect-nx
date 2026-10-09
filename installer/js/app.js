@@ -1,15 +1,16 @@
 // The page: picks the source, shows the detected edition, runs the pipeline with progress.
-import { CONFIG } from '../config.js?v=0.3.2';
-import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc, auditPackages, classifyAudit, knownBadFor } from './source.js?v=0.3.2';
+import { CONFIG } from '../config.js?v=0.3.3';
+import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc, auditPackages, classifyAudit, knownBadFor } from './source.js?v=0.3.3';
 import { planGameFiles, formatBytes } from './plan.js';
 import { openSink, describeSinkSupport, cleanStaleTemporaryFiles } from './sink.js';
 import { run, Cancelled, UserError, stageIds, stagesFor } from './pipeline.js';
-import { initLanguage, getLanguage, setLanguage, t } from './i18n.js?v=0.3.2';
+import { initLanguage, getLanguage, setLanguage, t } from './i18n.js?v=0.3.3';
 import {
   parseProdKeys, forgetKeys, estimateNspBytes, estimateProgramUpdateBytes, parseBaseMetadata, nextUpdateVersion,
   withLastUpdateVersion, pythonJson, inspectBaseNsp, PartsReader,
 } from './nsp.js';
 import { openNspSink, nspSinkSupport, saveTextFile } from './nsp_sink.js';
+import { findPermittedSwitch, requestSwitch, WebUsbTransport, USB_VENDOR_ID, USB_PRODUCT_ID } from './usb_install.js';
 import { openStfs, verifyStfs } from './stfs.js';
 
 const $ = (id) => document.getElementById(id);
@@ -28,7 +29,11 @@ const STAGE_KEYS = {
   nsp_base: 'stage_nsp_base',
   nsp_hash: 'stage_nsp_hash',
   nsp_write: 'stage_nsp_write',
+  nsp_usb: 'stage_nsp_usb',
 };
+// A USB install has three passes; its first two stages say so.
+const STAGE_KEYS_USB = { nsp_hash: 'stage_nsp_hash_usb', nsp_write: 'stage_nsp_write_usb' };
+const stageName = (id) => t((state.usbRun && STAGE_KEYS_USB[id]) || STAGE_KEYS[id] || id);
 
 // outcome: null | 'ok' | 'err' | 'cancelled' (last run of step 4, drives the step indicator).
 const state = {
@@ -81,7 +86,7 @@ function applyLanguage() {
   renderDlc();
   renderNsp();
   updateWizard();
-  if (state.running) for (const id of state.stages) if (rows[id]) rows[id].name.textContent = t(STAGE_KEYS[id] || id);
+  if (state.running) for (const id of state.stages) if (rows[id]) rows[id].name.textContent = stageName(id);
 }
 
 // ---- step indicator --------------------------------------------------------------------------------------------
@@ -504,10 +509,9 @@ function setButtons(enabled) {
   $('create-update').disabled = !ok;
   const n = state.nsp;
   const support = nspSinkSupport();
-  const canFull = n.out === 'split' ? support.split : support.file;
-  $('create-nsp').disabled = !(ok && n.keys && canFull);
+  $('create-nsp').disabled = !(ok && n.keys && canWriteFull(n.out, support));
   $('create-nsp-update').disabled = !(ok && n.keys && n.base && updateVersion());
-  for (const id of ['nsp-keys-pick', 'nsp-base-pick', 'nsp-update-data', 'nsp-update-version']) $(id).disabled = state.running;
+  for (const id of ['nsp-keys-pick', 'nsp-base-pick', 'nsp-update-data', 'nsp-update-version', 'nsp-update-usb']) $(id).disabled = state.running;
   for (const r of document.querySelectorAll('input[name=nsp-kind], input[name=nsp-out]')) r.disabled = state.running;
 }
 
@@ -549,22 +553,32 @@ function updateVersion() {
 function setUpdateVersion(v) { $('nsp-update-version').value = String(Math.min(Math.max(1, v), 0xFFFF)); }
 function updateName(v) { return CONFIG.nsp.updateName.replace('{n}', String(v)); }
 
+/** Whether this browser can produce a full NSP for the chosen output ('file', 'split' or 'usb'). */
+function canWriteFull(out, support) {
+  return out === 'usb' ? support.usb : out === 'split' ? support.split : support.file;
+}
+
 function renderNsp() {
   if (!$('nsp-full-panel')) return;
   const n = state.nsp;
   const support = nspSinkSupport();
   $('nsp-full-panel').hidden = n.kind !== 'full';
   $('nsp-update-panel').hidden = n.kind !== 'update';
-  const canFull = n.out === 'split' ? support.split : support.file;
+  const canFull = canWriteFull(n.out, support);
   const est = nspEstimate();
-  setText('nsp-full-info', canFull ? (est ? t('nsp_full_estimate', { size: formatBytes(est) }) : '') : t('nsp_browser_full'), !canFull);
+  const usb = n.out === 'usb';
+  $('nsp-usb-hint').hidden = !usb;
+  const why = usb ? t(support.usbReason === 'insecure' ? 'nsp_usb_insecure' : 'nsp_browser_usb') : t('nsp_browser_full');
+  setText('nsp-full-info', canFull ? (est ? t(usb ? 'nsp_usb_estimate' : 'nsp_full_estimate', { size: formatBytes(est) }) : '') : why, !canFull);
+  $('nsp-update-usb-row').hidden = !support.usb;
+  if (!support.usb) $('nsp-update-usb').checked = false;
   const v = updateVersion();
-  $('create-nsp').textContent = t('create_nsp_btn');
+  $('create-nsp').textContent = t(usb ? 'create_nsp_usb_btn' : 'create_nsp_btn');
   $('create-nsp-update').textContent = t('create_nsp_update_btn', { name: v ? updateName(v) : updateName('N') });
   const lines = [$('nsp-update-data').checked
     ? t('nsp_update_estimate_data')
     : t('nsp_update_estimate', { size: formatBytes(estimateProgramUpdateBytes(CONFIG.limits.expectedNroBytes)) })];
-  if (!support.file) lines.push(t('nsp_update_memory'));
+  if (!support.file && !$('nsp-update-usb').checked) lines.push(t('nsp_update_memory'));
   setText('nsp-update-info', lines.join('\n'));
   setButtons(!$('step-create').hidden);
 }
@@ -576,6 +590,7 @@ for (const r of document.querySelectorAll('input[name=nsp-out]')) {
   r.addEventListener('change', () => { if (r.checked) { state.nsp.out = r.value; renderNsp(); } });
 }
 $('nsp-update-data').addEventListener('change', renderNsp);
+$('nsp-update-usb').addEventListener('change', renderNsp);
 $('nsp-update-version').addEventListener('input', renderNsp);
 
 /** For a base NSP: its title and Program NCA (from the NCA headers, with the keys) give the next update number. */
@@ -658,14 +673,15 @@ $('create-nsp').addEventListener('click', async () => {
   if (!n.keys) { setText('nsp-status', t('nsp_need_keys'), true); return; }
   let sink;
   try {
-    sink = await openNspSink(n.out, CONFIG.nsp.fullName);
+    sink = await openNspSink(n.out, CONFIG.nsp.fullName, usbSinkOptions());
   } catch (err) {
     setText('nsp-status', err?.message ?? String(err), true);
     return;
   }
   if (!sink) return;
   setText('nsp-status', '');
-  startRun({ output: 'nsp', mode: 'full', sink, name: sink.name || CONFIG.nsp.fullName, nsp: { kind: 'full', keys: n.keys, ...editionNsp() } });
+  const target = n.out === 'usb' ? { target: 'usb' } : {};
+  startRun({ output: 'nsp', mode: 'full', sink, name: sink.name || CONFIG.nsp.fullName, nsp: { kind: 'full', keys: n.keys, ...target, ...editionNsp() } });
 });
 
 $('create-nsp-update').addEventListener('click', async () => {
@@ -675,9 +691,10 @@ $('create-nsp-update').addEventListener('click', async () => {
   const v = updateVersion();
   if (!v) { setText('nsp-status', t('nsp_bad_version'), true); return; }
   const name = updateName(v);
+  const usb = $('nsp-update-usb').checked && nspSinkSupport().usb;
   let sink;
   try {
-    sink = await openNspSink(nspSinkSupport().file ? 'file' : 'memory', name);
+    sink = await openNspSink(usb ? 'usb' : nspSinkSupport().file ? 'file' : 'memory', name, usbSinkOptions());
   } catch (err) {
     setText('nsp-status', err?.message ?? String(err), true);
     return;
@@ -689,17 +706,93 @@ $('create-nsp-update').addEventListener('click', async () => {
     output: 'nsp', mode: 'full', sink, name: sink.name || name, base,
     // titleId: the selected edition's, checked against the base's own (which the update keeps); dataDir: used only
     // when the base recorded none.
-    nsp: { kind: 'update', keys: n.keys, programOnly: !$('nsp-update-data').checked, version: v, base: base.meta ? { meta: base.meta } : { parts: base.parts }, ...editionNsp() },
+    nsp: {
+      kind: 'update', keys: n.keys, programOnly: !$('nsp-update-data').checked, version: v, base: base.meta ? { meta: base.meta } : { parts: base.parts },
+      ...(usb ? { target: 'usb' } : {}), ...editionNsp(),
+    },
   });
 });
+
+// ---- USB install (js/usb_install.js; docs/full-nsp.md section 6) ---------------------------------------------------
+// The console is chosen when the package is ready (the passes before take long, and Sphaira's USB screen need not be
+// open during them): a console this site may already use is taken without asking; otherwise the progress panel shows
+// a button, because the browser's device chooser needs a click.
+
+function showUsbPrompt(key, { button = false, params = {} } = {}) {
+  $('usb-prompt-text').textContent = t(key, params);
+  $('usb-connect').hidden = !button;
+  $('usb-prompt').hidden = false;
+}
+
+function hideUsbPrompt() { $('usb-prompt').hidden = true; }
+
+/** Waits for the user to pick the console (button + chooser), or for an allowed console to be plugged in. */
+function askForSwitch(signal, key = 'usb_prompt_connect', params = {}) {
+  return new Promise((resolve, reject) => {
+    const usb = navigator.usb;
+    const done = (fn, v) => {
+      $('usb-connect').removeEventListener('click', onClick);
+      usb.removeEventListener('connect', onConnect);
+      signal?.removeEventListener('abort', onAbort);
+      fn(v);
+    };
+    const onClick = async () => {
+      try {
+        const device = await requestSwitch(usb);
+        if (device) done(resolve, device);
+        else showUsbPrompt('usb_prompt_none', { button: true });
+      } catch (err) {
+        showUsbPrompt('usb_prompt_error', { button: true, params: { error: err?.message ?? String(err) } });
+      }
+    };
+    const onConnect = (e) => {
+      if (e.device?.vendorId === USB_VENDOR_ID && e.device?.productId === USB_PRODUCT_ID) done(resolve, e.device);
+    };
+    const onAbort = () => done(reject, signal.reason ?? new DOMException('Aborted', 'AbortError'));
+    if (signal?.aborted) { onAbort(); return; }
+    $('usb-connect').addEventListener('click', onClick);
+    usb.addEventListener('connect', onConnect);
+    signal?.addEventListener('abort', onAbort);
+    showUsbPrompt(key, { button: true, params });
+    $('usb-prompt').scrollIntoView({ block: 'nearest' });
+  });
+}
+
+/** UsbNspSink's connect(): an opened WebUsbTransport to the console. Retries (via the button) until it works or the run is cancelled. */
+async function connectSwitch({ signal, log }) {
+  let device = null;
+  try { device = await findPermittedSwitch(); } catch { /* ask instead */ }
+  let prompt = ['usb_prompt_connect', {}];
+  for (;;) {
+    if (!device) device = await askForSwitch(signal, ...prompt);
+    try {
+      const transport = await WebUsbTransport.open(device, { signal });
+      log(`USB: opened ${device.productName || 'the console'} (${device.vendorId.toString(16).padStart(4, '0')}:${device.productId.toString(16).padStart(4, '0')})`);
+      return transport;
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      log(`USB: ${err?.message ?? err}`, 'warn');
+      prompt = ['usb_prompt_error', { error: err?.message ?? String(err) }];
+      device = null;
+    }
+  }
+}
+
+function usbSinkOptions() {
+  return { connect: connectSwitch, onWaiting: () => showUsbPrompt('usb_prompt_waiting') };
+}
 
 window.addEventListener('pagehide', () => { forgetKeys(state.nsp.keys); state.nsp.keys = null; });
 
 /** The result notice of an NSP run: install notes and the base metadata to keep. */
 async function nspResultKids(job, result) {
+  const usb = job.sink.kind === 'usb';
   const kids = [
     el('p', {}, el('strong', { textContent: t('result_ready', { name: job.name }) }), ' ', t('result_size', { size: formatBytes(result.nspBytes) })),
-    el('p', { textContent: job.sink.kind === 'split' ? t('result_nsp_split', { name: job.name }) : result.sinkResult === 'saved' ? t('result_saved_file') : t('result_saved_download') }),
+    el('p', {
+      textContent: usb ? usbResultText(job, result)
+        : job.sink.kind === 'split' ? t('result_nsp_split', { name: job.name }) : result.sinkResult === 'saved' ? t('result_saved_file') : t('result_saved_download'),
+    }),
   ];
   const offerSave = (metaName, text, note) => {
     const btn = el('button', { className: 'btn small', type: 'button', textContent: t('nsp_meta_save_btn', { name: metaName }) });
@@ -715,7 +808,7 @@ async function nspResultKids(job, result) {
     kids.push(el('p', { textContent: note }), el('p', { className: 'result-actions' }, btn, status));
   };
   if (job.nsp.kind === 'full') {
-    kids.push(el('p', { textContent: t('result_nsp_install') }));
+    if (!usb) kids.push(el('p', { textContent: t('result_nsp_install') }));
     const metaName = `${job.name}.basemeta.json`;
     const text = pythonJson(result.nsp.baseMeta);
     let saved = false;
@@ -728,7 +821,7 @@ async function nspResultKids(job, result) {
     const v = job.nsp.version;
     const meta = result.baseMeta;
     kids.push(el('p', { textContent: t('result_nsp_update', { n: v, version: `0x${(v * 0x10000).toString(16)}`, title: meta.title_id }) }));
-    kids.push(el('p', { textContent: t('result_nsp_install') }));
+    if (!usb) kids.push(el('p', { textContent: t('result_nsp_install') }));
     rememberUpdate(meta.title_id, meta.program_nca, v);
     const updated = withLastUpdateVersion(meta, v);
     if (state.nsp.base === job.base) {
@@ -745,6 +838,16 @@ async function nspResultKids(job, result) {
   return kids;
 }
 
+function usbResultText(job, result) {
+  const st = job.sink.stats ?? {};
+  const secs = st.seconds ?? 0;
+  return t('result_usb_installed', {
+    size: formatBytes(result.nspBytes),
+    time: duration(secs),
+    rate: secs > 0 ? `${(result.nspBytes / 1e6 / secs).toFixed(1)} MB/s` : '–',
+  });
+}
+
 // ---- running ---------------------------------------------------------------------------------------------------
 const rows = {};
 function buildStages() {
@@ -757,7 +860,7 @@ function buildStages() {
     barBox.setAttribute('role', 'progressbar');
     barBox.setAttribute('aria-valuemin', '0');
     barBox.setAttribute('aria-valuemax', '100');
-    const name = el('span', { className: 'name', textContent: t(STAGE_KEYS[id] || id) });
+    const name = el('span', { className: 'name', textContent: stageName(id) });
     barBox.setAttribute('aria-label', name.textContent);
     const pct = el('span', { className: 'pct' });
     const label = el('span', { className: 'label' });
@@ -794,6 +897,7 @@ function etaText(r, f) {
 }
 
 function onProgress(id, p) {
+  if (id === 'nsp_usb' && p.done > 0) hideUsbPrompt();
   const idx = state.stages.indexOf(id);
   if (idx < 0 || !rows[id]) return;
   state.stages.forEach((sid, i) => {
@@ -850,6 +954,8 @@ async function startRun(job) {
   if (state.running || state.dlcBusy || !state.disc?.edition) { await sink.abort?.(); return; }
   const d = state.disc;
   state.stages = stagesFor(output, job.nsp);
+  state.usbRun = job.nsp?.target === 'usb';
+  hideUsbPrompt();
 
   state.running = true;
   state.abort = new AbortController();
@@ -877,7 +983,7 @@ async function startRun(job) {
   const what = output === 'nsp'
     ? (job.nsp.kind === 'full' ? 'full NSP' : job.nsp.programOnly ? `NSP update ${job.nsp.version} (program only)` : `NSP update ${job.nsp.version} with game data`)
     : (mode === 'full' ? 'full install' : 'update');
-  const where = { file: 'straight to the chosen file', split: 'a FAT32 split folder', opfs: 'temporary storage, then download' }[sink.kind] ?? 'in memory';
+  const where = { file: 'straight to the chosen file', split: 'a FAT32 split folder', opfs: 'temporary storage, then download', usb: 'nowhere: served to the Switch over USB' }[sink.kind] ?? 'in memory';
   log(`Mode: ${what}; edition ${d.edition.name}; ${dlc.length ? `${dlc.length} DLC package(s)` : 'no DLC'}; saving as ${name} (${where}).`);
   log(`Source: ${d.source.label} (${d.source.detail}).`);
   for (const line of d.source.log ?? []) log(line);
@@ -916,6 +1022,7 @@ async function startRun(job) {
       showResult(false, [el('p', { textContent: msg }), el('p', { className: 'muted', textContent: t('result_nothing_saved') })], 'err');
     }
   } finally {
+    hideUsbPrompt();
     clearInterval(timer);
     for (const id of state.stages) { rows[id].barBox.classList.remove('indeterminate'); rows[id].eta.textContent = ''; }
     window.removeEventListener('beforeunload', block);

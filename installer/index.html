@@ -10,7 +10,7 @@
 <link rel="preload" href="assets/fonts/GolosText-Variable.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="assets/fonts/RussoOne-Regular.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="icon" href="assets/icon.jpg">
-<link rel="stylesheet" href="style.css?v=0.3.2">
+<link rel="stylesheet" href="style.css?v=0.3.3">
 </head>
 <body>
 <a class="skip-link" href="#main" data-i18n="skip_link">Skip to content</a>
@@ -126,7 +126,12 @@
         <div class="seg nsp-out" role="radiogroup" aria-label="Output" data-i18n-aria="nsp_out_label">
           <label><input type="radio" name="nsp-out" value="file" checked> <span data-i18n="nsp_out_file">One .nsp file</span></label>
           <label><input type="radio" name="nsp-out" value="split"> <span data-i18n="nsp_out_split">FAT32 split folder</span></label>
+          <label><input type="radio" name="nsp-out" value="usb"> <span data-i18n="nsp_out_usb">Install to the connected Switch (USB)</span></label>
         </div>
+        <!-- USB install (js/usb_install.js, WebUSB): nothing is saved, the NSP is served to Sphaira's USB install screen. -->
+        <p class="hint" id="nsp-usb-hint" hidden data-i18n="nsp_usb_hint" data-i18n-html="true">
+          Nothing is saved on this computer: the page sends the NSP straight to Sphaira on the console.
+        </p>
         <p class="status" id="nsp-full-info" role="status"></p>
         <div class="actions">
           <button class="btn primary" id="create-nsp" type="button" disabled data-i18n="create_nsp_btn">Create masseffect-nx.nsp</button>
@@ -143,6 +148,7 @@
         <label class="check"><input type="checkbox" id="nsp-update-data"> <span data-i18n="nsp_update_data" data-i18n-html="true">Also rebuild the shaders and settings from the disc</span></label>
         <label class="number"><span data-i18n="nsp_update_version">Update number</span>
           <input type="number" id="nsp-update-version" min="1" max="65535" step="1" value="1"></label>
+        <label class="check" id="nsp-update-usb-row"><input type="checkbox" id="nsp-update-usb"> <span data-i18n="nsp_update_usb" data-i18n-html="true">Install it on the connected Switch over USB (Sphaira) instead of saving it</span></label>
         <p class="status" id="nsp-update-info" role="status"></p>
         <div class="actions">
           <button class="btn primary" id="create-nsp-update" type="button" disabled data-i18n="create_nsp_update_btn">Create the update</button>
@@ -155,6 +161,11 @@
 
     <div id="progress" class="progress-panel" hidden>
       <ol class="stages" id="stages"></ol>
+      <!-- Shown by app.js while a USB install waits for the console (connectSwitch). -->
+      <div id="usb-prompt" class="notice usb-prompt" role="status" hidden>
+        <p id="usb-prompt-text"></p>
+        <p class="result-actions"><button class="btn primary" id="usb-connect" type="button" data-i18n="usb_connect_btn">Choose the Switch</button></p>
+      </div>
       <div class="row">
         <span id="elapsed" class="muted"></span>
         <button class="btn small" id="cancel" type="button" data-i18n="cancel_btn">Cancel</button>
@@ -214,6 +225,6 @@
   <a href="#credits" data-i18n="footer_credits">Credits</a> · <a href="THIRD_PARTY_NOTICES.md" data-i18n="footer_notices">Third-party notices</a> · <span data-i18n="footer_disclaimer">Not affiliated with BioWare, Electronic Arts or Nintendo.</span>
 </footer>
 
-<script type="module" src="js/app.js?v=0.3.2"></script>
+<script type="module" src="js/app.js?v=0.3.3"></script>
 </body>
 </html>

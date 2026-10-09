@@ -305,7 +305,7 @@ same bytes (tested against this script, see below). No server, nothing uploaded,
 | AES-CTR | WebCrypto `AES-CTR` (counter = section upper IV ‖ offset/16, `length: 64`), 4 MiB per call. |
 | AES-XTS (headers), AES-ECB (key area) | Our own AES-128 block cipher in `js/nsp_crypto.js` (FIPS-197); XTS with Nintendo's big-endian sector tweak. Only 3 KiB per NCA. |
 | RSA-PSS | WebCrypto `generateKey({name: 'RSA-PSS', modulusLength: 2048})` (private key not extractable), `sign({saltLength: 32})`, modulus from the public JWK. Tests inject a deterministic signer (`deterministicPssSigner`: fixed salt, BigInt). |
-| Output | `js/nsp_sink.js`: `showSaveFilePicker` + positioned writes (placeholder header, stream, then the real header at 0), or a FAT32 split folder (`showDirectoryPicker`: `<name>.nsp/00, 01, ...` of `0xFFFF0000` bytes, part 00 stays open for the header), or memory + download (small outputs only: updates). |
+| Output | `js/nsp_sink.js`: `showSaveFilePicker` + positioned writes (placeholder header, stream, then the real header at 0), or a FAT32 split folder (`showDirectoryPicker`: `<name>.nsp/00, 01, ...` of `0xFFFF0000` bytes, part 00 stays open for the header), or memory + download (small outputs only: updates), or the connected console over USB (`UsbNspSink`, WebUSB; see "Install over USB" below). |
 
 Streaming is the packer's: pass 1 reads the RomFS once (IVFC block hashes + 64 KiB file chunk hashes, ~17 MB for
 8 GB), pass 2 reads it again, encrypts, hashes and writes. Measured in Chromium (M-series Mac, data in memory): pass 1
@@ -321,6 +321,8 @@ CPU for 8.7 GB on top of the reads and the disk write.
   Output `masseffect-nx-update-vN.nsp`. By default a **program-only update** (below): no disc reads, no shaders,
   about the size of the NRO. With "Also rebuild the shaders and settings from the disc" it is the full update of
   section 8 (shaders made again, disc read twice, only changed chunks stored).
+* **Install over USB** (full NSP or update): the same package, sent to Sphaira's USB install screen instead of a
+  file; nothing is written to the computer. Below.
 * **Update number**: one more than `last_update_version` in the base metadata, or than the last update made for that
   base in this browser (`localStorage`, keyed by title and Program NCA; only the number), and editable. After an
   update the page offers the base metadata again with `last_update_version` set, so the next update counts on.
@@ -330,11 +332,94 @@ CPU for 8.7 GB on top of the reads and the disk write.
 
 | | Full NSP (8-9 GB) | Update NSP |
 |---|---|---|
-| Chrome, Edge, Opera (desktop) | single file or FAT32 split folder | saved to a chosen file |
-| Firefox, Safari | not offered: no page API can write a multi-GB file with positioned writes; the page says so and points to the zip + this script | built in memory, then downloaded |
+| Chrome, Edge, Opera (desktop) | single file, FAT32 split folder, or installed over USB (WebUSB) | saved to a chosen file, or installed over USB |
+| Firefox, Safari | not offered: no page API can write a multi-GB file with positioned writes, and there is no WebUSB; the page says so and points to the zip + this script | built in memory, then downloaded |
 
 The origin-private file system could hold the NSP in Firefox and Safari, but needs the space twice (temporary file
 plus the download) and Safari has no `createWritable` there; not used.
+
+### Install over USB (WebUSB to Sphaira)
+
+Goal: install the NSP on the console while it is generated, without writing 8.7 GB to the computer. Pieces:
+`installer/js/usb_install.js` (protocol, WebUSB transport), `installer/js/crc32c.js`, `UsbNspSink` in
+`installer/js/nsp_sink.js`, `NspImage` in `installer/js/nsp.js`, the UI in `installer/js/app.js`.
+
+**Protocol.** Sphaira's own (the console is the USB device 057E:3000, vendor-specific interface 0 with one bulk IN
+and one bulk OUT endpoint; the host only answers). Every packet is 6 little-endian u32: magic `SPH0` (0x53504830),
+`arg2..arg5`, CRC-32C of the first 20 bytes.
+
+```
+console: hello (arg2 = 0)                      host: result(OK, length of the name table), "name\n" per file
+console: cmd 1 open, arg3 = index              host: result(OK, size >> 32 & 0xFFFF | flags << 16, size & 0xFFFFFFFF)
+console: range (offset hi, offset lo, length)  host: result(OK, length, CRC-32C of the data), the data
+console: range (0, 0)                          host: result(OK): file closed, back to the commands
+console: cmd 0 quit                            host: result(OK)
+```
+
+It is the protocol of `tools/usb_install.py` in the recomp repository (verified on a console with host-built NSPs).
+Sphaira ships a Python host and a WebUSB host of its own (`tools/usb_install.py`, `tools/webusb` in
+[ITotalJustice/sphaira](https://github.com/ITotalJustice/sphaira)); we read them and Sphaira's installer
+(`sphaira/source/usb/usb_installer.cpp`, `sphaira/include/usb/usb_api.hpp`, `sphaira/source/yati/yati.cpp`,
+`sphaira/source/yati/container/nsp.cpp`) for the protocol and the read pattern, and wrote our own code. Credit to
+ITotalJustice for Sphaira and its protocol. CRC-32C in JS: slicing-by-8 tables, measured ~2 GB/s in Node 26 on an
+M-series Mac (`test/usb.test.js` prints the rate), far above any USB link.
+
+**How Sphaira reads an NSP** (Sphaira 1.0.x, `InstallInternal`, flags 0): the PFS0 header (16 bytes, then the file
+table, then the string table), then each `.cnmt.nca` (the Meta NCA, at the end of our NSP), then the NCAs the CNMT
+lists, sorted by content type descending (Control, then Program), each one from its start to its end in increasing
+reads (0x4000 bytes first, then its read buffer size). Every NCA's SHA-256 must match its name (unless "skip NCA hash
+verify" is set), and the console's transfer timeout is 3 s per transfer (`usb_menu.cpp`).
+
+**Choice: (b), a hashing pre-pass, then ranges served by regenerating.** The NSP header holds the NCA names, the
+SHA-256 of the encrypted NCAs, and Sphaira reads it first. So the header must be final before the first byte goes
+out, and on-demand generation without a pre-pass (option a) cannot work, however sequential the reads are. The
+existing passes become three:
+
+1. pass 1 (as before): RomFS hashes (IVFC levels, 64 KiB chunk hashes);
+2. pass 2: the Program NCA is encrypted and hashed but not written (~260 MB/s, the JS SHA-256); the Control and Meta
+   NCAs and the header are then final and stay in memory (a few hundred KB);
+3. pass 3: Sphaira reads; `NspImage.read(offset, length)` answers from memory for the header, the Control and the
+   Meta NCA, and makes the Program NCA again from `NcaBuilder.chunks(from)`.
+
+The Program NCA, the 8 GB, is read by Sphaira strictly in order, so pass 3 is one more sequential read of the disc: a
+cursor continues for sequential requests, a window of recent blocks (16 MiB) answers re-reads, and any other request
+reopens the cursor at the requested offset (rounded down to a 16 KiB IVFC block). Reopening is cheap because every
+stream can start at an offset: `NcaBuilder.chunks(from)` (AES-CTR restarts at any 16-byte block),
+`IvfcPlan.chunks(data, from)` (hash levels from memory), `Romfs.chunks(from)` (files before the offset are not read),
+and the sources (`chunks(from)` on disc file slices, DLC slices and the pack worker's package reads). Patch sections of
+updates are not seekable and fall back to reading from the start and dropping the head (they are small or rarely
+reopened). The NCA header is made once and kept (its RSA-PSS signature is randomised; every read must see the same
+bytes). While the Program NCA is produced in one run from its start, its SHA-256 is compared with pass 2's, so a disc
+file that changed or became unreadable between the passes fails the install before the last block reaches the console
+(the page sends an error result; Sphaira stops).
+
+**Not used: `FLAG_STREAM`** (open result `flags` bit 0). With it Sphaira installs in file order and skips the NCA hash,
+header signature and NPDM checks, so content IDs need not be hashes and the pre-pass could go. But it is meant for
+sources that cannot seek (Sphaira-to-Sphaira, compressed archives), it leaves the content ID / SHA-256 relation broken
+for anything that checks it later, and it depends on a Sphaira version that has the flag. The pre-pass costs ~35 s of
+CPU plus one disc read; the safe path wins.
+
+**Costs.** The disc is read three times (pass 3 at USB speed, so it is not the limit). Memory: the window (16 MiB),
+the 4 MiB AES block, the small NCAs. The 8.7 GB NSP is never stored.
+
+**Page flow.** "Install to the connected Switch (USB)" (full NSP) or the update checkbox. The page tells the user to
+start Sphaira -> Install -> USB (MTP off) and to connect the cable, then click the button. When the package is ready
+the page uses a console this site was allowed before (`navigator.usb.getDevices()`), else shows "Choose the Switch"
+(the chooser needs a click; it also continues when an allowed console is plugged in), then waits for Sphaira's hello.
+Progress shows GB sent and MB/s, Cancel closes the device (pending transfers fail, Sphaira reports a USB error), a
+console that quits before it has read every byte (cancelled, no space, already installed) is an error, and the base
+metadata is offered as after a file output.
+
+**Drivers.** macOS: nothing. Windows: Chrome can only open devices bound to WinUSB; if the console is missing from the
+chooser, install WinUSB for 057E:3000 once with [Zadig](https://zadig.akeo.ie/) (the driver other USB install tools
+use; NS-USBloader/DBI setups often have it already). Linux: the user needs access to the device node (a udev rule for
+057E:3000). Another program holding the interface (an open `usb_install.py`, a DBI/NS-USBloader host) makes
+`claimInterface` fail; the page says so.
+
+**Needs the console** (not tested yet, the device was busy): a full install from Chrome on macOS; the USB throughput
+from the browser; that no regeneration (reopen) is ever slow enough to hit the 3 s transfer timeout (it should not
+happen with Sphaira's read order); Windows with WinUSB; Edge; cancelling from both sides; the update over USB; an
+install onto the SD card and onto system memory.
 
 ### Tests (`npm test` in `installer/`)
 
@@ -353,7 +438,12 @@ plus the download) and Safari has no `createWritable` there; not used.
   zip's), a full NSP, program-only updates from the metadata and from a two-part base NSP, an update with game data,
   errors (no keys, no base, not an NSP) discarding the output; per edition: the title ID and data folder of each
   edition (config IDs do not overlap), an update for the other edition's base refused before any work, an unknown base
-  title kept with a warning.
+  title kept with a warning. The USB target: the console gets the same NSP, with sources re-read from inside.
+* `test/usb.test.js` with `test/usb_fake_console.js` (a stand-in console reading in Sphaira's order and checking the
+  NCA hashes against their names): CRC-32C (check values, bitwise reference, speed), packet bytes (vectors made with
+  Python), `serveFiles`, whole installs byte-identical to the file output (out-of-order reads, a tiny window, random
+  ranges with seekable and non-seekable sources, a program-only update), a source changing between the passes, a
+  console stopping early, and `WebUsbTransport` over a fake `USBDevice`.
 
 ## 7. Risks and open questions
 

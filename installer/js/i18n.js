@@ -81,6 +81,23 @@ export const TRANSLATIONS = {
     nsp_out_label: 'Output',
     nsp_out_file: 'One .nsp file',
     nsp_out_split: 'FAT32 split folder (00, 01, …)',
+    nsp_out_usb: 'Install to the connected Switch (USB)',
+    nsp_usb_hint: '<strong>Nothing is saved on this computer:</strong> the page sends the NSP straight to <strong>Sphaira</strong> on the console, which installs it. '
+      + '1. On the Switch, start Sphaira, open <em>Install → USB</em> (turn MTP off in Sphaira if it is on) and connect the console to this computer with a USB cable. '
+      + '2. Click the button below. The shaders are made and the disc is read twice first (the package\'s file names are its hashes, and the console reads them first); then the page asks you to choose the console (“Nintendo Switch”, 057E:3000) and reads the disc a third time while Sphaira installs. '
+      + 'Keep the console awake (turn auto-sleep off) and this tab open. '
+      + '<strong>Windows:</strong> if the console is not in the list, install the WinUSB driver for 057E:3000 once with Zadig (a driver installed for another USB tool may already be WinUSB). <strong>Linux:</strong> the browser needs access to the device (a udev rule for 057E:3000). macOS needs nothing.',
+    nsp_usb_estimate: 'Estimated size: ~{size}. Nothing is written to this computer; the console needs that much free space where Sphaira installs (SD card or system memory).',
+    nsp_browser_usb: 'This browser has no WebUSB, so a web page cannot talk to the console: use desktop Chrome, Edge or Opera (Firefox and Safari do not support it). Or choose another output and install the file with DBI or Sphaira.',
+    nsp_usb_insecure: 'WebUSB only works on a secure page (https:// or localhost).',
+    create_nsp_usb_btn: 'Install on the Switch',
+    nsp_update_usb: 'Install it on the connected Switch over USB (Sphaira) instead of saving it',
+    usb_connect_btn: 'Choose the Switch',
+    usb_prompt_connect: 'The package is ready. On the Switch, open Sphaira → Install → USB and connect the cable; then click “Choose the Switch” and pick the Nintendo Switch (057E:3000).',
+    usb_prompt_none: 'No console was chosen. Open Sphaira\'s USB install screen, connect the cable and click the button again. (Not in the list on Windows? See the WinUSB note above.)',
+    usb_prompt_error: 'Could not use the console: {error}. Check the cable and Sphaira\'s USB install screen, then click the button again.',
+    usb_prompt_waiting: 'Connected. Waiting for Sphaira: keep its USB install screen open.',
+    result_usb_installed: 'Installed on the Switch over USB ({size} in {time}, {rate} on average). Nothing was saved on this computer.',
     create_nsp_btn: 'Create masseffect-nx.nsp',
     nsp_full_estimate: 'Estimated size: ~{size}. Free disk space of that size is needed where you save it.',
     nsp_browser_full: 'This browser cannot write a file of several GB from a web page: that needs the File System Access API of desktop Chrome, Edge or Opera. Use one of those, or create the full zip and run tools/build_full_nsp.py (docs/full-nsp.md). Updates work in any browser.',
@@ -124,6 +141,9 @@ export const TRANSLATIONS = {
     stage_nsp_base: 'Reading the base',
     stage_nsp_hash: 'Hashing the package (pass 1 of 2)',
     stage_nsp_write: 'Encrypting and writing the NSP',
+    stage_nsp_hash_usb: 'Hashing the package (pass 1 of 3)',
+    stage_nsp_write_usb: 'Encrypting and hashing the NSP (pass 2 of 3)',
+    stage_nsp_usb: 'Installing on the Switch over USB (pass 3 of 3)',
 
     how_title: 'After it finishes',
     how_desc: 'Extract the zip into <code>sdmc:/switch/</code> on the SD card. You get:',
@@ -268,6 +288,23 @@ export const TRANSLATIONS = {
     nsp_out_label: 'Результат',
     nsp_out_file: 'Один файл .nsp',
     nsp_out_split: 'Папка для FAT32 (части 00, 01, …)',
+    nsp_out_usb: 'Установить на подключённую Switch (USB)',
+    nsp_usb_hint: '<strong>На компьютере ничего не сохраняется:</strong> страница передаёт NSP прямо в <strong>Sphaira</strong> на консоли, и та его устанавливает. '
+      + '1. На Switch запустите Sphaira, откройте <em>Install → USB</em> (если в Sphaira включён MTP, выключите его) и подключите консоль к компьютеру кабелем USB. '
+      + '2. Нажмите кнопку ниже. Сначала создаются шейдеры и диск читается дважды (имена файлов пакета — это их хеши, а консоль читает их первыми); потом страница попросит выбрать консоль («Nintendo Switch», 057E:3000) и прочитает диск третий раз, пока Sphaira устанавливает. '
+      + 'Не давайте консоли уснуть (выключите автоматический спящий режим) и не закрывайте вкладку. '
+      + '<strong>Windows:</strong> если консоли нет в списке, один раз установите для 057E:3000 драйвер WinUSB через Zadig (драйвер, поставленный для другой USB-программы, может уже быть WinUSB). <strong>Linux:</strong> браузеру нужен доступ к устройству (правило udev для 057E:3000). На macOS ничего не нужно.',
+    nsp_usb_estimate: 'Ожидаемый размер: ~{size}. На компьютер ничего не записывается; столько свободного места нужно на консоли там, куда ставит Sphaira (SD-карта или системная память).',
+    nsp_browser_usb: 'В этом браузере нет WebUSB, и страница не может обращаться к консоли: используйте настольные Chrome, Edge или Opera (Firefox и Safari его не поддерживают). Или выберите другой вариант и установите файл через DBI или Sphaira.',
+    nsp_usb_insecure: 'WebUSB работает только на защищённой странице (https:// или localhost).',
+    create_nsp_usb_btn: 'Установить на Switch',
+    nsp_update_usb: 'Установить его на подключённую Switch по USB (Sphaira), а не сохранять',
+    usb_connect_btn: 'Выбрать Switch',
+    usb_prompt_connect: 'Пакет готов. На Switch откройте Sphaira → Install → USB и подключите кабель; затем нажмите «Выбрать Switch» и выберите Nintendo Switch (057E:3000).',
+    usb_prompt_none: 'Консоль не выбрана. Откройте экран установки по USB в Sphaira, подключите кабель и нажмите кнопку ещё раз. (В Windows её нет в списке? См. заметку о WinUSB выше.)',
+    usb_prompt_error: 'Не удалось обратиться к консоли: {error}. Проверьте кабель и экран установки по USB в Sphaira и нажмите кнопку ещё раз.',
+    usb_prompt_waiting: 'Подключено. Ожидание Sphaira: держите открытым её экран установки по USB.',
+    result_usb_installed: 'Установлено на Switch по USB ({size} за {time}, в среднем {rate}). На компьютере ничего не сохранено.',
     create_nsp_btn: 'Создать masseffect-nx.nsp',
     nsp_full_estimate: 'Ожидаемый размер: ~{size}. Столько же свободного места нужно там, куда вы сохраняете.',
     nsp_browser_full: 'Этот браузер не умеет записывать со страницы файл в несколько ГБ: для этого нужен File System Access API настольных Chrome, Edge или Opera. Откройте страницу в одном из них или создайте полный zip и запустите tools/build_full_nsp.py (docs/full-nsp.md). Обновления работают в любом браузере.',
@@ -311,6 +348,9 @@ export const TRANSLATIONS = {
     stage_nsp_base: 'Чтение базы',
     stage_nsp_hash: 'Хеширование пакета (проход 1 из 2)',
     stage_nsp_write: 'Шифрование и запись NSP',
+    stage_nsp_hash_usb: 'Хеширование пакета (проход 1 из 3)',
+    stage_nsp_write_usb: 'Шифрование и хеширование NSP (проход 2 из 3)',
+    stage_nsp_usb: 'Установка на Switch по USB (проход 3 из 3)',
 
     how_title: 'После завершения',
     how_desc: 'Распакуйте полученный zip-архив в <code>sdmc:/switch/</code> на SD-карте. В итоге получится:',
