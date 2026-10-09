@@ -1384,6 +1384,85 @@ u32 RexSwitchWindowFailures(char* buf, size_t cap) {
   return total;
 }
 
+/*
+ * The most recent failed window call (any thread): its call id (kWin*) and libnx result. Returns the number
+ * of failures since the start, so a caller can tell a new failure from one it has already seen. 0 = none.
+ */
+u32 RexSwitchWindowLastFailure(u32* call_out, u32* rc_out) {
+  const u32 total = g_window_failure_count.load(std::memory_order_acquire);
+  u32 call = 0, rc = 0;
+  if (total) {
+    const WindowFailure& f = g_window_failures[(total - 1) % kWindowFailures];
+    if (f.seq.load(std::memory_order_acquire) == total) {
+      call = f.call.load(std::memory_order_relaxed);
+      rc = f.rc.load(std::memory_order_relaxed);
+    }
+  }
+  if (call_out) *call_out = call;
+  if (rc_out) *rc_out = rc;
+  return total;
+}
+
+/*
+ * The kernel resources this process is charged for, and the physical memory pools, as one line.
+ *
+ * Why: the window calls that failed at start returned 0x00010801, svc::ResultLimitReached (2001-0132), the
+ * error of a resource-limit reservation that does not fit (the same code the SaltyNX connection got when
+ * this process's session cap, 1, was in use: see switch_saltynx.cpp). Which limit, and whose (ours, or the
+ * system's for vi), is what this line answers when printed next to the failure.
+ * svcGetSystemInfo (0x6F) is only called if the process may use it: a forbidden SVC kills the game.
+ */
+size_t RexSwitchResourceSummary(char* buf, size_t cap) {
+  if (!buf || !cap) return 0;
+  buf[0] = 0;
+  size_t used = 0;
+  auto add = [&](const char* fmt, auto... args) {
+    if (used + 1 >= cap) return;
+    const int w = std::snprintf(buf + used, cap - used, fmt, args...);
+    if (w > 0) used = std::min(cap - 1, used + size_t(w));
+  };
+  u64 raw = 0;
+  if (R_SUCCEEDED(svcGetInfo(&raw, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0)) && raw) {
+    const Handle limit = static_cast<Handle>(raw);
+    struct Resource {
+      const char* name;
+      LimitableResource which;
+      unsigned shift;
+    };
+    static const Resource kResources[] = {
+        {"memory MB", LimitableResource_Memory, 20},
+        {"threads", LimitableResource_Threads, 0},
+        {"events", LimitableResource_Events, 0},
+        {"transfer memories", LimitableResource_TransferMemories, 0},
+        {"sessions", LimitableResource_Sessions, 0},
+    };
+    add("process limits:");
+    for (const Resource& r : kResources) {
+      s64 now = -1, max = -1;
+      svcGetResourceLimitCurrentValue(&now, limit, r.which);
+      svcGetResourceLimitLimitValue(&max, limit, r.which);
+      add(" %s %lld/%lld", r.name, (long long)(now >> r.shift), (long long)(max >> r.shift));
+    }
+    svcCloseHandle(limit);
+  } else {
+    add("process limits: unreadable");
+  }
+  if (envIsSyscallHinted(0x6F)) {
+    static const char* kPools[] = {"application", "applet", "system", "system unsafe"};
+    add("; pools MB used/total:");
+    for (u64 pool = 0; pool < 4; ++pool) {
+      u64 total = 0, in_use = 0;
+      if (R_SUCCEEDED(svcGetSystemInfo(&total, 0, INVALID_HANDLE, pool)) &&
+          R_SUCCEEDED(svcGetSystemInfo(&in_use, 1, INVALID_HANDLE, pool))) {
+        add(" %s %llu/%llu", kPools[pool], (unsigned long long)(in_use >> 20), (unsigned long long)(total >> 20));
+      }
+    }
+  } else {
+    add("; pools: svcGetSystemInfo not allowed");
+  }
+  return used;
+}
+
 Result __wrap_nwindowCancelBuffer(NWindow* nw, s32 slot, const NvMultiFence* fence) {
   const s32 cur = nw ? nw->cur_slot : -2;
   const Result rc = __real_nwindowCancelBuffer(nw, slot, fence);

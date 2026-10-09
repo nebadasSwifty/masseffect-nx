@@ -150,6 +150,11 @@ class VulkanPresenter final : public Presenter {
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
 
  private:
+  // The paint itself; PaintAndPresentImpl wraps it with the Switch presentation trace.
+  PaintResult PaintAndPresentImplInner(bool execute_ui_drawers);
+  // Switch: one log line per second for 30 s around a lost or recovered presentation.
+  void ArmPresentationTrace(const char* why);
+  void TracePresentation(PaintResult result);
   // Usable for both the guest output image itself and for intermediate images.
   class GuestOutputImage {
    public:
@@ -548,6 +553,16 @@ class VulkanPresenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+
+  // Switch presentation diagnostics and transient acquire failures (vulkan_presenter.cpp). Painting thread
+  // only, except trace_until_ns_ (also armed by the UI thread when it connects).
+  void* switch_window_ = nullptr;  // NWindow* of the connected surface, for the trace
+  std::atomic<int64_t> trace_until_ns_{0};
+  int64_t trace_next_ns_ = 0;
+  uint64_t trace_counts_[4] = {};  // presented, not presented, connection outdated, other
+  uint32_t window_failures_seen_ = 0;
+  uint32_t transient_acquire_failures_ = 0;
+  uint64_t transient_acquire_total_ = 0;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

@@ -57,9 +57,26 @@ extern "C" {
 #include <switch/result.h>
 #include <switch/display/native_window.h>
 }
-// switch_perf.cpp: the window calls (NWindow / BufferQueue) that failed since the previous call.
+// switch_perf.cpp: the window calls (NWindow / BufferQueue) that failed since the previous call, the latest
+// one, and this process's kernel resources.
 extern "C" uint32_t RexSwitchWindowFailures(char* buf, size_t cap);
+extern "C" uint32_t RexSwitchWindowLastFailure(uint32_t* call_out, uint32_t* rc_out);
+extern "C" size_t RexSwitchResourceSummary(char* buf, size_t cap);
 #endif
+
+/*
+ * A failed buffer dequeue whose libnx result is a kernel one (module 1) does not mean the swapchain is out of
+ * date: on 2026-10-10 (ru_integ9, m481.log) both dequeues of two consecutive frames returned 0x00010801
+ * (svc::ResultLimitReached), the WSI reported VK_ERROR_OUT_OF_DATE_KHR, and the presenter retired the
+ * swapchain. The new one was created and presented without errors, yet the screen stayed black and the process
+ * stopped 27 s later. With this, such an acquire only drops the frame and the next one tries again with the
+ * same swapchain and the same registered buffers; the swapchain is recreated only if it keeps failing for this
+ * many consecutive frames. 0 = recreate at once (the previous behavior).
+ */
+REXCVAR_DEFINE_INT32(present_switch_dequeue_retry_frames, 90, "UI/Presenter",
+                     "Switch: consecutive frames whose buffer dequeue fails with a kernel result before the "
+                     "swapchain is recreated (0 = at once)")
+    .range(0, 100000);
 
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
@@ -1419,6 +1436,20 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   }
 
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
+#if REX_PLATFORM_SWITCH
+  switch_window_ = new_surface.GetType() == Surface::kTypeIndex_ViNWindow
+                       ? static_cast<void*>(static_cast<const ViNWindowSurface&>(new_surface).window())
+                       : nullptr;
+  transient_acquire_failures_ = 0;
+  {
+    // The first connection at start is not a recovery; any later one is, and gets the trace.
+    static bool first_connection = true;
+    if (!first_connection) {
+      ArmPresentationTrace("swapchain connected again");
+    }
+    first_connection = false;
+  }
+#endif
   return SurfacePaintConnectResult::kSuccess;
 }
 
@@ -2036,6 +2067,90 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  const PaintResult result = PaintAndPresentImplInner(execute_ui_drawers);
+#if REX_PLATFORM_SWITCH
+  TracePresentation(result);
+#endif
+  return result;
+}
+
+namespace {
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+constexpr int64_t kPresentationTraceNs = 30'000'000'000LL;
+}  // namespace
+
+void VulkanPresenter::ArmPresentationTrace(const char* why) {
+  const int64_t now = SteadyNowNs();
+  if (trace_until_ns_.exchange(now + kPresentationTraceNs, std::memory_order_relaxed) < now) {
+    REXLOG_INFO("[presenter] trace on for 30 s ({}): one line per second", why);
+  }
+}
+
+/*
+ * One line per second while the trace is armed (30 s after a lost presentation or a new connection): what the
+ * paints returned, the NWindow's state as libnx sees it, the window calls that failed, and the kernel resources.
+ * It answers what happened between "dropped" and "Created ... swapchain" and after it, which the 10-second
+ * reports cannot (2026-10-10: black screen after a recovery that reported no error at all).
+ */
+void VulkanPresenter::TracePresentation(PaintResult result) {
+#if REX_PLATFORM_SWITCH
+  const bool presented = result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal;
+  if (!presented) {
+    ArmPresentationTrace("a frame was not presented");
+  }
+  const int64_t until = trace_until_ns_.load(std::memory_order_relaxed);
+  if (!until) {
+    return;
+  }
+  const int64_t now = SteadyNowNs();
+  const unsigned bucket = presented                                                  ? 0
+                          : result == PaintResult::kNotPresented                     ? 1
+                          : result == PaintResult::kNotPresentedConnectionOutdated ? 2
+                                                                                     : 3;
+  ++trace_counts_[bucket];
+  if (trace_next_ns_ == 0) {
+    trace_next_ns_ = now + 1'000'000'000LL;
+    return;
+  }
+  const bool last = now >= until;
+  if (now < trace_next_ns_ && !last) {
+    return;
+  }
+  std::string window = "no NWindow";
+  if (const NWindow* nw = static_cast<const NWindow*>(switch_window_)) {
+    window = fmt::format("NWindow {}x{} slots configured {:016X} requested {:016X} connected {} dequeued slot {} "
+                         "swap interval {}",
+                         nw->width, nw->height, nw->slots_configured, nw->slots_requested,
+                         nw->is_connected ? "yes" : "no", nw->cur_slot, nw->swap_interval);
+  }
+  uint32_t call = 0, rc = 0;
+  const uint32_t failures = RexSwitchWindowLastFailure(&call, &rc);
+  char resources[512];
+  RexSwitchResourceSummary(resources, sizeof(resources));
+  REXLOG_INFO("[presenter] trace: presented {}, not presented {} ({} acquires kept the swapchain so far), "
+              "connection outdated {}, other {}; swapchain {} {}x{}; {}; window failures {} (last: call {} rc "
+              "0x{:08X}); {}{}",
+              trace_counts_[0], trace_counts_[1], transient_acquire_total_, trace_counts_[2], trace_counts_[3],
+              paint_context_.swapchain != VK_NULL_HANDLE ? "present" : "none", paint_context_.swapchain_extent.width,
+              paint_context_.swapchain_extent.height, window, failures, call, rc, resources,
+              last ? " (end of trace)" : "");
+  trace_counts_[0] = trace_counts_[1] = trace_counts_[2] = trace_counts_[3] = 0;
+  trace_next_ns_ = now + 1'000'000'000LL;
+  if (last) {
+    trace_next_ns_ = 0;
+    int64_t expected = until;
+    trace_until_ns_.compare_exchange_strong(expected, 0, std::memory_order_relaxed);
+  }
+#else
+  (void)result;
+#endif
+}
+
+Presenter::PaintResult VulkanPresenter::PaintAndPresentImplInner(bool execute_ui_drawers) {
   // First mark of the fine-grained breakdown. With the switch off this is just a bool.
   uint64_t profile = PaintedNow();
 
@@ -2119,6 +2234,29 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_ERROR_OUT_OF_DATE_KHR:
     case VK_ERROR_SURFACE_LOST_KHR:
     case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+#if REX_PLATFORM_SWITCH
+      // See present_switch_dequeue_retry_frames: a dequeue refused by the kernel keeps the swapchain.
+      if (acquire_result == VK_ERROR_OUT_OF_DATE_KHR) {
+        uint32_t call = 0, rc = 0;
+        const uint32_t failures = RexSwitchWindowLastFailure(&call, &rc);
+        const bool fresh = failures != window_failures_seen_;
+        window_failures_seen_ = failures;
+        const uint32_t kDequeueCall = 2;  // kWinDequeueBuffer in switch_perf.cpp
+        if (fresh && call == kDequeueCall && (rc & 0x1FF) == 1 &&
+            transient_acquire_failures_ < uint32_t(REXCVAR_GET(present_switch_dequeue_retry_frames))) {
+          ++transient_acquire_failures_;
+          ++transient_acquire_total_;
+          if (transient_acquire_failures_ == 1 || transient_acquire_failures_ % 30 == 0) {
+            char resources[512];
+            RexSwitchResourceSummary(resources, sizeof(resources));
+            REXLOG_WARN("[presenter] acquire: the buffer dequeue failed with a kernel result ({} frame(s) in a "
+                        "row); the frame is dropped and the swapchain kept; window: {}; {}",
+                        transient_acquire_failures_, WindowFailuresForLog(), resources);
+          }
+          return PaintResult::kNotPresented;
+        }
+      }
+#endif
       // Not an error, reporting just as info (may normally occur while resizing
       // on some platforms).
       REXLOG_INFO(
@@ -2131,6 +2269,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image (VkResult {}); window: {}",
                    int(acquire_result), WindowFailuresForLog());
       return PaintResult::kNotPresented;
+  }
+  if (transient_acquire_failures_) {
+    REXLOG_INFO("[presenter] acquire works again after {} dropped frame(s), same swapchain",
+                transient_acquire_failures_);
+    transient_acquire_failures_ = 0;
   }
   if (acquisition_in_cpu) {
     // Here, on the presenter thread and without the queue lock, instead of inside the GPU channel.

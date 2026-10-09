@@ -18,6 +18,13 @@
 
 #include "rex/ui/switch_saltynx.h"
 
+/*
+ * Optional per-iteration hook of the UI loop (at least every kWaitTimeoutNs), defined by the title if it wants
+ * one. It is the one thread that keeps looping on its own when the ring, the renderer and the presenter stop:
+ * the title's hang watchdog uses it to notice that renderer reports stopped altogether.
+ */
+extern "C" void RexSwitchUITick(void) __attribute__((weak));
+
 namespace rex::ui {
 
 namespace {
@@ -195,6 +202,10 @@ int SwitchWindowedAppContext::RunMainMessageLoop() {
                     docked ? "docked" : "handheld");
         display_changed_ = true;
       }
+    }
+
+    if (RexSwitchUITick) {
+      RexSwitchUITick();
     }
 
     // Processes every queued applet message and runs the hooks.

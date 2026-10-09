@@ -68,6 +68,7 @@
 
 #include <rex/ui/switch_thread_snapshot.h>
 extern "C" const char* RexSwitchLogDir(void);  // <NRO folder>/logs/rex/, ends in '/'
+extern "C" size_t RexSwitchResourceSummary(char* buf, size_t cap);  // switch_perf.cpp
 #endif
 
 REXCVAR_DEFINE_BOOL(masseffect_hang_watchdog, false, "Mass Effect",
@@ -84,6 +85,11 @@ REXCVAR_DEFINE_INT32(masseffect_hang_watchdog_intervals, 3, "Mass Effect",
                      "dump")
     .range(1, 60)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(masseffect_hang_watchdog_silence_s, 30, "Mass Effect",
+                     "Hang watchdog: dump when no renderer report (one every 10 s from the ring thread) has come for "
+                     "this many seconds, after the first one; checked from the UI loop. 0 = off")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace me::native {
 namespace {
@@ -98,6 +104,9 @@ std::atomic<bool> g_requested{false};
 std::atomic<uint32_t> g_quiet_intervals{0};
 std::atomic<uint64_t> g_quiet_swaps{0};
 bool g_seen_draws = false;  // ring thread only
+// Time of the last renderer report (steady clock, ns; 0 = none yet), for the silence check on the UI loop.
+std::atomic<int64_t> g_last_report_ns{0};
+std::atomic<bool> g_silence_done{false};
 bool g_auto_done = false;   // ring thread only
 std::chrono::steady_clock::time_point g_start_time;
 
@@ -187,6 +196,13 @@ void Dump(const char* reason) {
   const double uptime =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start_time).count();
   REXLOG_WARN("[hang] ===== thread dump ({}), {:.0f} s after start =====", reason, uptime);
+#if REX_PLATFORM_SWITCH
+  {
+    char resources[512];
+    RexSwitchResourceSummary(resources, sizeof(resources));
+    REXLOG_WARN("[hang] {}", resources);
+  }
+#endif
 
   // 1. Host threads first: no locks are needed for them, while the guest side below takes the object table lock,
   // which a stuck thread could be holding.
@@ -295,6 +311,10 @@ void StartHangWatchdog() {
 
 void HangWatchdogInterval(uint64_t swaps, uint64_t draws) {
   if (!g_started.load(std::memory_order_relaxed)) return;
+  g_last_report_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count(),
+                         std::memory_order_relaxed);
   {
     static const std::string flag = FlagPath();
     if (std::FILE* f = std::fopen(flag.c_str(), "r")) {
@@ -327,3 +347,25 @@ void HangWatchdogInterval(uint64_t swaps, uint64_t draws) {
 }
 
 }  // namespace me::native
+
+/*
+ * Called by the Switch UI loop at least every 100 ms (windowed_app_context_switch.cpp). The renderer report
+ * runs on the ring thread, so the "Swaps without draws" check above cannot see the ring itself stopping:
+ * 2026-10-10 (ru_integ9, m481.log) the log ended 27 s after a swapchain recovery with no report, no crash and
+ * no dump. This fires once when no report has come for masseffect_hang_watchdog_silence_s seconds.
+ */
+extern "C" void RexSwitchUITick(void) {
+  using namespace me::native;
+  if (!g_started.load(std::memory_order_relaxed) || g_silence_done.load(std::memory_order_relaxed)) return;
+  const int32_t silence_s = REXCVAR_GET(masseffect_hang_watchdog_silence_s);
+  const int64_t last = g_last_report_ns.load(std::memory_order_relaxed);
+  if (silence_s <= 0 || last == 0) return;
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  if (now - last < int64_t(silence_s) * 1000000000LL) return;
+  if (g_silence_done.exchange(true)) return;
+  const std::string reason =
+      fmt::format("no renderer report for {:.0f} s (the ring thread stopped reporting)", double(now - last) / 1e9);
+  Dump(reason.c_str());
+}
