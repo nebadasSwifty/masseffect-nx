@@ -291,8 +291,9 @@ needs hooks on the writers too (object creation and destruction). Layouts can be
 main thread per frame at 1785 MHz. If the per-class index removes whole scans, the gain is larger. Effort 1-2 weeks per subsystem.
 Risk medium: callers have side effects (allocation, virtual calls). Keep those as guest calls, as the skin-rebind native does.
 
-**Verification.** The hot-hook guard (`me_hot_guest.cpp` `Check`: the native runs on a copy, memory is rolled back, the original runs,
-registers, written ranges and FPCR are compared; first `masseffect_hot_guard_calls` calls and then 1 in `masseffect_hot_guard_period`).
+**Verification.** The hot-hook guard (`me_hot_guest.cpp` `Check`: the native runs on a private copy of its write ranges, the
+original runs for real, registers, written ranges and FPCR are compared; no guest memory is written by the guard, see
+[hot-guard.md](hot-guard.md); first `masseffect_hot_guard_calls` calls and then 1 in `masseffect_hot_guard_period`).
 Host differential fuzz `tests/hot_fuzz` (random registers and memory, NaN canonicalisation; mutation checks as in round 2). For an
 index or cache that replaces a scan: a self-check mode that runs both and compares the result sets for the first N uses. Console:
 main-thread core-ms per frame A/B (noise about 0.3-0.7 ms per thread, so run 2+ pairs), captures per leg.
