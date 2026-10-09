@@ -9,7 +9,7 @@ show them working and how to test them on the console.
 | Piece | Where | What it does |
 |---|---|---|
 | `PipelineFor` | `masseffect_native_draws.cpp` | Ring thread. Looks the key up (last-key shortcut, direct-mapped cells, `pipelines_` map). On a miss it builds the shader modules (SPIR-V transforms: rectangle, VS constants fold, 7e3 clamp, alpha-only, early Z, texture signs fold, restore-into-7e3 epilogue, FragCoord, depth) and calls `CreatePipelineVulkan` **synchronously**: NAK compiles both stages unless the Vulkan cache has them. |
-| Vulkan pipeline cache + prewarm list | one file, `<NRO folder>/cache/masseffect_native_pipelines.bin` (`NFPC` header, the `NFPL` list, then `vkGetPipelineCacheData`). With `masseffect_cold_startup = true` it is `cache/cold.bin` instead | Loaded at start-up. Saved after 64 new pipelines or 60 s with any new one: `vkGetPipelineCacheData` on the ring, then a writer thread writes the whole file (16 MB now). |
+| Vulkan pipeline cache + prewarm list | one file, `<NRO folder>/cache/masseffect_native_pipelines.bin` (`NFPC` header, the `NFPL` list, then `vkGetPipelineCacheData`). With `masseffect_cold_startup = true` it is `cache/cold.bin` instead | Loaded at start-up (read straight into its two parts). Saved after 64 new pipelines (at most once a minute) or 10 min with any new one, and at exit: `vkGetPipelineCacheData` on the writer thread, which writes the whole file (48 MB after a long tour). See A2 below. |
 | List format version | `kVersionPipelinesList` = 4 (v3 added texture signs, v4 the folded VS constants) | A version change discards the list (not the Vulkan cache). |
 | Prewarm thread `MASSEFFECT pipeline prewarm` | `TryPrewarm` / `PrewarmedLoop`, needs `masseffect_native_pipelines_prewarm = true` (default **false**) | Walks the list in creation order and creates + destroys each pipeline so the Vulkan cache holds it. Priority 0x3F..0x3B (the console only accepted 0x3B). Skips restore-into-7e3 records. |
 | Shader preload thread `ME shader preload` | `TryPreloadShaders`, `masseffect_shaders_preload = true` | Reads from the SD the SPIR-V of every shader named in the prewarm list, so the ring does not read it on first use. With no list it preloads nothing. |
@@ -86,6 +86,49 @@ the first save). Texture creation is at most ~70 ms per long frame (58 textures,
 * Log: `C6: pipelines saved (16141 KB of cache and 653 in the prewarm list, in N ms, from its thread; 65 pieces;
   cache serialized on this thread in X ms)`. The write takes longer (~+0.5 s); what matters is that no frame after it
   is long.
+
+### A2. Saving without running out of memory (2026-10-09)
+
+**Crash.** RU build, long location tour, ~70 min: `std::terminate: std::bad_alloc` on the writer thread
+(`SaveCachePipelines` lambda -> `WriterCacheMain` -> `SerializeCacheOnWriter` -> `std::vector<uint8_t>::resize`). The
+log showed a save every ~60 s: `C6: pipelines saved (47885 KB of cache and 3491 in the prewarm list, in 15006 ms, from
+its thread; 194 pieces ...)`. Each save allocated a fresh 48 MB vector while the previous 48 MB copy (`written_cache_`)
+was still held, with the game using almost all memory; once the fragmented heap had no 48 MB block the exception
+left the thread and terminated the game (it looked like a hang).
+
+**Now** (`masseffect_native_draws.cpp` `SaveCachePipelines` / `WriterCacheMain` / `WriteFilePipelines` /
+`ReadFilePipelines`, `masseffect_pipelines_cold_members.inc` section 4):
+
+* **No exception leaves the save path.** Every vector growth on the ring side (list snapshot, old-mode cache copy),
+  on the writer thread (whole iteration inside `try`) and on the load side (`ReadWholeFile`, `ReadFilePipelines`,
+  `LoadPipelinesList`) is checked. A failed save logs one warning
+  (`C6: pipelines not saved (<reason>; failure N), retry in S s`) and is retried after 30 s, doubling up to 10 min;
+  what was not written is kept (a new request from the ring during the backoff waits for it). After 3 cache failures
+  in a row the prewarm list is written with an empty cache part (`... writing the prewarm list without the Vulkan
+  cache`): the list is what matters, the prewarm thread regenerates the driver cache from it. At shutdown a failure
+  is one warning and no retry. A ring-side failure: `C6: pipelines save skipped on the ring (...)`, retried with the
+  next save. Creating the writer thread is also guarded (`std::system_error` -> saving disabled with one warning).
+* **One persistent serialization buffer.** `written_cache_` is the buffer: read into at start-up with a margin
+  (`CacheBufferMargin`: +1/8, at least 2 MB), and `vkGetPipelineCacheData` writes straight into it. It is reallocated
+  only when the cache outgrows its capacity, and then the old block is released **before** the new one is requested
+  (never two cache copies). If the margin does not fit, the exact size is tried. The file is streamed from the list
+  and cache buffers in 256 KB pieces (`WriteChunked`), with no file-sized copy. The load no longer reads the whole file
+  into a third buffer and copies it into the two parts. The `pipelines saved` line ends with `buffer N KB` (capacity).
+* **Fewer saves.** `masseffect_native_pipelines_save_min_new = 64` new pipelines and at least
+  `masseffect_native_pipelines_save_min_gap_s = 60` since the last save; or `masseffect_native_pipelines_save_interval_s
+  = 600` with any new pipeline (60 = the old rule); and in the destructor. On the Switch the destructor is not always
+  reached, so up to 10 min of fewer than 64 new pipelines can be lost (the next run compiles them once more).
+* **Cache cap.** `masseffect_native_pipelines_save_cache_cap_mb = 64` (0 = none): a larger Vulkan cache is not
+  serialized any more (one warning: `Vulkan pipeline cache is N KB, above ...`); the prewarm list is still saved,
+  with the last cache part written.
+* The old ring mode (`masseffect_native_pipelines_save_serialize_off_ring = false`) is guarded the same way but still
+  makes one fresh copy per save on the ring.
+* The writer thread stays a `std::thread` created lazily from the ring, like the other helper threads of the renderer
+  (copies, bindings, prewarm, preload, async); it is joined, never detached. Moving all of them to libnx `threadCreate`
+  is a separate change.
+
+Test: a long all-locations tour (70+ min) with the default cvars must not end in `std::terminate`; grep
+`C6: pipelines saved`, `pipelines not saved`, `save skipped`, `above masseffect_native_pipelines_save_cache_cap_mb`.
 
 ### B. Specialized pipelines compiled in the background (code default OFF; `app/masseffect.toml` sets 2 since 2026-10-08)
 

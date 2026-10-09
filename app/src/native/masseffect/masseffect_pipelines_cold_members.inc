@@ -4,6 +4,7 @@
 // 1. Specialized pipelines compiled in the background (masseffect_native_pipelines_async_specialized).
 // 2. The shipped prewarm list (masseffect_native_pipelines_shipped_list), merged by LoadPipelinesList.
 // 3. Helpers of the chunked pipelines file write (masseffect_native_pipelines_save_*).
+// 4. Allocation-safe cache serialization (masseffect_native_pipelines_save_cache_cap_mb and the writer's backoff).
 
   // --- 1. Specialized pipelines compiled in the background --------------------------------------------------
   static constexpr uint32_t kSpecFoldedBits = kSpecVsFolded | kSpecSignsFolded;
@@ -345,27 +346,95 @@
     return true;
   }
 
-  // Writer thread (masseffect_native_pipelines_save_serialize_off_ring): the cache data, empty if it did not
-  // change size since the last save. bytes_cache_saved_ belongs to the writer thread in this mode.
-  std::vector<uint8_t> SerializeCacheOnWriter(uint64_t& ns) {
+  // --- 4. Never terminate on a failed allocation while saving (2026-10-09) ------------------------------------
+  // A long RU tour (~70 min) died with "std::terminate: std::bad_alloc" on the writer thread: every save
+  // allocated a fresh vector for the whole Vulkan cache (48 MB) while the previous one was still held, and with the
+  // heap fragmented by the game one of them failed. Now:
+  // * written_cache_ is the one persistent serialization buffer (read into at start-up with a margin, then
+  //   reused): it is reallocated only when the cache outgrows its capacity, and the old block is released first.
+  // * Allocations are checked (try/catch around every vector growth on the save and load paths); a failure skips
+  //   the save with one warning and is retried with backoff (WriterCacheMain).
+  // * masseffect_native_pipelines_save_cache_cap_mb: a cache larger than this is not serialized; the prewarm list is
+  //   still saved (with the last cache part written).
+  enum CacheSerialize : uint8_t { kCacheUnchanged, kCacheSerialized, kCacheOverCap, kCacheNoMemory, kCacheError };
+  static constexpr uint32_t kSaveBackoffFirstS = 30;
+  static constexpr uint32_t kSaveBackoffMaxS = 600;
+  static constexpr uint32_t kCacheFailuresBeforeListOnly = 3;
+
+  // Extra capacity reserved above the cache size, so a growing cache does not reallocate on every save.
+  static size_t CacheBufferMargin(size_t bytes) { return std::max<size_t>(size_t(2) << 20, bytes / 8); }
+
+  // masseffect_native_pipelines_save_cache_cap_mb in bytes; 0 = no cap.
+  static size_t CacheCapBytes() {
+    const int32_t mb = REXCVAR_GET(masseffect_native_pipelines_save_cache_cap_mb);
+    return mb > 0 ? size_t(mb) << 20 : 0;
+  }
+
+  // Writer thread (masseffect_native_pipelines_save_serialize_off_ring): vkGetPipelineCacheData straight into
+  // written_cache_. kCacheUnchanged if it did not change size since the last save (written_cache_ untouched).
+  // bytes_cache_saved_ and written_cache_valid_ belong to the writer thread in this mode. After kCacheNoMemory or
+  // kCacheError written_cache_ is empty and not valid (its old content may be overwritten or released).
+  CacheSerialize SerializeCacheOnWriter(uint64_t& ns) {
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<uint8_t> data;
+    const auto finish = [&](CacheSerialize result) {
+      ns = uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+      return result;
+    };
     size_t bytes = 0;
-    if (cache_pipelines_ != VK_NULL_HANDLE &&
-        data_cache_(device_, cache_pipelines_, &bytes, nullptr) == VK_SUCCESS && bytes &&
-        bytes != bytes_cache_saved_) {
-      data.resize(bytes);
-      const VkResult result = data_cache_(device_, cache_pipelines_, &bytes, data.data());
-      if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || !bytes) {
-        data.clear();
-      } else {
-        data.resize(bytes);
-        bytes_cache_saved_ = bytes;
+    if (cache_pipelines_ == VK_NULL_HANDLE ||
+        data_cache_(device_, cache_pipelines_, &bytes, nullptr) != VK_SUCCESS || !bytes ||
+        (bytes == bytes_cache_saved_ && written_cache_valid_)) {
+      return finish(kCacheUnchanged);
+    }
+    if (const size_t cap = CacheCapBytes(); cap && bytes > cap) {
+      if (!cache_cap_warned_) {
+        cache_cap_warned_ = true;
+        REXLOG_WARN("[native] C6: Vulkan pipeline cache is {} KB, above masseffect_native_pipelines_save_cache_cap_mb "
+                    "({} MB): it is no longer saved, only the prewarm list (with the last cache part written)",
+                    bytes >> 10, cap >> 20);
+      }
+      return finish(kCacheOverCap);
+    }
+    const auto invalidate = [this] {
+      written_cache_.clear();  // keeps the capacity for the next attempt
+      written_cache_valid_ = false;
+      bytes_cache_saved_ = 0;
+    };
+    if (written_cache_.capacity() < bytes) {
+      // Release the old block before asking for the new one: never two cache copies at once.
+      std::vector<uint8_t>().swap(written_cache_);
+      invalidate();
+      try {
+        written_cache_.reserve(bytes + CacheBufferMargin(bytes));
+      } catch (const std::bad_alloc&) {
+        std::vector<uint8_t>().swap(written_cache_);
+        try {
+          written_cache_.reserve(bytes);  // no margin: the smallest block that works
+        } catch (const std::bad_alloc&) {
+          std::vector<uint8_t>().swap(written_cache_);
+          return finish(kCacheNoMemory);
+        }
       }
     }
-    ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
-    return data;
+    written_cache_.resize(bytes);  // within the capacity: no allocation, only the growth is zeroed
+    written_cache_valid_ = false;  // being overwritten
+    const VkResult result = data_cache_(device_, cache_pipelines_, &bytes, written_cache_.data());
+    if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || !bytes || bytes > written_cache_.size()) {
+      invalidate();
+      return finish(kCacheError);
+    }
+    written_cache_.resize(bytes);
+    written_cache_valid_ = true;
+    bytes_cache_saved_ = bytes;
+    return finish(kCacheSerialized);
   }
+
+  bool written_cache_valid_ = true;  // writer thread: written_cache_ holds a whole cache (or none was ever saved)
+  bool cache_cap_warned_ = false;    // writer thread
+  bool writer_no_thread_ = false;    // ring: the writer thread could not be created
+  uint32_t ring_save_failures_ = 0;  // ring: saves skipped there for lack of memory
+  uint32_t save_failures_ = 0;       // writer thread: failed saves
 
   bool serialize_off_ring_ = false;  // masseffect_native_pipelines_save_serialize_off_ring, read at start-up
   bool writer_cache_wanted_ = false;  // guarded by writer_mutex_: the writer serializes the cache itself

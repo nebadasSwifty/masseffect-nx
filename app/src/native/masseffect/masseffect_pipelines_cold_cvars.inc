@@ -62,6 +62,32 @@ REXCVAR_DEFINE_BOOL(masseffect_native_pipelines_save_serialize_off_ring, true, "
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 /*
+ * How often the pipelines file is saved, and how large its Vulkan cache part may get (2026-10-09).
+ *
+ * After a long tour the cache is ~48 MB and a save took 15 s on the writer thread; it was saved every 60 s with any
+ * new pipeline, allocating a full copy each time, until one allocation failed (std::bad_alloc, game terminated).
+ * Now a save needs masseffect_native_pipelines_save_min_new new pipelines (and at least _min_gap_s since the last
+ * one), or _interval_s with any new one; the destructor still saves. A cache above _cache_cap_mb is not serialized
+ * any more: only the prewarm list is saved (the prewarm thread regenerates the driver cache from it).
+ */
+REXCVAR_DEFINE_INT32(masseffect_native_pipelines_save_min_new, 64, "MASSEFFECT",
+                     "Native renderer: save the pipelines file once this many new pipelines were created (subject "
+                     "to masseffect_native_pipelines_save_min_gap_s)")
+    .range(1, 100000);
+REXCVAR_DEFINE_INT32(masseffect_native_pipelines_save_min_gap_s, 60, "MASSEFFECT",
+                     "Native renderer: minimum seconds between two saves triggered by "
+                     "masseffect_native_pipelines_save_min_new")
+    .range(0, 86400);
+REXCVAR_DEFINE_INT32(masseffect_native_pipelines_save_interval_s, 600, "MASSEFFECT",
+                     "Native renderer: save the pipelines file after this many seconds if there is any new "
+                     "pipeline (60 = the old behaviour)")
+    .range(10, 86400);
+REXCVAR_DEFINE_INT32(masseffect_native_pipelines_save_cache_cap_mb, 64, "MASSEFFECT",
+                     "Native renderer: a Vulkan pipeline cache larger than this (MB) is not saved any more; the "
+                     "prewarm list still is. 0 = no cap")
+    .range(0, 1024);
+
+/*
  * A prewarm list shipped with the build (our data, not game data: pipeline keys, vertex formats and shader
  * fingerprints). It is the list part of cache/masseffect_native_pipelines.bin after a long console run, extracted by
  * tools/extract_prewarm_list.py, and lives next to the NRO (not in cache/, so a cold test keeps it; an installed NSP

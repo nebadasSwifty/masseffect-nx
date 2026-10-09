@@ -6369,12 +6369,19 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       pipelines_no_save_ += compiled - prewarmed_counted_;
       prewarmed_counted_ = compiled;
     }
-    // The pipeline cache is saved after 64 new pipelines, or after a minute with any new one: on the
-    // Switch, exiting does not always reach the destructor.
-    if (pipelines_no_save_ &&
-        (pipelines_no_save_ >= 64 ||
-         std::chrono::steady_clock::now() - cache_saved_ >= std::chrono::seconds(60))) {
-      SaveCachePipelines();
+    // The pipeline cache is saved after masseffect_native_pipelines_save_min_new (64) new pipelines, but at most
+    // once per masseffect_native_pipelines_save_min_gap_s (60 s), or after masseffect_native_pipelines_save_interval_s
+    // (10 min) with any new one; and in the destructor. Each save serializes and rewrites the whole file (48 MB
+    // after a long tour), so it is not done every minute for a single pipeline any more. On the Switch, exiting does
+    // not always reach the destructor: at most one interval of fewer than min_new pipelines can be lost.
+    if (pipelines_no_save_) {
+      const auto since = std::chrono::steady_clock::now() - cache_saved_;
+      const uint32_t min_new = uint32_t(std::max<int32_t>(1, REXCVAR_GET(masseffect_native_pipelines_save_min_new)));
+      if ((pipelines_no_save_ >= min_new &&
+           since >= std::chrono::seconds(REXCVAR_GET(masseffect_native_pipelines_save_min_gap_s))) ||
+          since >= std::chrono::seconds(REXCVAR_GET(masseffect_native_pipelines_save_interval_s))) {
+        SaveCachePipelines();
+      }
     }
   }
 
@@ -8306,7 +8313,15 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     const std::streamoff bytes = file ? std::streamoff(file.tellg()) : 0;
     if (bytes > 0 && bytes < (std::streamoff(256) << 20)) {
-      data.resize(size_t(bytes));
+      // No exception may leave here: an allocation failure is a missing file (masseffect_pipelines_cold_members.inc,
+      // "Never terminate on a failed allocation").
+      try {
+        data.resize(size_t(bytes));
+      } catch (const std::bad_alloc&) {
+        std::vector<uint8_t>().swap(data);
+        REXLOG_WARN("[native] C6: no memory to read {} ({} KB): ignored", path.string(), size_t(bytes) >> 10);
+        return;
+      }
       file.seekg(0);
       if (!file.read(reinterpret_cast<char*>(data.data()), std::streamsize(bytes))) {
         data.clear();
@@ -8314,31 +8329,62 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
   }
 
-  // Reads the pipelines file and splits it into the cache and the list. If it does not exist yet, the two
-  // older files (next to the NRO), which are deleted when the new one is written.
+  // Reads the pipelines file straight into its two parts (no whole-file copy: the cache part is tens of MB, and a
+  // second copy of it at start-up only fragments the heap). If it does not exist yet, the two older files (next to
+  // the NRO), which are deleted when the new one is written. The cache vector gets the writer's growth margin
+  // (CacheBufferMargin), so the first saves serialize into it without a new allocation.
   void ReadFilePipelines(std::vector<uint8_t>& cache, std::vector<uint8_t>& list) {
-    std::vector<uint8_t> all;
-    ReadWholeFile(PathFilePipelines(), all);
-    if (!all.empty()) {
+    std::ifstream file(PathFilePipelines(), std::ios::binary | std::ios::ate);
+    const std::streamoff total = file ? std::streamoff(file.tellg()) : 0;
+    if (total > 0 && total < (std::streamoff(256) << 20)) {
+      const uint64_t size = uint64_t(total);
+      uint8_t header[kHeaderFilePipelines] = {};
       uint32_t magic = 0;
       uint32_t version = 0;
       uint64_t bytes_list = 0;
       uint64_t bytes_cache = 0;
-      if (all.size() >= kHeaderFilePipelines) {
-        std::memcpy(&magic, all.data(), 4);
-        std::memcpy(&version, all.data() + 4, 4);
-        std::memcpy(&bytes_list, all.data() + 8, 8);
-        std::memcpy(&bytes_cache, all.data() + 16, 8);
+      file.seekg(0);
+      if (size >= kHeaderFilePipelines &&
+          file.read(reinterpret_cast<char*>(header), std::streamsize(kHeaderFilePipelines))) {
+        std::memcpy(&magic, header, 4);
+        std::memcpy(&version, header + 4, 4);
+        std::memcpy(&bytes_list, header + 8, 8);
+        std::memcpy(&bytes_cache, header + 16, 8);
       }
       if (magic != kMagicFilePipelines || version != kVersionFilePipelines ||
-          bytes_list > all.size() || bytes_cache > all.size() ||
-          kHeaderFilePipelines + bytes_list + bytes_cache != all.size()) {
+          bytes_list > size || bytes_cache > size ||
+          kHeaderFilePipelines + bytes_list + bytes_cache != size) {
         REXLOG_WARN("[native] C6: pipeline file from another version or damaged: starting from scratch");
         return;
       }
-      const auto start = all.begin() + kHeaderFilePipelines;
-      list.assign(start, start + std::ptrdiff_t(bytes_list));
-      cache.assign(start + std::ptrdiff_t(bytes_list), all.end());
+      try {
+        list.resize(size_t(bytes_list));
+      } catch (const std::bad_alloc&) {
+        std::vector<uint8_t>().swap(list);
+        REXLOG_WARN("[native] C6: no memory for the prewarm list of the pipeline file ({} KB): starting from "
+                    "scratch", size_t(bytes_list) >> 10);
+        return;
+      }
+      if (bytes_list && !file.read(reinterpret_cast<char*>(list.data()), std::streamsize(bytes_list))) {
+        list.clear();
+        REXLOG_WARN("[native] C6: pipeline file could not be read: starting from scratch");
+        return;
+      }
+      try {
+        cache.reserve(size_t(bytes_cache) + CacheBufferMargin(size_t(bytes_cache)));
+        cache.resize(size_t(bytes_cache));
+      } catch (const std::bad_alloc&) {
+        // The list is what matters (the prewarm thread regenerates the driver cache from it).
+        std::vector<uint8_t>().swap(cache);
+        REXLOG_WARN("[native] C6: no memory for the Vulkan cache part of the pipeline file ({} KB): the list "
+                    "is kept, the driver cache starts empty", size_t(bytes_cache) >> 10);
+        return;
+      }
+      if (bytes_cache && !file.read(reinterpret_cast<char*>(cache.data()), std::streamsize(bytes_cache))) {
+        cache.clear();
+        list.clear();
+        REXLOG_WARN("[native] C6: pipeline file could not be read: starting from scratch");
+      }
       return;
     }
     // An explicit new diagnostic cache must not import the legacy shared files.
@@ -8398,12 +8444,22 @@ class DrawsVulkanImpl final : public DrawsVulkan {
 
   void SaveCachePipelines() {
     cache_saved_ = std::chrono::steady_clock::now();
+    if (writer_no_thread_) {
+      return;  // the writer thread could not be created: nothing is saved in this session (warned once)
+    }
     // The prewarm list is saved even if the cache does not grow (a new pipeline whose shaders were already
     // in it does not make it grow). The cache, as usual: only if it has new entries.
+    // No allocation failure may leave this function (masseffect_pipelines_cold_members.inc): a list or cache
+    // that cannot be copied stays marked as unsaved and is retried with the next save.
     std::vector<uint8_t> list;
     if (list_no_save_) {
-      list_no_save_ = 0;
-      list = SerializePipelinesList();
+      try {
+        list = SerializePipelinesList();
+        list_no_save_ = 0;
+      } catch (const std::bad_alloc&) {
+        std::vector<uint8_t>().swap(list);
+        NoteSaveSkippedOnRing("no memory to copy the prewarm list");
+      }
     }
     std::vector<uint8_t> data;
     bool cache_wanted = false;  // masseffect_native_pipelines_save_serialize_off_ring: the writer serializes it
@@ -8414,17 +8470,27 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       pipelines_no_save_ = 0;
       const auto serialize_start = std::chrono::steady_clock::now();
       size_t bytes = 0;
+      const size_t cap = CacheCapBytes();
       // without new entries it is not rewritten (the SD card is slow on the Switch)
       if (cache_pipelines_ != VK_NULL_HANDLE &&
           data_cache_(device_, cache_pipelines_, &bytes, nullptr) == VK_SUCCESS && bytes &&
-          bytes != bytes_cache_saved_) {
-        data.resize(bytes);
-        const VkResult result = data_cache_(device_, cache_pipelines_, &bytes, data.data());
-        if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || !bytes) {
-          data.clear();
-        } else {
+          bytes != bytes_cache_saved_ && (!cap || bytes <= cap)) {
+        try {
           data.resize(bytes);
-          bytes_cache_saved_ = bytes;
+        } catch (const std::bad_alloc&) {
+          std::vector<uint8_t>().swap(data);
+          bytes = 0;
+          pipelines_no_save_ = 1;  // retried with the next save (masseffect_native_pipelines_save_interval_s)
+          NoteSaveSkippedOnRing("no memory to serialize the Vulkan cache");
+        }
+        if (bytes) {
+          const VkResult result = data_cache_(device_, cache_pipelines_, &bytes, data.data());
+          if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || !bytes) {
+            data.clear();
+          } else {
+            data.resize(bytes);
+            bytes_cache_saved_ = bytes;
+          }
         }
       }
       ns_ring_serialize_ = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -8437,10 +8503,19 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     // thread stalled it on every save. If the previous one has not been written yet, this one replaces it.
     std::lock_guard<std::mutex> latch(writer_mutex_);
     if (!writer_cache_.joinable()) {
-      writer_cache_ = std::thread([this] {
-        rex::thread::set_current_thread_name("MASSEFFECT cache de pipelines");
-        WriterCacheMain();
-      });
+      // Created from the ring like the other helper threads of this file (copies, bindings, prewarm, preload,
+      // async), joined in StopWriterCache and never detached. A failure only disables saving.
+      try {
+        writer_cache_ = std::thread([this] {
+          rex::thread::set_current_thread_name("MASSEFFECT cache de pipelines");
+          WriterCacheMain();
+        });
+      } catch (const std::exception& error) {
+        writer_no_thread_ = true;
+        REXLOG_WARN("[native] C6: could not create the pipeline cache writer thread ({}); the pipeline cache "
+                    "is not saved in this session", error.what());
+        return;
+      }
     }
     if (!data.empty()) {  // only the list, if the cache did not grow
       writer_data_ = std::move(data);
@@ -8453,47 +8528,145 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     writer_warning_.notify_one();
   }
 
+  // Ring: one warning per skipped save (they are at least masseffect_native_pipelines_save_min_gap_s apart).
+  void NoteSaveSkippedOnRing(const char* reason) {
+    if (ring_save_failures_++ < 16) {
+      REXLOG_WARN("[native] C6: pipelines save skipped on the ring ({}); retried with the next save", reason);
+    }
+  }
+
   // Pipeline cache writer thread. Sleeping or continuing is decided with the lock held.
+  //
+  // Nothing may leave this function by an exception: an uncaught std::bad_alloc here was std::terminate for the
+  // whole game (2026-10-09, RU tour, ~70 min: vector::resize of the 48 MB cache serialization). A failed
+  // save (no memory, Vulkan error, SD error) logs one warning, keeps what was not written and retries after
+  // kSaveBackoffFirstS, doubling up to kSaveBackoffMaxS; any new request from the ring also retries.
   void WriterCacheMain() {
-    std::vector<uint8_t> data;
+    std::vector<uint8_t> data;  // ring serialization mode only: a cache the ring serialized
     std::vector<uint8_t> list;  // the prewarm one
     bool cache_wanted = false;
+    bool dirty = false;  // written_list_ / written_cache_ hold something not yet in the file
+    bool retry = false;
+    std::chrono::steady_clock::time_point retry_at{};
+    uint32_t backoff_s = 0;
+    uint32_t cache_failures_row = 0;
     for (;;) {
+      bool stopping = false;
       {
         std::unique_lock<std::mutex> latch(writer_mutex_);
-        writer_warning_.wait(latch, [this] { return pending_writer_ || writer_stop_; });
-        if (!pending_writer_) {
-          return;  // stop, nothing pending
+        const auto ready = [this] { return pending_writer_ || writer_stop_; };
+        if (retry) {
+          writer_warning_.wait_until(latch, retry_at, ready);
+        } else {
+          writer_warning_.wait(latch, ready);
         }
-        data = std::move(writer_data_);
-        writer_data_ = {};
-        list = std::move(writer_list_);
-        writer_list_ = {};
-        cache_wanted = writer_cache_wanted_;
-        writer_cache_wanted_ = false;
-        pending_writer_ = false;
+        stopping = writer_stop_;
+        if (!pending_writer_) {
+          if (!retry) {
+            return;  // stop, nothing pending
+          }
+          if (!stopping && std::chrono::steady_clock::now() < retry_at) {
+            continue;  // spurious wake-up before the retry time
+          }
+          // retry time reached (or stopping: one last attempt)
+        } else {
+          if (!writer_data_.empty()) {
+            data = std::move(writer_data_);
+            writer_data_ = {};
+          }
+          if (!writer_list_.empty()) {
+            list = std::move(writer_list_);
+            writer_list_ = {};
+          }
+          cache_wanted |= writer_cache_wanted_;
+          writer_cache_wanted_ = false;
+          pending_writer_ = false;
+          if (retry && !stopping && std::chrono::steady_clock::now() < retry_at) {
+            continue;  // backing off after a failure: kept, attempted at retry_at together with what was pending
+          }
+        }
       }
-      // masseffect_native_pipelines_save_serialize_off_ring: vkGetPipelineCacheData here, not on the ring.
-      writer_ns_serialize_ = 0;
-      if (cache_wanted) data = SerializeCacheOnWriter(writer_ns_serialize_);
-      if (data.empty() && list.empty()) {
-        continue;  // the cache did not change size and the list did not change: nothing to write
+      const char* failure = nullptr;
+      try {
+        // A single file with both parts. Only one may arrive (the cache did not grow, or the list did not
+        // change): the other is the last one written. The writer keeps one copy of each part; in the default
+        // mode (serialize off the ring) the cache is serialized in place into written_cache_. Only the old ring
+        // mode briefly holds two cache copies (the ring's new one and the one replaced here).
+        if (!list.empty()) {
+          written_list_ = std::move(list);
+          list = {};
+          dirty = true;
+        }
+        if (!data.empty()) {
+          written_cache_ = std::move(data);
+          data = {};
+          written_cache_valid_ = true;
+          dirty = true;
+        }
+        // masseffect_native_pipelines_save_serialize_off_ring: vkGetPipelineCacheData here, not on the ring,
+        // straight into written_cache_ (the persistent buffer). After a failure the buffer no longer holds a
+        // valid cache: it is serialized again before anything is written.
+        writer_ns_serialize_ = 0;
+        if (serialize_off_ring_ && (cache_wanted || !written_cache_valid_)) {
+          cache_wanted = false;
+          switch (SerializeCacheOnWriter(writer_ns_serialize_)) {
+            case kCacheSerialized:
+              dirty = true;
+              cache_failures_row = 0;
+              break;
+            case kCacheNoMemory:
+              failure = "no memory for the Vulkan cache data";
+              break;
+            case kCacheError:
+              failure = "vkGetPipelineCacheData failed";
+              break;
+            case kCacheUnchanged:
+            case kCacheOverCap:
+              break;
+          }
+          if (failure && ++cache_failures_row >= kCacheFailuresBeforeListOnly && dirty) {
+            // The list is what matters: after several failures in a row it is written with an empty cache part
+            // (the prewarm thread regenerates the driver cache from it next time).
+            REXLOG_WARN("[native] C6: {} ({} times in a row): writing the prewarm list without the Vulkan cache",
+                        failure, cache_failures_row);
+            failure = nullptr;
+          }
+        }
+        if (!failure && dirty) {
+          if (WriteFilePipelines()) {
+            dirty = false;
+          } else {
+            failure = "could not write the file";
+          }
+        }
+      } catch (const std::bad_alloc&) {
+        failure = "out of memory";
+      } catch (const std::exception&) {
+        failure = "exception while saving";
       }
-      // A single file with both parts. Only one may arrive (the cache did not grow, or the list did not
-      // change): the other is the last one written.
-      if (!data.empty()) {
-        written_cache_ = std::move(data);
+      if (failure) {
+        if (stopping) {
+          REXLOG_WARN("[native] C6: pipelines not saved at shutdown ({})", failure);
+          return;  // no retry loop while the renderer is being destroyed
+        }
+        backoff_s = backoff_s ? std::min(backoff_s * 2, kSaveBackoffMaxS) : kSaveBackoffFirstS;
+        retry = true;
+        retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(backoff_s);
+        ++save_failures_;
+        REXLOG_WARN("[native] C6: pipelines not saved ({}; failure {}), retry in {} s", failure, save_failures_,
+                    backoff_s);
+        continue;
       }
-      if (!list.empty()) {
-        written_list_ = std::move(list);
-      }
-      WriteFilePipelines();
+      retry = false;
+      backoff_s = 0;
     }
   }
 
   // cache/masseffect_native_pipelines.bin with the list and the cache, written to a temporary file that is then
   // renamed. Writer thread only. The first time it is written, the two older files are deleted if present.
-  void WriteFilePipelines() {
+  // Both parts are streamed from the buffers they already live in (WriteChunked): no file-sized copy.
+  // False if the temporary file could not be written (the old file stays).
+  bool WriteFilePipelines() {
     const auto before = std::chrono::steady_clock::now();
     uint32_t pieces = 0;  // WriteChunked (masseffect_native_pipelines_save_chunk_kb)
     const std::filesystem::path path = PathFilePipelines();
@@ -8513,7 +8686,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
           !file.write(reinterpret_cast<const char*>(&bytes_cache), 8) ||
           !WriteChunked(file, written_list_.data(), size_t(bytes_list), pieces) ||
           !WriteChunked(file, written_cache_.data(), size_t(bytes_cache), pieces)) {
-        return;
+        return false;
       }
     }
     error.clear();
@@ -8531,7 +8704,7 @@ class DrawsVulkanImpl final : public DrawsVulkan {
     }
     if (saved_cache_++ < 8) {
       REXLOG_INFO("[native] C6: pipelines saved ({} KB of cache and {} in the prewarm list, in {} ms, from "
-                  "its thread{}; {} pieces; cache serialized {} in {:.1f} ms)",
+                  "its thread{}; {} pieces; cache serialized {} in {:.1f} ms; buffer {} KB)",
                   written_cache_.size() >> 10,
                   written_list_.size() >= kHeaderList
                       ? (written_list_.size() - kHeaderList) / sizeof(RegisterPipeline)
@@ -8540,8 +8713,10 @@ class DrawsVulkanImpl final : public DrawsVulkan {
                       .count(),
                   error ? ", could not rename" : "", pieces,
                   serialize_off_ring_ ? "on this thread" : "on the ring",
-                  double(serialize_off_ring_ ? writer_ns_serialize_ : ns_ring_serialize_.load()) / 1e6);
+                  double(serialize_off_ring_ ? writer_ns_serialize_ : ns_ring_serialize_.load()) / 1e6,
+                  written_cache_.capacity() >> 10);
     }
+    return true;
   }
 
   void StopWriterCache() {
@@ -13517,18 +13692,27 @@ class DrawsVulkanImpl final : public DrawsVulkan {
       }
     }
     if (!reason) {
-      file_list_.reserve(header[3]);
-      for (uint32_t i = 0; i < header[3]; ++i) {
-        RegisterPipeline r;
-        std::memcpy(&r, data.data() + kHeaderList + size_t(i) * sizeof(RegisterPipeline), sizeof(r));
-        if (r.n_attributes > RegisterPipeline::kMaxAttributes || r.n_bindings > RegisterPipeline::kMaxBindings) {
-          continue;
+      // Bounded (kMaxRegistersList records, 3.6 MB), but no allocation failure may terminate the start-up:
+      // without memory the session starts with no list.
+      try {
+        file_list_.reserve(header[3]);
+        index_list_.reserve(header[3]);
+        for (uint32_t i = 0; i < header[3]; ++i) {
+          RegisterPipeline r;
+          std::memcpy(&r, data.data() + kHeaderList + size_t(i) * sizeof(RegisterPipeline), sizeof(r));
+          if (r.n_attributes > RegisterPipeline::kMaxAttributes || r.n_bindings > RegisterPipeline::kMaxBindings) {
+            continue;
+          }
+          if (index_list_.emplace(XXH3_64bits(&r.key, sizeof(r.key)), file_list_.size()).second) {
+            file_list_.push_back(r);
+          }
         }
-        if (index_list_.emplace(XXH3_64bits(&r.key, sizeof(r.key)), file_list_.size()).second) {
-          file_list_.push_back(r);
-        }
+        written_list_ = std::move(data);  // the writer thread rewrites it unchanged if only the cache changes
+      } catch (const std::bad_alloc&) {
+        std::vector<RegisterPipeline>().swap(file_list_);
+        std::unordered_map<uint64_t, size_t>().swap(index_list_);
+        reason = "no memory for the list: starting fresh in this session";
       }
-      written_list_ = std::move(data);  // the writer thread rewrites it unchanged if only the cache changes
     }
     REXLOG_INFO("[native] C6 prewarm: {} pipelines in the list from {}{}{}", file_list_.size(),
                 path.string(), reason ? ": " : "", reason ? reason : "");
