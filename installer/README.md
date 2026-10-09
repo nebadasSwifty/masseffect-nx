@@ -23,8 +23,9 @@ Optionally the user adds Xbox 360 **DLC packages** (Bring Down the Sky, Pinnacle
 the DLC shaders, and `masseffect.toml` gets `dlc_enable = true`. See [../docs/dlc.md](../docs/dlc.md) section 4.
 
 Optionally (step 4, "Installable NSP", experimental) the page writes an **installable NSP** instead of the zip: the
-whole game as one application, or a small **update** for an NSP installed earlier. See "Installable NSP" below and
-[../docs/full-nsp.md](../docs/full-nsp.md).
+whole game as one application, or a small **update** for an NSP installed earlier, saved to a file or a FAT32 split
+folder, or **installed straight to the connected Switch over USB** (WebUSB to Sphaira's USB install screen; nothing is
+written to the computer). See "Installable NSP" below and [../docs/full-nsp.md](../docs/full-nsp.md).
 
 ## How it works
 
@@ -107,13 +108,15 @@ whole game as one application, or a small **update** for an NSP installed earlie
 
 `js/nsp.js` is a JavaScript port of `tools/build_full_nsp.py` (byte-identical output for the same keys; tested against
 it), `js/nsp_crypto.js` has the cryptography WebCrypto lacks (our own AES-128 for the XTS headers and the ECB key area,
-an incremental SHA-256, a deterministic RSA-PSS signer for tests), `js/nsp_sink.js` the outputs. `run()` in
-`js/pipeline.js` takes `output: 'nsp'` and an `nsp` option; the stages are `stagesFor(output, nsp)`.
+an incremental SHA-256, a deterministic RSA-PSS signer for tests), `js/nsp_sink.js` the outputs, `js/usb_install.js`
+and `js/crc32c.js` the USB install. `run()` in `js/pipeline.js` takes `output: 'nsp'` and an `nsp` option; the stages
+are `stagesFor(output, nsp)`.
 
 ```
  full NSP             download, scan, translate, pack,   nsp_hash (pass 1: hashes), nsp_write (pass 2: AES-CTR + write)
  update (with data)   download, nsp_base, scan, translate, pack, nsp_hash, nsp_write
  update (program)     download, nsp_base, nsp_write          (no shaders, no disc reads; ~ the NRO's size)
+ any of them, USB     ... nsp_write (pass 2: AES-CTR + hash only), nsp_usb (pass 3: served to the console by range)
 ```
 
 * **Keys.** The user picks `prod.keys`; only `header_key` and `key_area_key_application_00` are kept, in memory, and
@@ -137,8 +140,21 @@ an incremental SHA-256, a deterministic RSA-PSS signer for tests), `js/nsp_sink.
   `masseffect-nx-update-vN.nsp` to a chosen file, or in memory + download where there is no file picker. By default a
   program-only update; the checkbox "Also rebuild the shaders and settings from the disc" makes a full update (only
   changed 64 KiB chunks are stored).
-* **Browser support.** Full NSP: desktop Chrome, Edge, Opera (File System Access API). Firefox and Safari: the full
-  NSP button stays disabled with an explanation (use the zip and `tools/build_full_nsp.py`); updates work (memory).
+* **Install over USB** (output "Install to the connected Switch (USB)", and a checkbox for updates). The user starts
+  Sphaira -> Install -> USB on the console and connects the cable; the page runs as for a file, but pass 2 only hashes
+  (the NCA names in the NSP header are SHA-256 hashes, and Sphaira reads the header first), and then
+  `UsbNspSink` (`js/nsp_sink.js`) asks for the console (`navigator.usb`, 057E:3000: a console the site was allowed
+  before is used without asking, else a "Choose the Switch" button opens the browser's chooser) and serves the NSP
+  with Sphaira's protocol (`serveFiles` in `js/usb_install.js`). The NSP is never stored: `NspImage` (`js/nsp.js`)
+  keeps the header, the Control and the Meta NCA in memory and makes the Program NCA again as the console reads it
+  (sequential reads continue a cursor; anything else reopens it at that offset: every source can start at an offset,
+  and AES-CTR is seekable). The re-made Program NCA is checked against the pass 2 hash before its last block goes out.
+  Progress shows bytes and MB/s; Cancel closes the device (Sphaira then reports a USB error). An install the console
+  stops early (cancelled there, no space, already installed) is reported as an error. Windows may need the WinUSB driver
+  for 057E:3000 (Zadig); Linux a udev rule. Design and protocol: [../docs/full-nsp.md](../docs/full-nsp.md) section 6.
+* **Browser support.** Full NSP: desktop Chrome, Edge, Opera (File System Access API; WebUSB for the USB install).
+  Firefox and Safari: the full NSP button stays disabled with an explanation (use the zip and
+  `tools/build_full_nsp.py`); updates work (memory). Without WebUSB the USB output explains why it is unavailable.
 * **Installing.** The page explains DBI (USB/MTP install recommended) and Goldleaf, the 4 GB FAT32 limit, the split
   folder and its archive bit. Signature patches are needed, as for the launcher NSP.
 * **Speed** (Chromium, M-series Mac, data in memory): pass 1 ~890 MB/s, pass 2 ~260 MB/s (the JS SHA-256 of the
@@ -277,7 +293,14 @@ node --test installer/test/          # Node 20+
   plus a real pack (WebCrypto RSA key) whose header signature verifies against the NPDM key.
 * `nsp_pipeline.test.js`: `run()` with `output: 'nsp'` and stand-in workers (stages, packed files incl. the prewarm
   list, full NSP, updates,
-  errors discard the output).
+  errors discard the output; the USB target against the fake console, with sources re-read from inside: disc slices
+  and pack worker reads at an offset).
+* `usb.test.js` (with `test/usb_fake_console.js`, a stand-in console that reads like Sphaira's installer: PFS0 header,
+  Meta NCA, Control NCA, Program NCA, and checks every NCA's SHA-256 against its name): CRC-32C (published check values,
+  a bitwise reference, speed), the packets (vectors made with Python), `serveFiles` with several files and bad
+  requests, whole USB installs compared byte for byte with the file output (also with out-of-order reads and a tiny
+  window, a program-only update, a source that changes between the passes, a console that stops early),
+  `NspImage` random ranges, and `WebUsbTransport` over a fake `USBDevice`.
 * `e2e.test.js` (optional; `MASSEFFECT_TEST_WASM`, `MASSEFFECT_TEST_DISC`, native `dxc`): the whole pipeline over a few
   real packages with the real scan/hlsl/pack WebAssembly, the installer's worker code and either the real DXC WASM (`MASSEFFECT_TEST_DXC_WASM=1`) or a native DXC behind the
   `dxc_web` interface (`test/fixtures/dxc_native_shim.mjs`).
@@ -294,6 +317,10 @@ node --test installer/test/          # Node 20+
   size needed, quota permitting), and without that it is built in memory and will fail above a few GB.
 * The NSP writer runs on the page's main thread (in 4 MiB steps, so the page stays responsive); a full NSP from the
   browser has not been installed on a console yet (the same bytes from the host packer have).
+* **The USB install has not been run against a real console yet** (only against the fake console of the tests; the
+  same protocol from `tools/usb_install.py` of the recomp repository works). Not measured: the USB throughput from the
+  browser, whether Sphaira's 3 s transfer timeout is ever hit by the regeneration of a range, Windows/Linux driver
+  setup.
 * Dual-layer images where the game partition is not at one of the four offsets are rejected ("not an Xbox 360 disc
   image").
 * The page reads whole packages (up to about 28 MB) into memory, one per scan worker.

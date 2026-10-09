@@ -5,6 +5,9 @@
 // Streaming, like the Python packer: pass 1 reads the RomFS once and keeps only hashes (IVFC block hashes, 64 KiB
 // chunk hashes per file), pass 2 reads it again, encrypts and writes it, then the NSP header (whose names are the
 // NCA hashes) is written over a placeholder. Peak memory: a few tens of MB plus the program (~60 MB).
+// A sink with serve() (the USB install, js/nsp_sink.js UsbNspSink) gets no writes: pass 2 only hashes, and the
+// finished NSP is then served by range from an NspImage, which encrypts the requested region again (AES-CTR is
+// seekable; every stream below can start at an offset).
 //
 // Keys: parseProdKeys() keeps only header_key and key_area_key_application_00, in memory, for the lifetime of the
 // tab (the page drops them on pagehide). They are never uploaded, stored or logged, and error messages never contain
@@ -417,9 +420,27 @@ export function romfsTableCount(n) {
   return n;
 }
 
-/** A RomFS file: bytes, or a size and a re-readable chunks() (async iterable of Uint8Array). */
+/**
+ * A RomFS file: bytes, or a size and a re-readable chunks() (async iterable of Uint8Array). A source with
+ * `seekable: true` takes chunks(from) and starts at byte `from`; others are read from the start and the head dropped.
+ */
 export function sourceFromBytes(bytes) {
-  return { size: bytes.length, chunks: async function* () { if (bytes.length) yield bytes; } };
+  return { size: bytes.length, seekable: true, chunks: async function* (from = 0) { if (bytes.length > from) yield from ? bytes.subarray(from) : bytes; } };
+}
+
+/** Drops the first `n` bytes of an async byte stream. */
+export async function* skipBytes(stream, n) {
+  for await (const block of stream) {
+    if (n >= block.length) { n -= block.length; continue; }
+    yield n ? block.subarray(n) : block;
+    n = 0;
+  }
+}
+
+/** A source's bytes from `from` (its own seek when it has one). */
+export function sourceChunksFrom(src, from) {
+  if (!from) return src.chunks();
+  return src.seekable ? src.chunks(from) : skipBytes(src.chunks(), from);
 }
 
 class RomfsDir {
@@ -538,25 +559,33 @@ export class Romfs {
     return this.size;
   }
 
-  /** The whole image, in order (call layout() first). */
-  async *chunks() {
-    const head = new Uint8Array(ROMFS_DATA_OFFSET);
-    head.set(this.header);
-    yield head;
-    let pos = ROMFS_DATA_OFFSET;
+  /**
+   * The whole image, in order (call layout() first), or its tail from byte `from`: files before it are not read, the
+   * file that contains it starts at its inner offset (sourceChunksFrom).
+   */
+  async *chunks(from = 0) {
+    if (from < ROMFS_DATA_OFFSET) {
+      const head = new Uint8Array(ROMFS_DATA_OFFSET);
+      head.set(this.header);
+      yield from ? head.subarray(from) : head;
+    }
+    let pos = Math.max(from, ROMFS_DATA_OFFSET);
     for (const [doff, src] of this.placements) {
       const target = ROMFS_DATA_OFFSET + doff;
+      if (target + src.size <= pos && src.size) continue;
       if (target > pos) { yield new Uint8Array(target - pos); pos = target; }
-      let got = 0;
-      for await (const block of src.chunks()) {
+      if (!src.size) continue;
+      const inner = pos - target;
+      let got = inner;
+      for await (const block of sourceChunksFrom(src, inner)) {
         yield block;
         pos += block.length;
         got += block.length;
       }
       if (got !== src.size) throw new PackError(`a file of the RomFS changed size while packing (${got} != ${src.size})`);
     }
-    if (this.metaOff > pos) yield new Uint8Array(this.metaOff - pos);
-    yield this.meta;
+    if (this.metaOff > pos) { yield new Uint8Array(this.metaOff - pos); pos = this.metaOff; }
+    if (pos - this.metaOff < this.meta.length) yield this.meta.subarray(pos - this.metaOff);
   }
 }
 
@@ -738,6 +767,8 @@ class Section {
     this.size = size;
     this.chunks = chunkFn;
     this.ctrUpper = (BigInt(secureValue) << 32n) | BigInt(generation);
+    // chunks(from) starts at byte `from` of the section (else NcaBuilder drops the head of a full read).
+    this.seekable = false;
   }
 }
 
@@ -752,7 +783,9 @@ async function pfs0Section(pfs0, hashBlock) {
   new Fields(fs).u16(0, 2).u8(2, 1).u8(3, 2).u8(4, 3)
     .bytes(0x08, sha256(table))
     .u32(0x28, hashBlock).u32(0x2C, 2).u64(0x30, 0).u64(0x38, table.length).u64(0x40, pfs0Off).u64(0x48, pfs0.length);
-  return new Section(fs, body.length, async function* () { yield body; });
+  const section = new Section(fs, body.length, async function* (from = 0) { if (from < body.length) yield body.subarray(from); });
+  section.seekable = true;
+  return section;
 }
 
 /** IVFC (HierarchicalIntegrity) over a data image (tools/build_full_nsp.py IvfcPlan). */
@@ -816,16 +849,20 @@ class IvfcPlan {
     return fs;
   }
 
-  async *chunks(dataChunks) {
-    let pos = 0;
+  /** The section image from byte `from`; dataChunks(inner) gives the data level (level 6) from its byte `inner`. */
+  async *chunks(dataChunks, from = 0) {
+    let pos = from;
     for (let i = 0; i < this.levels.length; i++) {
-      const [, blob] = this.levels[i];
-      if (this.offsets[i] > pos) { yield new Uint8Array(this.offsets[i] - pos); pos = this.offsets[i]; }
+      const [size, blob] = this.levels[i];
+      const start = this.offsets[i];
+      if (start + size <= pos) continue;
+      if (start > pos) { yield new Uint8Array(start - pos); pos = start; }
+      const inner = pos - start;
       if (blob !== null) {
-        yield blob;
-        pos += blob.length;
+        yield inner ? blob.subarray(inner) : blob;
+        pos = start + blob.length;
       } else {
-        for await (const block of dataChunks()) { yield block; pos += block.length; }
+        for await (const block of dataChunks(inner)) { yield block; pos += block.length; }
       }
     }
     if (this.size > pos) yield new Uint8Array(this.size - pos);
@@ -851,7 +888,9 @@ async function romfsSection(romfs, { progress, signal, chunkBytes = CHUNK } = {}
   const plan = await IvfcPlan.create(hasher.finish(), romfs.size);
   romfs.plan = plan;
   romfs.chunkHashes = chunks.result;
-  return new Section(plan.fsHeader(), plan.size, () => plan.chunks(() => romfs.chunks()));
+  const section = new Section(plan.fsHeader(), plan.size, (from = 0) => plan.chunks((inner) => romfs.chunks(inner), from));
+  section.seekable = true;
+  return section;
 }
 
 // ---- NCA ---------------------------------------------------------------------------------------------------------------
@@ -872,7 +911,13 @@ class NcaBuilder {
     this.size = off;
   }
 
-  async header() {
+  /** The encrypted header. Made once: the RSA-PSS signature is randomised, and every read must see the same bytes. */
+  header() {
+    this.headerPromise ??= this.#makeHeader();
+    return this.headerPromise;
+  }
+
+  async #makeHeader() {
     const h = new Uint8Array(0xC00);
     h.set(enc.encode('NCA3'), 0x200);
     const f = new Fields(h).u8(0x204, 0).u8(0x205, this.contentType).u8(0x206, 0).u8(0x207, 0)
@@ -890,15 +935,23 @@ class NcaBuilder {
     return aesXts(this.keys.header_key, h);
   }
 
-  /** The encrypted NCA, in order. */
-  async *chunks() {
-    yield await this.header();
+  /** The encrypted NCA, in order, from byte `from` (a multiple of 16: AES-CTR restarts at any block). */
+  async *chunks(from = 0) {
+    if (from % 16) throw new Error('NcaBuilder.chunks: the start must be 16-aligned');
+    if (from < 0xC00) {
+      const h = await this.header();
+      yield from ? h.subarray(from) : h;
+    }
     const ctr = new AesCtr(this.aesKey);
     for (let i = 0; i < this.sections.length; i++) {
       const s = this.sections[i];
-      let pos = this.starts[i];
-      let written = 0;
-      for await (const block of rechunk(s.chunks(), this.chunkBytes, this.signal)) {
+      const start = this.starts[i];
+      if (start + s.size <= from) continue;
+      const inner = Math.max(0, from - start);
+      let pos = start + inner;
+      let written = inner;
+      const stream = !inner ? s.chunks() : s.seekable ? s.chunks(inner) : skipBytes(s.chunks(), inner);
+      for await (const block of rechunk(stream, this.chunkBytes, this.signal)) {
         yield await ctr.apply(s.ctrUpper, pos, block);
         pos += block.length;
         written += block.length;
@@ -1393,7 +1446,7 @@ export function validDataDir(d) {
  *   signer      { modulus, sign(message) } (default: a fresh WebCrypto RSA-2048 key)
  *   aesKeyFor   (contentType) => Uint8Array(16) (default: random keys)
  *   sink        { write(bytes), writeAt(position, bytes) } (js/nsp_sink.js)
- *   onProgress  (phase 'hash' | 'write', done, total)
+ *   onProgress  (phase 'hash' | 'write' | 'usb', done, total, info); 'usb' only with a serving sink, info = { rate }
  *   chunkBytes  read/encrypt block size (default 4 MiB; a multiple of 16 KiB)
  *   log, signal
  * Returns { titleId, patchId, version, files: [[name, size]], size, baseMeta (full packs), stats }.
@@ -1515,19 +1568,24 @@ export async function buildNsp(options) {
 }
 
 async function writeNsp(sink, program, control, makeMeta, { progress, signal, log }) {
+  // A serving sink (USB install) gets nothing written: the header must be final before the console reads it, so pass 2
+  // only hashes, and the NSP is then served by range (NspImage regenerates the Program NCA).
+  const serving = typeof sink.serve === 'function';
   const metaSize = (await makeMeta(new Uint8Array(32), program.size, new Uint8Array(32))).length;
   const zeros = '0'.repeat(32);
   const names = [[`${zeros}.nca`, program.size], [`${zeros}.nca`, control.length], [`${zeros}.cnmt.nca`, metaSize]];
   const headerSize = pfs0Header(names).length;
   const total = headerSize + names.reduce((a, [, s]) => a + s, 0);
   log(`NSP: ${formatSize(total)}`);
-  await sink.write(new Uint8Array(headerSize));
-  log('Pass 2/2: encrypting and writing the Program NCA');
+  if (!serving) await sink.write(new Uint8Array(headerSize));
+  log(serving
+    ? 'Pass 2/3: encrypting and hashing the Program NCA (its SHA-256 is its name in the NSP header, which the console reads first; nothing is written)'
+    : 'Pass 2/2: encrypting and writing the Program NCA');
   const digest = new Sha256();
   let written = 0;
   for await (const block of program.chunks()) {
     throwIfAborted(signal);
-    await sink.write(block);
+    if (!serving) await sink.write(block);
     digest.update(block);
     written += block.length;
     progress('write', written, program.size);
@@ -1535,11 +1593,11 @@ async function writeNsp(sink, program, control, makeMeta, { progress, signal, lo
   if (written !== program.size) throw new PackError('Program NCA size mismatch');
   const programHash = digest.digest();
   const controlHash = sha256(control);
-  await sink.write(control);
+  if (!serving) await sink.write(control);
   const meta = await makeMeta(programHash, program.size, controlHash);
   if (meta.length !== metaSize) throw new PackError('Meta NCA size changed');
   const metaHash = sha256(meta);
-  await sink.write(meta);
+  if (!serving) await sink.write(meta);
   const files = [
     [`${toHex(programHash.subarray(0, 16))}.nca`, program.size],
     [`${toHex(controlHash.subarray(0, 16))}.nca`, control.length],
@@ -1547,8 +1605,132 @@ async function writeNsp(sink, program, control, makeMeta, { progress, signal, lo
   ];
   const header = pfs0Header(files);
   if (header.length !== headerSize) throw new PackError('NSP header size changed');
-  await sink.writeAt(0, header);
+  if (serving) {
+    log('Pass 3/3: serving the NSP to the console (the Program NCA is read and encrypted again as the console asks for it)');
+    const image = new NspImage(header, program, programHash, control, meta, { signal, log });
+    await sink.serve(image, { signal, log, progress: (done, all, info) => progress('usb', done, all, info) });
+  } else {
+    await sink.writeAt(0, header);
+  }
   return { files, total };
+}
+
+/**
+ * A finished NSP that is never stored: read(offset, length) returns any range. The header, the Control and the Meta
+ * NCA are in memory; the Program NCA (the 8 GB) is made again on demand from a cursor over NcaBuilder.chunks(from):
+ * sequential reads (what Sphaira does for an NCA) continue the cursor, a recent range is answered from a small window
+ * of the last blocks, and anything else reopens the cursor at the requested offset (no data is read before it).
+ * While the Program NCA is produced in one sequential run from its start, its SHA-256 is checked against the hash
+ * from pass 2: a source that changed between the passes fails before its last block reaches the console.
+ */
+export class NspImage {
+  constructor(header, program, programHash, control, meta, { signal = null, log = () => {}, windowBytes = 16 << 20, skipAheadBytes = 64 << 20 } = {}) {
+    this.header = header;
+    this.program = program;
+    this.programHash = programHash;
+    this.control = control;
+    this.meta = meta;
+    this.signal = signal;
+    this.log = log;
+    this.windowBytes = windowBytes;
+    this.skipAheadBytes = skipAheadBytes;
+    this.programStart = header.length;
+    this.controlStart = this.programStart + program.size;
+    this.metaStart = this.controlStart + control.length;
+    this.size = this.metaStart + meta.length;
+    this.stats = { reopens: 0, producedBytes: 0, verified: false };
+    this.cursor = null; // { it, pos }
+    this.window = []; // [{ start, bytes }] of the Program NCA, in order
+    this.hash = new Sha256();
+    this.hashedTo = 0;
+    this.coverage = []; // merged [start, end) ranges of the NSP read so far
+  }
+
+  /** Bytes [offset, offset + length) of the NSP (shorter at the end of the file). */
+  async read(offset, length) {
+    throwIfAborted(this.signal);
+    if (offset < 0 || offset > this.size) throw new RangeError(`read past the end of the NSP (${offset})`);
+    const end = Math.min(this.size, offset + length);
+    const out = new Uint8Array(end - offset);
+    const pieces = [[0, this.header], [this.controlStart, this.control], [this.metaStart, this.meta]];
+    for (const [start, bytes] of pieces) {
+      const lo = Math.max(offset, start), hi = Math.min(end, start + bytes.length);
+      if (lo < hi) out.set(bytes.subarray(lo - start, hi - start), lo - offset);
+    }
+    const lo = Math.max(offset, this.programStart), hi = Math.min(end, this.controlStart);
+    if (lo < hi) await this.#program(lo - this.programStart, hi - this.programStart, out, lo - offset);
+    this.#cover(offset, end);
+    return out;
+  }
+
+  /** Whether every byte of the NSP has been read at least once (the console installed all of it). */
+  complete() {
+    return this.coverage.length === 1 && this.coverage[0][0] === 0 && this.coverage[0][1] === this.size;
+  }
+
+  #cover(lo, hi) {
+    if (lo >= hi) return;
+    const next = [];
+    for (const [a, b] of this.coverage) {
+      if (b < lo || a > hi) next.push([a, b]);
+      else { lo = Math.min(lo, a); hi = Math.max(hi, b); }
+    }
+    next.push([lo, hi]);
+    next.sort((x, y) => x[0] - y[0]);
+    this.coverage = next;
+  }
+
+  async #program(from, to, out, outOffset) {
+    const windowStart = this.window.length ? this.window[0].start : this.cursor?.pos;
+    if (!this.cursor || from < windowStart || from > this.#windowEnd() + this.skipAheadBytes) this.#reopen(from);
+    while (this.#windowEnd() < to) {
+      const { value, done } = await this.cursor.it.next();
+      if (done) throw new PackError('the Program NCA ended early (a source changed size?)');
+      throwIfAborted(this.signal);
+      const start = this.cursor.pos;
+      this.cursor.pos += value.length;
+      this.stats.producedBytes += value.length;
+      this.#hashBlock(start, value);
+      this.window.push({ start, bytes: value });
+      // Keep the window small, but never drop a block the current request still needs.
+      while (this.window.length > 1 && this.#windowEnd() - this.window[0].start - this.window[0].bytes.length >= this.windowBytes &&
+        this.window[0].start + this.window[0].bytes.length <= from) this.window.shift();
+    }
+    for (const { start, bytes } of this.window) {
+      const lo = Math.max(from, start), hi = Math.min(to, start + bytes.length);
+      if (lo < hi) out.set(bytes.subarray(lo - start, hi - start), outOffset + (lo - from));
+    }
+  }
+
+  #windowEnd() {
+    return this.cursor.pos; // the window always ends where the cursor is
+  }
+
+  #reopen(from) {
+    const start = from - (from % 0x4000); // an IVFC block: whole blocks from the sources, AES-CTR 16-aligned
+    if (this.cursor) {
+      this.stats.reopens++;
+      Promise.resolve(this.cursor.it.return?.()).catch(() => {});
+      this.log(`USB: the console asked for Program NCA offset ${from} out of order; regenerating from ${start}`);
+    }
+    this.window = [];
+    this.cursor = { it: this.program.chunks(start)[Symbol.asyncIterator](), pos: start };
+  }
+
+  #hashBlock(start, bytes) {
+    // Only the continuation of what was hashed so far (re-made blocks after a reopen backwards add their new tail; a
+    // reopen past it ends the check).
+    if (start > this.hashedTo || start + bytes.length <= this.hashedTo) return;
+    this.hash.update(bytes.subarray(this.hashedTo - start));
+    this.hashedTo = start + bytes.length;
+    if (this.hashedTo === this.program.size) {
+      if (!equalBytes(this.hash.digest(), this.programHash)) {
+        throw new PackError('the data changed between the hashing pass and the install (a file on the disc or in the folder was modified or became unreadable); the console would reject the package');
+      }
+      this.stats.verified = true;
+      this.log('USB: Program NCA verified (same SHA-256 as pass 2)');
+    }
+  }
 }
 
 function formatSize(n) {
