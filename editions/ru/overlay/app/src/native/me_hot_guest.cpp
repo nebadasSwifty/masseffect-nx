@@ -5,11 +5,14 @@
 //
 // Every hook replaces one recompiled function by an exact native version (src/native/hot/n_<addr>.h) and checks itself:
 // for the first masseffect_hot_guard_calls calls (and every masseffect_hot_guard_period-th call afterwards) the native
-// version runs on a copy of the registers with the guest ranges it writes snapshotted, the memory is rolled back, the
-// original (__imp__sub_X) runs for real, and registers, written ranges and the FPU mode are compared. A difference
-// logs "[hot] DIFFERENCE ..." and switches that hook off for the rest of the run (the original already produced the
-// correct state).
+// version runs on a copy of the registers and on a private copy of the guest ranges it writes (its shadow build,
+// me_hot_shadow.cpp / me_hot_shadow.h: nothing is written to guest memory), then the original (__imp__sub_X) runs for
+// real, and registers, written ranges and the FPU mode are compared. A difference logs "[hot] DIFFERENCE ..." and
+// switches that hook off for the rest of the run (the original already produced the correct state). Other guest threads
+// only ever see the original's stores (2026-10-09: the previous guard wrote the native result into guest memory and
+// rolled it back, a race with threads sharing those bytes; per-hook notes in docs/hot-guard.md).
 #include "me_hot_guest.h"
+#include "me_hot_shadow.h"
 
 #include <rex/logging.h>
 
@@ -109,6 +112,18 @@ std::string CompareRegs(const Cmp& cmp, const PPCContext& a, const PPCContext& b
   return {};
 }
 
+// Slack pages of the guard's private copy (me_hot_shadow.h ShadowPageFn): on the Switch through the always-mapped shadow
+// alias of a committed page (no fault, no commit, no watched-page read); elsewhere none (the slack stays in the declared
+// pages).
+#if defined(__SWITCH__)
+extern "C" void* RexGmShadowFor(uint64_t window_address);
+const uint8_t* GuardPage(const uint8_t* base, uint32_t page) {
+  return static_cast<const uint8_t*>(RexGmShadowFor(reinterpret_cast<uint64_t>(base + page)));
+}
+#else
+const uint8_t* GuardPage(const uint8_t*, uint32_t) { return nullptr; }
+#endif
+
 }  // namespace
 
 void Check(Hook& h, PPCContext& ctx, uint8_t* base) {
@@ -118,37 +133,40 @@ void Check(Hook& h, PPCContext& ctx, uint8_t* base) {
     h.orig(ctx, base);
     return;
   }
-  const size_t total = TotalBytes(w);
-  std::vector<uint8_t> before(total), native_out(total);
-  SaveRanges(w, base, before.data());
+  // Private copy of the declared ranges; guest memory is only read here.
+  ShadowView view;
+  std::vector<uint8_t> storage;
+  if (!ShadowBuild(view, w, base, ctx.r1.u32, storage, &GuardPage)) {  // a range wraps around 4 GB: cannot verify
+    h.orig(ctx, base);
+    return;
+  }
   const uint32_t hw_before = ctx.fpscr.getcsr();
   const uint32_t csr_before = ctx.fpscr.csr;
   const PPCContext in = ctx;  // inputs for the report
   PPCContext nat = ctx;
-  if (!h.native(nat, base)) {  // declined: the original runs, nothing to compare
-    h.orig(ctx, base);
-    return;
-  }
+  ShadowView* const outer = t_shadow;  // a guarded call reached from guest code that a shadow native called
+  t_shadow = &view;
+  const bool handled = h.shadow(nat, base);
+  t_shadow = outer;
   const uint32_t hw_native = nat.fpscr.getcsr();
-  // All ranges are copied before any is rolled back: declared ranges may overlap (me_hot_common.h SaveRanges).
-  SaveRanges(w, base, native_out.data());
-  RestoreRanges(w, base, before.data());  // roll back
   ctx.fpscr.setcsr(hw_before);
   ctx.fpscr.csr = csr_before;
-  h.orig(ctx, base);  // the call for real
+  h.orig(ctx, base);  // the call for real: the only writer of guest memory
+  if (!handled) return;  // declined: the original ran, nothing to compare
   const uint32_t hw_orig = ctx.fpscr.getcsr();
 
   std::string diff = CompareRegs(h.cmp, nat, ctx);
   if (diff.empty() && hw_native != hw_orig) diff = fmt::format("hardware FPCR native={:#x} original={:#x}", hw_native, hw_orig);
   if (diff.empty()) {
-    int ri = 0;
-    uint32_t k = 0;
-    if (FirstRangeDiff(w, base, native_out.data(), &ri, &k)) {
-      size_t off = 0;
-      for (int i = 0; i < ri; ++i) off += w.r[i].len;
-      diff = fmt::format("memory {:#010x} (+{} of range {:#010x}+{}) native={:#04x} original={:#04x}",
-                         w.r[ri].addr + k, k, w.r[ri].addr, w.r[ri].len, native_out[off + k],
-                         *Raw(base, w.r[ri].addr + k));
+    const ShadowDiff d = ShadowCompare(view, w, base);
+    if (d.kind == ShadowDiff::kMemory) {
+      diff = fmt::format("memory {:#010x} (+{} of range {:#010x}+{}) native={:#04x} original={:#04x}", d.addr, d.offset,
+                         w.r[d.range].addr, w.r[d.range].len, d.native, d.original);
+    } else if (d.kind == ShadowDiff::kStore) {
+      diff = fmt::format("native stored to {:#010x}, outside its declared write ranges (store dropped)", d.addr);
+    } else if (d.kind == ShadowDiff::kSlack) {
+      diff = fmt::format("native wrote {:#010x} next to its declared write ranges (native={:#04x} before={:#04x})", d.addr,
+                         d.native, d.original);
     }
   }
   const uint64_t n = h.checks.fetch_add(1, std::memory_order_relaxed) + 1;

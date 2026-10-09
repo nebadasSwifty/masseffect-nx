@@ -292,5 +292,6 @@ extern "C" void __imp__sub_8250C628(PPCContext& c, uint8_t* base) {  // DrawRich
 }
 namespace {
 fuzz::Registrar reg_8264E178({"sub_8264EBB0(8264E178)", c8264E178::orig_w, c8264E178::nat_w, c8264E178::writes_w,
-                              me::hot::n_8264E178::kCmp, c8264E178::kWin, c8264E178::kLen, c8264E178::gen});
+                              me::hot::n_8264E178::kCmp, c8264E178::kWin, c8264E178::kLen, c8264E178::gen,
+                              me::hot::n_8264E178::Writes});  // guard replay: the console guard's write set
 }  // namespace

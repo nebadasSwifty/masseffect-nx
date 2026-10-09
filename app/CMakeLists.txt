@@ -38,6 +38,8 @@ set(MASSEFFECT_SOURCES
     src/native/me_physx.cpp
     src/native/me_audio_hooks.cpp
     src/native/me_hot_guest.cpp
+    # Self-check guard: the hot natives compiled again with private-copy accessors (me_hot_shadow.h, docs/hot-guard.md).
+    src/native/me_hot_shadow.cpp
     src/native/me_hang_watchdog.cpp
     src/native/me_console_exec.cpp
     src/native/me_tour.cpp

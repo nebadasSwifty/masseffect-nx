@@ -17,15 +17,14 @@
 // the first NaN operand of the instruction the compiler emitted; a fresh invalid-operation NaN is +default NaN and
 // fneg flips it), so they are only reproducible bit-exactly by running the very same compiled code. Whenever the
 // determinant or any of the 16 results is NaN (NaN inputs, inf*0, inf-inf, overflow to +-inf followed by a
-// subtraction), nothing has been written yet and the call is delegated to the original (__imp__sub_822631E8, the
-// unpatched entry). NaN-free results are fully determined by IEEE rounding, which both paths share.
+// subtraction), nothing has been written yet and the call is declined (returns false: the hook runs the original,
+// __imp__sub_822631E8; declining instead of calling it from here keeps the self-check guard's shadow run free of guest
+// stores). NaN-free results are fully determined by IEEE rounding, which both paths share.
 #pragma once
 
 #include <cmath>
 
 #include "../me_hot_common.h"
-
-extern "C" void __imp__sub_822631E8(PPCContext&, uint8_t*);
 
 namespace me::hot::n_822631E8 {
 
@@ -34,7 +33,7 @@ inline constexpr Cmp kCmp = {R(3), 0, 0};
 inline constexpr uint32_t kR = uint32_t(-2113142784 + -12956);   // r11 of the original: 1.0f at kR, compare constant at kR-15532
 inline constexpr uint32_t kIdent = uint32_t(-2098855936 + 20272);  // 64 bytes copied if det == 0
 
-inline void Native(PPCContext& ctx, uint8_t* base) {
+inline bool Native(PPCContext& ctx, uint8_t* base) {
   const uint32_t dst = ctx.r3.u32;
   const uint32_t m = ctx.r4.u32;
   auto ld = [&](uint32_t k) { return double(LdF32(base, m + k)); };
@@ -85,8 +84,7 @@ inline void Native(PPCContext& ctx, uint8_t* base) {
     d0 = double(float(std::fma(d0, d30, d13)));
     d1 = double(float(-std::fma(d11, d29, -d0)));
   if (d1 != d1) [[unlikely]] {  // NaN determinant: every result is NaN, see the header
-    __imp__sub_822631E8(ctx, base);
-    return;
+    return false;
   }
   if (d1 == double(LdF32(base, kR - 15532))) {
     // singular: copy the constant block, 8 bytes at a time exactly as the original (ld/std pairs, no byte swap needed)
@@ -95,7 +93,7 @@ inline void Native(PPCContext& ctx, uint8_t* base) {
       std::memcpy(&v, Raw(base, kIdent + i), 8);
       std::memcpy(Raw(base, dst + i), &v, 8);
     }
-    return;
+    return true;
   }
   double f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26,
       f27, f28, f29, f30, f31;
@@ -246,12 +244,12 @@ inline void Native(PPCContext& ctx, uint8_t* base) {
   bool nan = false;
   for (int i = 0; i < 16; ++i) nan |= (o[i] != o[i]);
   if (nan) [[unlikely]] {  // NaN sign/payload is operand-order dependent, see the header
-    __imp__sub_822631E8(ctx, base);
-    return;
+    return false;
   }
   uint32_t w[16];
   for (int i = 0; i < 16; ++i) std::memcpy(&w[i], &o[i], 4);
   for (int i = 0; i < 16; ++i) St32(base, dst + 4 * i, w[i]);
+  return true;
 }
 
 inline void Writes(const PPCContext& ctx, const uint8_t*, me::hot::Writes& w) { w.Add(ctx.r3.u32, 64); }

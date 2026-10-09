@@ -81,12 +81,29 @@ enum : uint32_t { kAfterTrail = 0, kTop = 0x100, kAfterLiterals = 0x200 };
 
 // One decode. kWrite = false: measure only (no guest writes; returns false on an implausible stream). Fills ip/op.
 template <bool kWrite>
-inline bool Decode(uint8_t* base, uint32_t in, uint32_t out, uint32_t& ip_out, uint32_t& op_out, uint32_t in_len) {
+inline bool Decode(uint8_t* base, uint32_t in, uint32_t out, uint32_t& ip_out, uint32_t& op_out, uint32_t in_len,
+                   uint32_t& reach_out) {
   uint32_t ip = in, op = out;
   // Measure mode stops at a size the guard could not snapshot anyway (or a runaway stream).
   const uint32_t max_out = 1u << 20, max_in = in_len + 0x10000u;
   auto copy = [&](uint32_t dst, uint32_t src, uint32_t n) {
     if constexpr (kWrite) CopyFwd(base, dst, src, n);
+  };
+  // A match normally copies from the bytes already produced, [out, dst); the original also accepts a source in front of
+  // the output buffer. Measure mode records how far in front (reach_out): the self-check guard's private copy of the
+  // output must then also cover those bytes (Writes::read_before), since a copy run starting there can continue into the
+  // bytes this call already produced.
+  bool wild = false;
+  auto match = [&](uint32_t dst, uint32_t src, uint32_t n) {
+    if constexpr (kWrite) {
+      CopyFwd(base, dst, src, n);
+    } else {
+      if (uint32_t(src - out) >= uint32_t(dst - out)) {
+        const uint32_t reach = out - src;
+        if (reach > max_out) wild = true;  // not in front of the output either (address wrap)
+        else if (reach > reach_out) reach_out = reach;
+      }
+    }
   };
   uint32_t state;
   uint32_t t = Ld8(base, ip);
@@ -102,7 +119,7 @@ inline bool Decode(uint8_t* base, uint32_t in, uint32_t out, uint32_t& ip_out, u
   }
   for (;;) {
     if constexpr (!kWrite) {
-      if (op - out > max_out || ip - in > max_in) return false;
+      if (op - out > max_out || ip - in > max_in || wild) return false;
     }
     t = Ld8(base, ip++);
     uint32_t trailing;
@@ -111,7 +128,7 @@ inline bool Decode(uint8_t* base, uint32_t in, uint32_t out, uint32_t& ip_out, u
       const uint32_t src = op - (b << 3) - ((t >> 2) & 7u) - 1u;
       ++ip;
       const uint32_t n = (t >> 5) + 1u;
-      copy(op, src, n);
+      match(op, src, n);
       op += n;
       trailing = t & 3u;
     } else if (t >= 32) {  // M3
@@ -120,7 +137,7 @@ inline bool Decode(uint8_t* base, uint32_t in, uint32_t out, uint32_t& ip_out, u
       const uint32_t d = (uint32_t(Ld8(base, ip + 1)) << 6) + (uint32_t(Ld8(base, ip)) >> 2);
       const uint32_t src = op - d - 1u;
       ip += 2;
-      copy(op, src, n + 2u);
+      match(op, src, n + 2u);
       op += n + 2u;
       trailing = Ld8(base, ip - 2) & 3u;  // re-read after the copy, as the original
     } else if (t >= 16) {  // M4
@@ -130,7 +147,7 @@ inline bool Decode(uint8_t* base, uint32_t in, uint32_t out, uint32_t& ip_out, u
       ip += 2;
       if (t == 17 && d == 0) break;  // end marker
       const uint32_t src = op - d - ((t & 8u) ? 0x8000u : 0x4000u);
-      copy(op, src, n + 2u);
+      match(op, src, n + 2u);
       op += n + 2u;
       trailing = Ld8(base, ip - 2) & 3u;
     } else if (state == kTop) {  // literal run
@@ -145,10 +162,10 @@ inline bool Decode(uint8_t* base, uint32_t in, uint32_t out, uint32_t& ip_out, u
       const uint32_t b = Ld8(base, ip);
       ++ip;
       if (state == kAfterLiterals) {
-        copy(op, op - (b << 2) - (t >> 2) - 2049u, 3);
+        match(op, op - (b << 2) - (t >> 2) - 2049u, 3);
         op += 3;
       } else {
-        copy(op, op - (b << 2) - (t >> 2) - 1u, 2);
+        match(op, op - (b << 2) - (t >> 2) - 1u, 2);
         op += 2;
       }
       trailing = t & 3u;
@@ -164,6 +181,9 @@ inline bool Decode(uint8_t* base, uint32_t in, uint32_t out, uint32_t& ip_out, u
   }
   ip_out = ip;
   op_out = op;
+  if constexpr (!kWrite) {
+    if (wild) return false;
+  }
   return true;
 }
 
@@ -178,7 +198,8 @@ inline void Native(PPCContext& ctx, uint8_t* base) {
   (void)Ld8(base, in);  // the original reads the first byte before it clears *out_len
   St32(base, out_len, 0);
   uint32_t ip = 0, op = 0;
-  detail::Decode<true>(base, in, out, ip, op, ctx.r4.u32);
+  uint32_t reach = 0;  // measure mode only
+  detail::Decode<true>(base, in, out, ip, op, ctx.r4.u32, reach);
   St32(base, out_len, op - out);
   if (ip == ip_end) {
     ctx.r3.u64 = 0;
@@ -194,8 +215,8 @@ inline void Native(PPCContext& ctx, uint8_t* base) {
 // overlaps the input it was decoded from (the copies would change later tokens).
 inline void Writes(const PPCContext& ctx, const uint8_t* base, me::hot::Writes& w) {
   const uint32_t in = ctx.r3.u32, out = ctx.r5.u32;
-  uint32_t ip = 0, op = 0;
-  if (!detail::Decode<false>(const_cast<uint8_t*>(base), in, out, ip, op, ctx.r4.u32)) {
+  uint32_t ip = 0, op = 0, reach = 0;
+  if (!detail::Decode<false>(const_cast<uint8_t*>(base), in, out, ip, op, ctx.r4.u32, reach)) {
     w.overflow = true;
     return;
   }
@@ -205,6 +226,7 @@ inline void Writes(const PPCContext& ctx, const uint8_t* base, me::hot::Writes& 
     return;
   }
   w.Add(out, op - out);
+  w.read_before = reach;  // match sources in front of the output buffer (the guard's private copy covers them)
   w.Add(ctx.r6.u32, 4);
   w.Add(ctx.r1.u32 - 16, 16);
 }

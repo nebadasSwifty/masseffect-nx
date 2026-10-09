@@ -48,7 +48,8 @@ First console run (RU, spacewalk, guard period 4096): `[hot] DIFFERENCE sub_82B2
 `Check()` copied the native result of range 0, rolled range 0 back, and only then copied range 1: the overlapping bytes of range 1
 were already the pre-call values (here 0, the buffer cleared by memset), and the comparison with the original reported them.
 Fixes: (1) `Check()` copies every range before rolling any back (shared helpers `SaveRanges` / `RestoreRanges` /
-`FirstRangeDiff` in `me_hot_common.h`), so overlapping declared ranges are safe for every hook; (2) the resampler declares the exact
+`FirstRangeDiff` in `me_hot_common.h`; later the same day replaced by the private-copy guard, which merges overlapping ranges
+and never rolls guest memory back: [hot-guard.md](hot-guard.md)), so overlapping declared ranges are safe for every hook; (2) the resampler declares the exact
 extents (`32 * blocks` bytes per plane; one merged range when the planes overlap, more than 32 blocks). (3) The fuzzer now replays
 the guard's algorithm on every iteration of every case with the same helpers (`tests/hot_fuzz/main.cpp`, "guard replay"); with the
 old copy order it reproduces the console report on 78 % of the stereo inputs, with the fix 0 failures (EN and RU, 100000 iterations),
