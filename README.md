@@ -26,6 +26,17 @@ You can assemble your complete Switch installation package entirely in your desk
 3. **Copy to SD card:** Extract the resulting `masseffect-nx.zip` into `sdmc:/switch/` so files reside in `/switch/masseffect-nx/`.
 4. **Install launcher forwarder:** Download `masseffect-nx-forwarder.nsp` and install it via your preferred homebrew manager (DBI, Sphaira, etc.). Ensure your forwarder is configured for **39-bit address space** so the process receives full application memory.
 
+### Full NSP over USB (optional)
+
+The installer can also build a full, installable NSP (game data inside, one title per edition). It is 8-9 GB, more than
+a FAT32 SD card can hold in one file, so install it over the cable instead of copying it:
+
+- **Straight from the browser** (Chrome or Edge): choose "Install to the connected Switch (USB)", open Sphaira on the
+  console (Install -> USB) and click Install. Nothing is saved on the computer.
+- **From a saved NSP on a Mac**: [Switch USB Installer](https://github.com/nebadasSwifty/switch-usb-installer) - drag the
+  NSP onto the app and press Install while Sphaira is on its USB install screen.
+- Or DBI (MTP "Install title from computer"), Tinfoil/Awoo, Goldleaf + Quark. Details: [docs/full-nsp.md](docs/full-nsp.md).
+
 ### Folder Structure
 
 ```text

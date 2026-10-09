@@ -281,8 +281,10 @@ the toml's 128, `dlc_enable` off), an empty save folder and a pipeline cache of 
 
 * About 7.3 GB of game data + 0.95 GB of shaders (+ 0.8 GB DLC): the NSP is 8.1-8.9 GB.
 * **FAT32 cannot hold a file of 4 GiB or more.** Options, best first:
-  1. **Install over USB or the network**, nothing stored on the SD: DBI (MTP "Install title from computer" or
-     `dbibackend`), Tinfoil/Awoo (USB/network), Goldleaf + Quark. Recommended.
+  1. **Install over USB or the network**, nothing stored on the SD: the installer page's own USB install to Sphaira
+     (Chrome/Edge), [Switch USB Installer](https://github.com/nebadasSwifty/switch-usb-installer) for a saved NSP on a
+     Mac (Sphaira), DBI (MTP "Install title from computer" or `dbibackend`), Tinfoil/Awoo (USB/network),
+     Goldleaf + Quark. Recommended.
   2. **exFAT SD card**: copy the single NSP and install it from the SD.
   3. **Split NSP** (`--split`): a folder `masseffect-nx.nsp/` with parts `00`, `01`, ... of `0xFFFF0000` bytes. The
      folder needs the FAT "archive" attribute (Hekate's archive bit fixer, or `attrib +a` on Windows); macOS cannot
