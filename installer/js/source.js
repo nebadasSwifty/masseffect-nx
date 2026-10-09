@@ -42,19 +42,44 @@ export async function sourceFromIso(input, { onProgress } = {}) {
   };
 }
 
+/** The known-broken, unused packages (config.disc.packageCheck.known) that apply to an edition id. */
+export function knownBadFor(packageCheck, editionId) {
+  return (packageCheck?.known ?? []).filter((k) => !k.editions || k.editions.includes(editionId));
+}
+
+/**
+ * Splits a checkPackages() result by the known-broken list: {..., bad (unexpected), known: [{path, problems, why}],
+ * log}. A known package that passes is simply fine; a known package that is broken is a note, never a warning.
+ */
+export function classifyAudit(r, { scope = 'all', known = [] } = {}) {
+  const knownBy = new Map(known.map((k) => [normalise(k.path).toLowerCase(), k]));
+  const all = r.allBad ?? r.bad;
+  const bad = [];
+  const knownBad = [];
+  for (const b of all) {
+    const k = knownBy.get(b.path.toLowerCase());
+    if (k) knownBad.push({ ...b, why: k.why });
+    else bad.push(b);
+  }
+  const log = [`Package check (${scope === 'maps' ? 'Maps/*.xxx' : 'all packages'}): ${r.checked} checked, ` +
+    `${bad.length} bad, ${r.duplicates.length} same-GUID group(s)` +
+    (knownBad.length ? `, ${knownBad.length} known broken and unused by the game.` : '.')];
+  for (const b of bad) log.push(`  BAD ${b.path}: ${b.problems.join('; ')}`);
+  for (const g of r.duplicates) log.push(`  SAME GUID under different names: ${g.join(', ')}`);
+  for (const b of knownBad) log.push(`  known, not used by the game (${b.why}): ${b.path}: ${b.problems.join('; ')}`);
+  return { ...r, allBad: all, bad, known: knownBad, scope, log };
+}
+
 /**
  * Structural check of the packages of a source (after the disc root is known). scope: 'all' (every package) or 'maps'
- * (Maps/*.xxx only). Returns {checked, bad: [{path, problems}], duplicates: [[path, ...]], log: [string]}.
+ * (Maps/*.xxx only); known: entries of config.disc.packageCheck.known for the edition (knownBadFor). Returns
+ * {checked, bad: [{path, problems}], known: [{path, problems, why}], duplicates: [[path, ...]], log: [string]}.
  * Nothing is blocked here; the page shows a warning when bad or duplicate packages are found.
  */
-export async function auditPackages(files, { scope = 'all', cache, onProgress } = {}) {
+export async function auditPackages(files, { scope = 'all', cache, onProgress, known = [] } = {}) {
   const filter = scope === 'maps' ? isMapPackage : () => true;
   const r = await checkPackages(files, { filter, cache, onProgress });
-  const log = [`Package check (${scope === 'maps' ? 'Maps/*.xxx' : 'all packages'}): ${r.checked} checked, ` +
-    `${r.bad.length} bad, ${r.duplicates.length} same-GUID group(s).`];
-  for (const b of r.bad) log.push(`  BAD ${b.path}: ${b.problems.join('; ')}`);
-  for (const g of r.duplicates) log.push(`  SAME GUID under different names: ${g.join(', ')}`);
-  return { ...r, log };
+  return classifyAudit(r, { scope, known });
 }
 
 /*

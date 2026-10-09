@@ -108,7 +108,20 @@ export const CONFIG = {
     // tools/check_packages.py: summary, chunk table, every chunk's block table; and one package GUID under two names).
     // scope 'all' reads a few KB of each of the ~2200 packages (seconds), 'maps' only Maps/*.xxx.
     // block: false only warns; true also keeps the create step hidden while bad or duplicate packages are found.
-    packageCheck: { scope: 'all', block: false },
+    // known: packages that are broken on every copy of an edition and that the game never reads. They are listed as a
+    // note (not as damaged files) and never block. path: relative to the disc root (case-insensitive); editions: the
+    // editions[].id values it applies to (on any other edition a broken copy is a normal finding).
+    packageCheck: {
+      scope: 'all',
+      block: false,
+      known: [
+        {
+          path: 'Layer0/MEInit/GlobalTlk_ES.xxx',
+          editions: ['rus-rev0'],
+          why: 'the Spanish text table; junk on both discs of the Russian release, which only reads GlobalTlk.xxx',
+        },
+      ],
+    },
   },
 
   // Optional downloadable content (Xbox 360 Marketplace STFS packages the user supplies; see docs/dlc.md).

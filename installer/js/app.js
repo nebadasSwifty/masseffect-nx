@@ -1,10 +1,10 @@
 // The page: picks the source, shows the detected edition, runs the pipeline with progress.
-import { CONFIG } from '../config.js?v=0.3.1';
-import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc, auditPackages } from './source.js';
+import { CONFIG } from '../config.js?v=0.3.2';
+import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc, auditPackages, classifyAudit, knownBadFor } from './source.js?v=0.3.2';
 import { planGameFiles, formatBytes } from './plan.js';
 import { openSink, describeSinkSupport, cleanStaleTemporaryFiles } from './sink.js';
 import { run, Cancelled, UserError, stageIds, stagesFor } from './pipeline.js';
-import { initLanguage, getLanguage, setLanguage, t } from './i18n.js?v=0.3.1';
+import { initLanguage, getLanguage, setLanguage, t } from './i18n.js?v=0.3.2';
 import {
   parseProdKeys, forgetKeys, estimateNspBytes, estimateProgramUpdateBytes, parseBaseMetadata, nextUpdateVersion,
   withLastUpdateVersion, pythonJson, inspectBaseNsp, PartsReader,
@@ -260,7 +260,8 @@ async function load(makeSource) {
     const info = await inspectDisc(source, CONFIG);
     const check = CONFIG.disc.packageCheck ?? { scope: 'all', block: false };
     const packages = await auditPackages(info.files, {
-      scope: check.scope, cache: source.checks, onProgress: (done, total) => status(t('status_packages', { done, total })),
+      scope: check.scope, cache: source.checks, known: knownBadFor(check, info.edition?.id),
+      onProgress: (done, total) => status(t('status_packages', { done, total })),
     });
     state.disc = { source, ...info, packages };
     status(`${source.label}: ${info.files.length.toLocaleString('en-US')} files (${source.detail}).`);
@@ -280,6 +281,11 @@ function showEdition() {
   if (!d.edition) {
     d.edition = CONFIG.editions[0];
     d.matchType = 'unverified_manual';
+  }
+  // The known-broken list depends on the edition (it can be changed by hand below).
+  if (d.packages) {
+    const check = CONFIG.disc.packageCheck ?? {};
+    d.packages = classifyAudit(d.packages, { scope: d.packages.scope, known: knownBadFor(check, d.edition.id) });
   }
   const isUnverified = d.matchType !== 'exact';
   const badge = isUnverified
@@ -343,6 +349,11 @@ function showEdition() {
 /** Adds the warning about bad or swapped packages (if any) to `elements`. Returns true when creating is blocked. */
 function packageWarning(d, elements) {
   const p = d.packages;
+  if (p?.known?.length) {
+    elements.push(el('div', { className: 'notice' },
+      el('p', { textContent: t('pkg_known_body', { count: p.known.length }) }),
+      el('ul', {}, ...p.known.map((k) => el('li', {}, el('code', { textContent: k.path }))))));
+  }
   if (!p || (!p.bad.length && !p.duplicates.length)) return false;
   const items = [];
   for (const b of p.bad) items.push(`${b.path}: ${b.problems[0]}`);

@@ -7,7 +7,8 @@ import { readdirSync, statSync, readFileSync, openSync, readSync, closeSync } fr
 import { join, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { openXdvdfs } from '../js/xdvdfs.js';
-import { mergeDiscFiles, auditPackages } from '../js/source.js';
+import { mergeDiscFiles, auditPackages, knownBadFor } from '../js/source.js';
+import { CONFIG } from '../config.js';
 
 // Node's fs.openAsBlob reports sizes modulo 2^32 for files over 4 GiB, so use a tiny Blob-like adapter
 // (what the parser needs: size, slice(a, b), arrayBuffer()).
@@ -65,7 +66,15 @@ test('RU two-disc merge takes Feros WAR00 from Disc 1 and Ilos LOS00 from Disc 2
   const from = (path) => decisions.find((d) => d.startsWith(`${path}: `))?.split(': ')[1].split(' ')[0];
   assert.equal(from('Layer0/Maps/BIOA_WAR00.xxx'), 'Disc1.iso');
   assert.equal(from('Layer0/Maps/BIOA_LOS00.xxx'), 'Disc2.iso');
-  const audit = await auditPackages(files, { cache: checks });
+  const audit = await auditPackages(files, { cache: checks, known: knownBadFor(CONFIG.disc.packageCheck, 'rus-rev0') });
   assert.deepEqual(audit.bad, []);
   assert.deepEqual(audit.duplicates, []);
+  // GlobalTlk_ES.xxx is junk on both RU discs and unused: a note, not a finding.
+  assert.deepEqual(audit.known.map((k) => k.path), ['Layer0/MEInit/GlobalTlk_ES.xxx']);
+  // Feros and Ilos are different packages, and every Feros/Ilos map of the result passed.
+  const guid = (p) => checks.get(files.find((f) => f.path === p).blob)?.info.guid;
+  assert.notEqual(guid('Layer0/Maps/BIOA_LOS00.xxx'), guid('Layer0/Maps/BIOA_WAR00.xxx'));
+  const maps = files.filter((f) => /\/Maps\/BIOA_(WAR|LOS)[^/]*\.xxx$/i.test(f.path));
+  assert.ok(maps.length > 20, String(maps.length));
+  for (const f of maps) assert.equal(audit.results.get(f.path)?.status, 'ok', f.path);
 });

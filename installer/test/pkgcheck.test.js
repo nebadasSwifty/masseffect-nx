@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkPackage, checkPackages, guidDuplicates } from '../js/pkgcheck.js';
-import { mergeDiscFiles, auditPackages } from '../js/source.js';
+import { mergeDiscFiles, auditPackages, knownBadFor, classifyAudit } from '../js/source.js';
+import { CONFIG } from '../config.js';
 import { buildPackage, chunkOffset } from './pkg_builder.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -186,6 +187,21 @@ test('single source audit: the fake LOS00 of Disc 1 and the cut WAR00 of Disc 2 
   assert.equal((await checkPackages(files, { filter: (p) => p.includes('/Maps/'), cache })).checked, 3);
   assert.equal(cache.size, 3);
   assert.equal((await checkPackages(files, { cache })).bad.length, 2);
+});
+
+test('known broken, unused packages (GlobalTlk_ES.xxx on the RU edition) are a note, not a finding', async () => {
+  const good = buildPackage({ guid: 3, chunks: [2] });
+  const files = [entry('Layer0/MEInit/GlobalTlk_ES.xxx', new Uint8Array(64).fill(0xd3)), entry('Layer0/MEInit/GlobalTlk.xxx', good)];
+  const ru = await auditPackages(files, { known: knownBadFor(CONFIG.disc.packageCheck, 'rus-rev0') });
+  assert.deepEqual(ru.bad, []);
+  assert.deepEqual(ru.known.map((k) => k.path), ['Layer0/MEInit/GlobalTlk_ES.xxx']);
+  assert.match(ru.log.join('\n'), /0 bad, 0 same-GUID group\(s\), 1 known broken and unused/);
+  // On the English edition (the Spanish table is used there) the same file is a normal finding.
+  const en = classifyAudit(ru, { known: knownBadFor(CONFIG.disc.packageCheck, CONFIG.editions[0].id) });
+  assert.deepEqual(en.bad.map((b) => b.path), ['Layer0/MEInit/GlobalTlk_ES.xxx']);
+  assert.deepEqual(en.known, []);
+  // and back (the page re-classifies when the edition is changed by hand)
+  assert.deepEqual(classifyAudit(en, { known: knownBadFor(CONFIG.disc.packageCheck, 'rus-rev0') }).bad, []);
 });
 
 // Optional: MASSEFFECT_TEST_PACKAGES=/path/game_root (an extracted disc or game_root) compares every package with the
