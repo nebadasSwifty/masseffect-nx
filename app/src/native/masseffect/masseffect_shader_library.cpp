@@ -220,7 +220,22 @@ const std::vector<uint32_t>& Shader::Spirv() const {
   if (ready.v.load(std::memory_order_acquire)) return spirv_lazy;  // the prefetch published it meanwhile
   std::vector<uint8_t> temporal;
   std::vector<uint32_t> data;
-  if (const char* error = ReadEntry(file->principal, *this, temporal, data)) {
+  // A read of the SD card can fail once (seen as a rare abort in a prewarm thread at start): retry on a reopened
+  // handle before giving up. A real mismatch with the index fails every attempt the same way.
+  const char* error = ReadEntry(file->principal, *this, temporal, data);
+  for (int attempt = 1; error && attempt <= 3; ++attempt) {
+    std::fprintf(stderr, "[masseffect] shader library %s: entry %016llX: %s (attempt %d, retrying)\n",
+                 file->path.string().c_str(), static_cast<unsigned long long>(fingerprint), error, attempt);
+    std::fflush(stderr);
+    if (std::FILE* reopened = std::fopen(file->path.string().c_str(), "rb")) {
+      std::fclose(file->principal);
+      file->principal = reopened;
+    } else {
+      std::clearerr(file->principal);
+    }
+    error = ReadEntry(file->principal, *this, temporal, data);
+  }
+  if (error) {
     std::fprintf(stderr, "[masseffect] shader library %s: entry %016llX: %s\n", file->path.string().c_str(),
                  static_cast<unsigned long long>(fingerprint), error);
     std::fflush(stderr);
