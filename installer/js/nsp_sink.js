@@ -8,8 +8,8 @@
 //   4. the connected Switch over USB (Chromium, WebUSB): UsbNspSink. Nothing is written anywhere: js/nsp.js sees
 //      serve() and hands over an NspImage that the console reads by range (Sphaira's USB install, js/usb_install.js).
 // Firefox and Safari have neither picker nor WebUSB: a full NSP (8-9 GB) cannot be written there; the page says so.
-import { FAT32_PART } from './nsp.js?v=0.3.3';
-import { serveFiles, webUsbSupport } from './usb_install.js?v=0.3.3';
+import { FAT32_PART } from './nsp.js?v=0.3.4';
+import { serveFiles, webUsbSupport } from './usb_install.js?v=0.3.4';
 
 function triggerDownload(blob, name) {
   const url = URL.createObjectURL(blob);

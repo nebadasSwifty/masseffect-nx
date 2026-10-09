@@ -1,5 +1,5 @@
 // Module worker: wires ScanHandler (handlers.js) to postMessage.
-import { ScanHandler } from './handlers.js';
+import { ScanHandler } from './handlers.js?v=0.3.4';
 
 const handler = new ScanHandler();
 let chain = Promise.resolve();

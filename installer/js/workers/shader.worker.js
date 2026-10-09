@@ -1,5 +1,5 @@
 // Module worker: wires ShaderHandler (handlers.js) to postMessage.
-import { ShaderHandler } from './handlers.js';
+import { ShaderHandler } from './handlers.js?v=0.3.4';
 
 const handler = new ShaderHandler();
 let chain = Promise.resolve();

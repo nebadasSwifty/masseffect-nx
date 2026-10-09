@@ -22,7 +22,7 @@ const TOML = 'video_mode_width = 960\n';
 function fakeSite(nro, list = null) {
   const toml = enc(TOML);
   const fetchImpl = async (url, init = {}) => {
-    const u = String(url);
+    const u = String(url).replace(/\?.*$/, ''); // without the ?v= cache tag
     let body = null;
     if (u.endsWith('/masseffect.toml')) body = toml;
     else if (u.endsWith('.nro')) body = nro;

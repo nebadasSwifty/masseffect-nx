@@ -1,16 +1,16 @@
 // The page: picks the source, shows the detected edition, runs the pipeline with progress.
-import { CONFIG } from '../config.js?v=0.3.3';
-import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc, auditPackages, classifyAudit, knownBadFor } from './source.js?v=0.3.3';
+import { CONFIG } from '../config.js?v=0.3.4';
+import { sourceFromIso, sourceFromFileList, sourceFromDirectoryHandle, sourceFromDataTransfer, inspectDisc, auditPackages, classifyAudit, knownBadFor } from './source.js?v=0.3.4';
 import { planGameFiles, formatBytes } from './plan.js';
 import { openSink, describeSinkSupport, cleanStaleTemporaryFiles } from './sink.js';
-import { run, Cancelled, UserError, stageIds, stagesFor } from './pipeline.js?v=0.3.3';
-import { initLanguage, getLanguage, setLanguage, t } from './i18n.js?v=0.3.3';
+import { run, Cancelled, UserError, stageIds, stagesFor } from './pipeline.js?v=0.3.4';
+import { initLanguage, getLanguage, setLanguage, t } from './i18n.js?v=0.3.4';
 import {
   parseProdKeys, forgetKeys, estimateNspBytes, estimateProgramUpdateBytes, parseBaseMetadata, nextUpdateVersion,
   withLastUpdateVersion, pythonJson, inspectBaseNsp, PartsReader,
-} from './nsp.js?v=0.3.3';
-import { openNspSink, nspSinkSupport, saveTextFile } from './nsp_sink.js?v=0.3.3';
-import { findPermittedSwitch, requestSwitch, WebUsbTransport, USB_VENDOR_ID, USB_PRODUCT_ID } from './usb_install.js?v=0.3.3';
+} from './nsp.js?v=0.3.4';
+import { openNspSink, nspSinkSupport, saveTextFile } from './nsp_sink.js?v=0.3.4';
+import { findPermittedSwitch, requestSwitch, WebUsbTransport, USB_VENDOR_ID, USB_PRODUCT_ID } from './usb_install.js?v=0.3.4';
 import { openStfs, verifyStfs } from './stfs.js';
 
 const $ = (id) => document.getElementById(id);
@@ -785,6 +785,14 @@ function usbSinkOptions() {
 window.addEventListener('pagehide', () => { forgetKeys(state.nsp.keys); state.nsp.keys = null; });
 
 /** The result notice of an NSP run: install notes and the base metadata to keep. */
+/** The result line about the shaders. A run with an unexpected failure never gets here (pipeline.js throws). */
+function shadersSummary(shaders) {
+  const ok = shaders.ok.toLocaleString('en-US');
+  return shaders.known?.length
+    ? el('p', { className: 'muted', textContent: t('result_shaders_known', { ok, known: shaders.known.length }) })
+    : el('p', { className: 'muted', textContent: t('result_shaders', { ok }) });
+}
+
 async function nspResultKids(job, result) {
   const usb = job.sink.kind === 'usb';
   const kids = [
@@ -831,9 +839,7 @@ async function nspResultKids(job, result) {
     offerSave(job.base.metaName, pythonJson(updated), t('nsp_meta_update_note', { n: v, next: v + 1 }));
   }
   if (result.shaders) {
-    kids.push(result.shaders.failures.length
-      ? el('p', { className: 'muted', textContent: t('result_shaders_skipped', { ok: result.shaders.ok.toLocaleString('en-US'), skipped: result.shaders.failures.length }) })
-      : el('p', { className: 'muted', textContent: t('result_shaders', { ok: result.shaders.ok.toLocaleString('en-US') }) }));
+    kids.push(shadersSummary(result.shaders));
   }
   return kids;
 }
@@ -935,7 +941,7 @@ function log(text, level = 'info') {
 
 function createWorker(kind) {
   const file = { scan: 'scan', shader: 'shader', pack: 'pack' }[kind];
-  return new Worker(new URL(`./workers/${file}.worker.js`, import.meta.url), { type: 'module' });
+  return new Worker(new URL(`./workers/${file}.worker.js?v=0.3.4`, import.meta.url), { type: 'module' });
 }
 
 async function start(mode) {
@@ -1005,9 +1011,7 @@ async function startRun(job) {
       el('p', { textContent: result.sinkResult === 'saved' ? t('result_saved_file') : t('result_saved_download') }),
       el('p', { innerHTML: t('result_extract') }),
       ...(dlc.length ? [el('p', { textContent: t('result_dlc', { count: dlc.length }) })] : []),
-      result.shaders.failures.length
-        ? el('p', { className: 'muted', textContent: t('result_shaders_skipped', { ok: result.shaders.ok.toLocaleString('en-US'), skipped: result.shaders.failures.length }) })
-        : el('p', { className: 'muted', textContent: t('result_shaders', { ok: result.shaders.ok.toLocaleString('en-US') }) }),
+      shadersSummary(result.shaders),
     ]);
   } catch (e) {
     if (e instanceof Cancelled) {

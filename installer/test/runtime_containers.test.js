@@ -46,12 +46,20 @@ test('runtime_containers.json exists, is valid JSON, and contains valid containe
     assert.equal(sig & 0xFFFFFF00, 0x102A1100, `${name} invalid 2008 container signature: 0x${sig.toString(16)}`);
     const isVertex = (sig & 1) === 1;
     assert.equal(name.startsWith('vs_'), isVertex, `${name} stage flag mismatch with file prefix`);
+    // the runtime's layout checks (shaders/tools/container_check.h): otherwise the translator refuses it
+    const virtualSize = buf.readUInt32BE(4);
+    const header = buf.readUInt32BE(24);
+    assert.ok(header + 8 <= buf.length, `${name}: shader header outside the container`);
+    const start = virtualSize + buf.readUInt32BE(header);
+    const size = buf.readUInt32BE(header + 4);
+    assert.ok(size > 0 && size % 4 === 0 && start + size <= buf.length, `${name}: microcode outside the container`);
+    assert.ok(header < virtualSize && header + (isVertex ? 40 : 32) <= virtualSize, `${name}: shader header outside the virtual part`);
   }
 });
 
 test('checkToolchain includes runtime_containers.json and wasmUrls exposes it', async () => {
   const urls = wasmUrls(CONFIG, 'https://example.com/installer/');
-  assert.equal(urls.runtimeContainers, 'https://example.com/installer/wasm/runtime_containers.json');
+  assert.equal(urls.runtimeContainers, `https://example.com/installer/wasm/runtime_containers.json?v=${CONFIG.wasm.version}`);
 
   const files = new Set([
     'wasm/scan.mjs', 'wasm/hlsl.mjs', 'wasm/dxc_web.mjs', 'wasm/pack.mjs', 'wasm/shader_common.h',

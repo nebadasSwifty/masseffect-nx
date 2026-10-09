@@ -85,13 +85,13 @@ test('dlcZipEntries: the SD paths of the runtime ContentManager', async () => {
 });
 
 // ---- a whole run with stand-in workers ----------------------------------------------------------------------------
-function fakeSite({ packageBytes = 4096, list = null, manifest = null } = {}) {
+function fakeSite({ packageBytes = 4096, list = null, manifest = null, shader = null } = {}) {
   const nro = enc('NRO0'.repeat(50));
   const toml = enc(TOML);
   const scanned = [];
   const fetched = [];
   const fetchImpl = async (url, init = {}) => {
-    const u = String(url);
+    const u = String(url).replace(/\?.*$/, ''); // without the ?v= cache tag
     fetched.push(u);
     let body = null;
     if (u.endsWith('/masseffect.toml')) body = toml;
@@ -115,7 +115,7 @@ function fakeSite({ packageBytes = 4096, list = null, manifest = null } = {}) {
       const head = new Uint8Array(await m.blob.slice(0, 16).arrayBuffer());
       return { type: 'scanned', id: m.id, name: m.name, ok: true, containers: [{ name: `c_${m.name}`, data: head }] };
     },
-    shader: async (m) => (m.type === 'init' ? { type: 'ready' } : { type: 'result', id: m.id, ok: true, spirv: new Uint8Array(8) }),
+    shader: async (m) => (m.type === 'init' ? { type: 'ready' } : (shader?.(m) ?? { type: 'result', id: m.id, ok: true, spirv: new Uint8Array(8) })),
     pack: async (m) => {
       if (m.type === 'init') return { type: 'ready' };
       if (m.type === 'add') return { type: 'added' };
@@ -256,4 +256,55 @@ test('fetchBuild: the list is verified against the manifest like the NRO; a file
   const build = await fetchBuild(CONFIG, CONFIG.editions[0], { baseUrl: 'https://example.test/', fetchImpl: fakeSite({ list: notList }).fetchImpl, progress() {}, log: (t, l) => logs.push([l, t]) });
   assert.equal(build.prewarmList, undefined);
   assert.ok(logs.some(([l, t]) => l === 'warn' && t.includes('not a pipeline prewarm list')));
+});
+
+// ---- shader failures: never a package with holes ------------------------------------------------------------------
+const fail = (m, reason, stage = 'translate') => ({ type: 'result', id: m.id, name: m.name, ok: false, stage, reason });
+
+test('a container that fails twice stops the run: no package is written', async () => {
+  const site = fakeSite({ shader: (m) => (m.name === 'c_Layer0/MEInit/Core.xxx' ? fail(m, 'translator crashed (memory access out of bounds)') : null) });
+  const { pkg } = await syntheticDlc(BDTS, 'Bring Down the Sky [ENPLES]', 1);
+  let aborted = false;
+  const logs = [];
+  await assert.rejects(
+    run({ config: CONFIG, edition: CONFIG.editions[0], files: discFiles(), dlc: [pkg], mode: 'update',
+      sink: { write() {}, close() {}, abort() { aborted = true; } },
+      createWorker: site.createWorker, baseUrl: 'https://example.test/', fetchImpl: site.fetchImpl, onLog: (t, l) => logs.push([l, t]) }),
+    (e) => e instanceof UserError && e.code === 'shaders-incomplete' && /1 of 3 shaders could not be made/.test(e.message) && /Core\.xxx/.test(e.message));
+  assert.equal(aborted, true);
+  assert.ok(logs.some(([l, t]) => l === 'error' && /^FAILED c_Layer0\/MEInit\/Core\.xxx \(translate\)/.test(t)));
+  assert.ok(!logs.some(([, t]) => /expected/.test(t)), 'no "expected" wording for failures');
+});
+
+test('a container that fails once is retried in a fresh worker and the run succeeds', async () => {
+  let calls = 0;
+  const site = fakeSite({ shader: (m) => (++calls === 1 ? fail(m, 'no answer after 180 s') : null) });
+  const { result, logs } = await runWith(site, 'update', []);
+  assert.equal(calls, 2);
+  assert.equal(result.shaders.ok, 1);
+  assert.deepEqual(result.shaders.failures, []);
+  assert.ok(logs.some(([l, t]) => l === 'warn' && /trying them once more/.test(t)));
+});
+
+test('a scan match that is not a shader container is ignored, not a failure', async () => {
+  const site2 = fakeSite({ shader: (m) => (m.name.endsWith('P1.xxx') ? fail(m, 'not a shader container: microcode outside the container') : null) });
+  const { pkg } = await syntheticDlc(BDTS, 'Bring Down the Sky [ENPLES]', 1);
+  const r2 = await runWith(site2, 'update', [pkg]);
+  assert.equal(r2.result.shaders.ignored, 1);
+  assert.deepEqual(r2.result.shaders.failures, []);
+  assert.ok(r2.logs.some(([l, t]) => l === 'info' && /1 scan matches are not shader containers/.test(t)));
+});
+
+test('a container on the known list is left out with a note; the run succeeds', async () => {
+  const name = 'c_Layer0/MEInit/Core.xxx';
+  const config = { ...CONFIG, knownShaderFailures: { [name]: 'DXC rejects it natively too' } };
+  const { pkg } = await syntheticDlc(BDTS, 'Bring Down the Sky [ENPLES]', 1);
+  const site = fakeSite({ shader: (m) => (m.name === name ? fail(m, 'DXC rejected it (code 4)', 'dxc') : null) });
+  const sink = new MemorySink();
+  const logs = [];
+  const result = await run({ config, edition: config.editions[0], files: discFiles(), dlc: [pkg], mode: 'update', sink,
+    createWorker: site.createWorker, baseUrl: 'https://example.test/', fetchImpl: site.fetchImpl, onLog: (t, l) => logs.push([l, t]) });
+  assert.deepEqual(result.shaders.failures, []);
+  assert.deepEqual(result.shaders.known.map((f) => f.name), [name]);
+  assert.ok(logs.some(([l, t]) => l === 'skip' && /Known untranslatable/.test(t)));
 });

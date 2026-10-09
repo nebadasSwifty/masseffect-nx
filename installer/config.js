@@ -141,6 +141,9 @@ export const CONFIG = {
   // The WebAssembly tools (built by shaders/wasm/*.sh and published by the workflow into installer/wasm/).
   wasm: {
     dir: 'wasm/',
+    // Cache tag of the WebAssembly tools (added as ?v= to their URLs): change it whenever shaders/wasm/, the
+    // translator, the scanner or the packer change, so browsers drop their cached copies.
+    version: '2026-10-09b',
     scan: 'scan.mjs',
     hlsl: 'hlsl.mjs',
     dxc: 'dxc_web.mjs',
@@ -152,6 +155,12 @@ export const CONFIG = {
     // Each .mjs loads its own .wasm from the same folder.
     extraFiles: ['scan.wasm', 'hlsl.wasm', 'dxc_web.wasm', 'pack.wasm'],
   },
+
+  // Shader containers the native toolchain cannot build either: the page leaves them out instead of refusing to make
+  // the package. Any other container that fails to translate or compile stops the run (no package with holes).
+  // Key: the scanner's file name ({vs,ps}_<FNV-1a 64 of the container>.bin); value: why (for the log). None is known
+  // today (shaders/README.md, "Containers that do not make it").
+  knownShaderFailures: {},
 
   limits: {
     // Parallel translate+compile workers: min(hardwareConcurrency - 1, this). Each holds a DXC instance (~0.5 GB).

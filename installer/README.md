@@ -49,11 +49,21 @@ written to the computer). See "Installable NSP" below and [../docs/full-nsp.md](
 * **Workers.** Scanning uses `limits.scanWorkers` workers (one package at a time each). Translating uses
   `min(hardwareConcurrency - 1, limits.maxShaderWorkers)` workers, each with its own translator and DXC instance, one
   container per job. SPIR-V goes straight into the pack worker as it is produced, so the page never holds the package.
-* **Skipping.** A container that fails is skipped, never fatal: the 56 containers that crash the translator
-  (a WebAssembly trap: the worker drops that instance and creates a new one), the 4 that DXC rejects, and any job that
-  gets no answer within `limits.jobTimeoutMs` (the worker is terminated and replaced). Skips are listed in the
-  Details log. A complete disc gives 30,191 containers and 30,131 shaders; the page warns (but does not stop) if far
-  fewer come out.
+* **Failures stop the run.** A container that fails to translate or compile (a WebAssembly trap: the worker drops
+  that instance and creates a new one; a DXC error; no answer within `limits.jobTimeoutMs`) is tried once more, alone,
+  in a fresh worker. If it fails again the run stops with an error naming it and **no package is written**: a
+  package with holes draws nothing wherever the missing shader is used, and the user would not know why. The only
+  exceptions: containers listed in `config.js` `knownShaderFailures` (the native toolchain cannot build them either;
+  logged, left out), and a translator answer "not a shader container" (random package bytes that look like a
+  container; the game ignores them too; the current scanner no longer reports them). On the RU discs + both DLC
+  the run translates and compiles all 31,128 containers (30,830 from the scan + 298 from
+  `shaders/runtime_containers`); the HLSL is byte-identical to the native translator's.
+* **Restarting main.** The tools are command line programs; each job calls `callMain` again on the same instance.
+  Emscripten's `callMain` leaves argv on the stack, so `runMain` (`js/workers/handlers.js`) saves and restores the
+  stack pointer around every call (the modules export `stackSave`/`stackRestore`; without the restore the 4 MB stack
+  ran out after about 14,500 shaders on one worker). An older module without them is replaced every 4,000 calls.
+* **Cache tags.** `config.js` `wasm.version` is added as `?v=` to the tools' URLs and passed on to each module's
+  `.wasm`; change it whenever `shaders/wasm/` or the translator, scanner or packer sources change.
 * **Progress and cancel.** Five stages with their own bars, each with a percent and an estimate of the time left
   (from the rate since the stage's first report; the packing stage reports no steps and shows an animated bar).
   A step indicator above the cards shows each of the four steps as pending, active, done, error or optional. Cancel

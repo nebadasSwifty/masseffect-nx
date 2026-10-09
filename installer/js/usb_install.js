@@ -15,7 +15,7 @@
 // any range (it reads the PFS0 header, then the Meta and Control NCA at the end, then the Program NCA in order) and
 // checks every NCA's SHA-256 against its name. FLAG_STREAM (1) would promise strictly increasing offsets and make
 // Sphaira skip those checks; not used (docs/full-nsp.md section 6, "Install over USB").
-import { crc32c } from './crc32c.js?v=0.3.3';
+import { crc32c } from './crc32c.js?v=0.3.4';
 
 export const USB_VENDOR_ID = 0x057E;
 export const USB_PRODUCT_ID = 0x3000;

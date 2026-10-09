@@ -1,5 +1,5 @@
 // Module worker: wires PackHandler (handlers.js) to postMessage.
-import { PackHandler } from './handlers.js';
+import { PackHandler } from './handlers.js?v=0.3.4';
 
 const handler = new PackHandler();
 let chain = Promise.resolve();

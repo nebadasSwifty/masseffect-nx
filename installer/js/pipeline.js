@@ -20,7 +20,7 @@
 // files go to the content folder of the runtime, and masseffect.toml gets dlc_enable = true. See docs/dlc.md.
 import { ZipWriter } from './zip.js';
 import { planGameFiles, scanCandidates, sha256Hex } from './plan.js';
-import { buildNsp, metadataFromNsp, PartsReader, sourceFromBytes, PackError, checkUpdateTitle } from './nsp.js?v=0.3.3';
+import { buildNsp, metadataFromNsp, PartsReader, sourceFromBytes, PackError, checkUpdateTitle } from './nsp.js?v=0.3.4';
 
 export class Cancelled extends Error {
   constructor() { super('Cancelled'); this.name = 'Cancelled'; }
@@ -130,13 +130,16 @@ function abs(rel, baseUrl) {
 
 export function wasmUrls(config, baseUrl) {
   const w = config.wasm;
+  // ?v=<config.wasm.version>: a browser that cached an older tool must not keep using it (the workers pass the same
+  // query on to each module's .wasm, see handlers.js createModule).
+  const url = (name) => abs(w.dir + name, baseUrl) + (w.version ? `?v=${encodeURIComponent(w.version)}` : '');
   return {
-    scan: abs(w.dir + w.scan, baseUrl),
-    hlsl: abs(w.dir + w.hlsl, baseUrl),
-    dxc: abs(w.dir + w.dxc, baseUrl),
-    pack: abs(w.dir + w.pack, baseUrl),
-    shaderCommon: abs(w.dir + w.shaderCommon, baseUrl),
-    runtimeContainers: w.runtimeContainers ? abs(w.dir + w.runtimeContainers, baseUrl) : null,
+    scan: url(w.scan),
+    hlsl: url(w.hlsl),
+    dxc: url(w.dxc),
+    pack: url(w.pack),
+    shaderCommon: url(w.shaderCommon),
+    runtimeContainers: w.runtimeContainers ? url(w.runtimeContainers) : null,
   };
 }
 
@@ -333,11 +336,15 @@ async function scanStage({ workers, urls, files, config, signal, progress, log }
   return containers;
 }
 
+// A translator answer "not a shader container": the scanner's byte pattern matched random package data whose header
+// fails the runtime's layout checks (shaders/tools/container_check.h). The game ignores such a container too, so it
+// is not a missing shader. (The current scanner drops these itself; an older scan.wasm still sends them.)
+const NOT_A_SHADER = /not a shader container/;
+
 async function translateStage({ workers, urls, containers, config, signal, progress, log, packRemote }) {
   const names = [...containers.keys()];
   const total = names.length;
   if (total === 0) throw new UserError('No shader containers were found on the disc. Is this a complete Mass Effect disc?', 'disc');
-  const queue = names.slice();
   const failures = [];
   let done = 0, ok = 0;
   let batch = [];
@@ -350,50 +357,79 @@ async function translateStage({ workers, urls, containers, config, signal, progr
     }
   };
   const jobMs = config.limits.jobTimeoutMs;
-  const n = Math.max(1, Math.min(config.limits.maxShaderWorkers, total, workerBudget()));
   const startWorker = async () => {
     const remote = workers.spawn('shader');
     await remote.call({ type: 'init', urls }, [], 'ready', 120000);
     return remote;
   };
-  const runners = [];
-  for (let i = 0; i < n; i++) {
-    runners.push((async () => {
-      let remote = await startWorker();
-      for (let name = queue.shift(); name; name = queue.shift()) {
-        throwIfCancelled(signal);
-        const data = containers.get(name);
-        let r;
-        try {
-          r = await remote.call({ type: 'job', id: done, name, data }, [], 'result', jobMs);
-        } catch (e) {
-          if (!e.timeout) throw e;
-          workers.kill(remote);
-          r = { ok: false, stage: 'translate', reason: `no answer after ${Math.round(jobMs / 1000)} s` };
-          remote = await startWorker();
+  const skippedLabel = () => (failures.length ? ` (${failures.length} not translated yet)` : '');
+  // One pass over `queue` with `n` workers; failed containers go to `failed`.
+  const pass = async (queue, n, failed, counted) => {
+    const runners = [];
+    for (let i = 0; i < n; i++) {
+      runners.push((async () => {
+        let remote = await startWorker();
+        for (let name = queue.shift(); name; name = queue.shift()) {
+          throwIfCancelled(signal);
+          const data = containers.get(name);
+          let r;
+          try {
+            r = await remote.call({ type: 'job', id: done, name, data }, [], 'result', jobMs);
+          } catch (e) {
+            if (!e.timeout) throw e;
+            workers.kill(remote);
+            r = { ok: false, stage: 'translate', reason: `no answer after ${Math.round(jobMs / 1000)} s` };
+            remote = await startWorker();
+          }
+          if (counted) done++;
+          if (r.ok) {
+            ok++;
+            batch.push({ name, container: data, spirv: r.spirv });
+            if (batch.length >= 64) flush();
+          } else {
+            failed.push({ name, stage: r.stage, reason: r.reason });
+          }
+          if (counted && (done % 50 === 0 || done === total)) {
+            progress({ done, total, label: `Translating shaders: ${done.toLocaleString('en-US')} of ${total.toLocaleString('en-US')}${skippedLabel()}` });
+          }
         }
-        done++;
-        if (r.ok) {
-          ok++;
-          batch.push({ name, container: data, spirv: r.spirv });
-          if (batch.length >= 64) flush();
-        } else {
-          failures.push({ name, stage: r.stage, reason: r.reason });
-        }
-        if (done % 50 === 0 || done === total) {
-          progress({ done, total, label: `Translating shaders: ${done.toLocaleString('en-US')} of ${total.toLocaleString('en-US')}${failures.length ? ` (${failures.length} skipped)` : ''}` });
-        }
-      }
-      workers.kill(remote);
-    })());
+        workers.kill(remote);
+      })());
+    }
+    await Promise.all(runners);
+  };
+  await pass(names.slice(), Math.max(1, Math.min(config.limits.maxShaderWorkers, total, workerBudget())), failures, true);
+
+  // Not shaders: reported once, never retried, not a failure.
+  const ignored = failures.filter((f) => NOT_A_SHADER.test(f.reason));
+  let failed = failures.filter((f) => !NOT_A_SHADER.test(f.reason));
+  // A real failure gets one more try, alone in a fresh worker (a crashed or out-of-memory instance, a timeout on a
+  // busy machine). What fails twice is reported.
+  if (failed.length) {
+    log(`${failed.length} shader containers failed; trying them once more in a fresh worker.`, 'warn');
+    const again = [];
+    await pass(failed.map((f) => f.name), 1, again, false);
+    failed = again;
   }
-  await Promise.all(runners);
   flush();
   await addChain;
-  progress({ done: total, total, label: `Translating shaders: ${total.toLocaleString('en-US')} of ${total.toLocaleString('en-US')}${failures.length ? ` (${failures.length} skipped)` : ''}` });
-  for (const f of failures) log(`Skipped ${f.name} (${f.stage}): ${f.reason}`, 'skip');
-  log(`Translated ${ok} of ${total} containers; ${failures.length} skipped (a few skipped containers are expected).`, failures.length ? 'warn' : 'info');
-  return { ok, failures, total };
+  progress({ done: total, total, label: `Translating shaders: ${total.toLocaleString('en-US')} of ${total.toLocaleString('en-US')}` });
+
+  // Containers the native toolchain cannot build either (config.knownShaderFailures, documented there).
+  const knownList = config.knownShaderFailures ?? {};
+  const known = failed.filter((f) => Object.prototype.hasOwnProperty.call(knownList, f.name));
+  const unexpected = failed.filter((f) => !Object.prototype.hasOwnProperty.call(knownList, f.name));
+  if (ignored.length) {
+    log(`${ignored.length} scan matches are not shader containers (their header points outside the data; the game ignores them too).`, 'info');
+    for (const f of ignored) log(`Not a shader: ${f.name}: ${f.reason}`, 'skip');
+  }
+  for (const f of known) log(`Known untranslatable ${f.name} (${f.stage}): ${f.reason} [${knownList[f.name]}]`, 'skip');
+  for (const f of unexpected) log(`FAILED ${f.name} (${f.stage}): ${f.reason}`, 'error');
+  const real = total - ignored.length;
+  log(`Translated ${ok} of ${real} shader containers` +
+    `${known.length ? `; ${known.length} known untranslatable (the native build skips them too)` : ''}` +
+    `${unexpected.length ? `; ${unexpected.length} FAILED` : ''}.`, unexpected.length ? 'error' : 'info');
+  return { ok, failures: unexpected, known, ignored: ignored.length, total };
 }
 
 function workerBudget() {
@@ -494,7 +530,7 @@ async function* packageChunks(packRemote, file, size, chunkBytes, signal, from =
  *              displayVersion } and a sink from
  *              js/nsp_sink.js,
  *            baseUrl, fetchImpl, signal, onProgress(stageId, {done,total,label}), onLog(text, level) }
- * Returns { zipBytes, shaders: {ok, failures, total}, sinkResult } (zip) or { nspBytes, nsp, baseMeta, shaders, sinkResult } (NSP).
+ * Returns { zipBytes, shaders: {ok, failures (always empty: a failure throws), known, ignored, total}, sinkResult } (zip) or { nspBytes, nsp, baseMeta, shaders, sinkResult } (NSP).
  */
 export async function run(options) {
   const { config, edition, files, mode, sink, createWorker, baseUrl, signal } = options;
@@ -592,6 +628,13 @@ export async function run(options) {
     const shaders = await translateStage({ workers, urls, containers, config, signal, progress: stage('translate'), log, packRemote });
     containers.clear();
     if (shaders.ok === 0) throw new UserError('No shader could be translated. The WebAssembly tools may be broken; see the log.', 'shaders');
+    if (shaders.failures.length) {
+      // Never ship a package with holes: the game would draw nothing (or the wrong thing) wherever these are used.
+      const first = shaders.failures.slice(0, 5).map((f) => `${f.name} (${f.stage}: ${f.reason})`).join('; ');
+      throw new UserError(`${shaders.failures.length} of ${(shaders.total - shaders.ignored).toLocaleString('en-US')} shaders could not be made, ` +
+        `so no package was written (it would miss graphics in the game). First: ${first}. ` +
+        'Try again in a fresh browser tab with other tabs closed; if it fails again, report it with the Details log.', 'shaders-incomplete');
+    }
     if (shaders.ok < config.limits.expectedContainers * 0.9) {
       log(`Only ${shaders.ok} shaders were made (a complete disc gives about ${config.limits.expectedContainers - 60}). The game may be missing graphics.`, 'warn');
     }
