@@ -317,3 +317,13 @@ Rerun on build ru_integ3 (guard fix 6aa6847), spacewalk, profiles fetched: aA3 3
 sub_82B2D4F0 and sub_82B2D780, no DIFFERENCE. Average CPU per thread (68 profile blocks): ring 60.4 -> 60.5 %,
 game thread 48.1 -> 48.3 %, audio thread (third XThread) 11.8 -> 11.2 % (this route is light on audio; the 32 % audio
 windows were in the location tour).
+
+## 2026-10-09: memory fixes (build ru_integ5 tour, ru_integ7 spacewalk)
+- Location tour on ru_integ5 (pipeline-cache save and texture staging fixes, emergency reserve, `[mem]` report),
+  83 min over Eden, Normandy, Presidium and Wards: never-taken heap 551 -> 207 MB (fast at first, ~2 MB/min later),
+  0 out-of-memory drops, emergency reserve never released. Stopped by request before the reserve was reached.
+- ru_integ7 (integ5 + kernel waits + ring no-alloc + interned/dropped shader variant code, commit 5d18398), spacewalk,
+  base toml run/me1/tour_base_night.toml: Swaps 300 / 297, 1 frame > 100 ms (129 ms), picture unchanged.
+  `[mem]` 3 min after arrival: variant source copies 0 KB (were ~107 MB), 3719 idle transformed codes dropped
+  (90.7 MB), 30 remade (3 ms total, max 583 us), 0 mismatches; never-taken heap 876 MB.
+  Next memory target: driver module SPIR-V, 4839 modules 117 MB (Mesa keeps a copy per VkShaderModule).
